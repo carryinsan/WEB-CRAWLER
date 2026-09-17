@@ -19,14 +19,19 @@
 export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 
-const VERSION = 'arix-crawler-1.0.0';
+const VERSION = 'arix-crawler-1.2.0';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 500;
 const SEARCH_TIMEOUT_MS = 4500;
 const PAGE_TIMEOUT_MS = 5000;
 const MAX_PAGE_BYTES = 800_000;
-const MAX_TEXT_CHARS = 9000;
+const MAX_TEXT_CHARS = 30000;
+const MAX_TRANSCRIPT_CHARS = 30000;
+const READER_TIMEOUT_MS = 7000;
+const MAX_READER_FALLBACKS = 4;
+const YOUTUBE_TIMEOUT_MS = 7000;
+const PDF_DECOMPRESS_TIMEOUT_MS = 3500;
 const DEFAULT_VERIFY = 8;
 const DEEP_VERIFY = 12;
 const MAX_ENGINE_REQUESTS = 12;
@@ -41,8 +46,8 @@ const NEWS_RESOLVE_TIMEOUT_MS = 1800;
 const COMMON_CRAWL_TIMEOUT_MS = 3000;
 const MAX_NEWS_RESOLVES = 20;
 const MAX_CC_LOOKUPS = 4;
-const NORMAL_VERIFY_CAP = 6;
-const DEEP_VERIFY_CAP = 10;
+const NORMAL_VERIFY_CAP = 8;
+const DEEP_VERIFY_CAP = 12;
 
 const USER_AGENT =
   'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.1; +https://lexis-ai-chatini.vercel.app/)';
@@ -346,10 +351,16 @@ function parseMeta(html, name) {
 }
 
 function extractVisibleText(html) {
-  const main = html.match(/<(?:main|article|body)\b[^>]*>([\s\S]*?)<\/(?:main|article|body)>/i);
-  const source = main ? main[1] : html;
-  const text = stripTags(source)
-    .replace(/\b(function|var|const|let)\s+[^;]{0,120};?/g, ' ')
+  const candidates = [
+    html.match(/<article\b[^>]*>([\s\S]*?)<\/article>/i)?.[1],
+    html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1],
+    html.match(/<body\b[^>]*>([\s\S]*?)<\/body>/i)?.[1],
+    html,
+  ].filter(Boolean);
+  const source = candidates.find(x => stripTags(x).length >= 400) || candidates[0] || '';
+  const text = stripTags(String(source))
+    .replace(/\b(function|var|const|let)\s+[^;]{0,180};?/g, ' ')
+    .replace(/(?:skip to content|accept cookies|cookie settings|privacy settings|sign in|log in|subscribe)\b/gi, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
   return truncate(text, MAX_TEXT_CHARS);
@@ -422,25 +433,33 @@ function parseYahoo(html) {
 function parseGoogleWeb(html, source = 'google', forcedType = 'web') {
   const out = [];
   const seen = new Set();
-  const anchors = [...html.matchAll(/<a[^>]+href=["'](?:\/url\?q=|)([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)];
+  const anchors = [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)];
   for (const m of anchors) {
-    let raw = m[1];
-    if (raw.startsWith('http://') || raw.startsWith('https://')) {
-      // direct URL
-    } else if (raw.startsWith('/url?q=')) {
-      raw = raw.slice(7);
-    } else {
-      continue;
-    }
+    let raw = decodeHtml(m[1]);
+    try {
+      if (raw.startsWith('/url?')) {
+        const u = new URL(raw, 'https://www.google.com/');
+        raw = u.searchParams.get('q') || u.searchParams.get('url') || '';
+      }
+    } catch {}
+    if (!/^https?:\/\//i.test(raw)) continue;
     const url = cleanUrl(raw, 'https://www.google.com/');
-    if (!url || /google\.(com|co\.in)\/search/i.test(url)) continue;
-    const title = stripTags(m[2]);
+    if (!url) continue;
+    const host = hostname(url);
+    if (/google\.(com|co\.in)$/i.test(host) && /\/search|\/url\b/i.test(new URL(url).pathname + new URL(url).search)) continue;
+    const title = stripTags(m[2]).replace(/\s+/g, ' ').trim();
     if (!title || title.length < 3) continue;
     const key = normalizedKey(url);
     if (seen.has(key)) continue;
     seen.add(key);
     if (forcedType === 'video' && !/youtube\.com|youtu\.be|vimeo\.com/i.test(url)) continue;
-    out.push({ title, url, snippet: '', source, type: forcedType });
+    let type = forcedType;
+    if (forcedType === 'web') {
+      if (isGovUrl(url)) type = 'gov';
+      else if (isDocUrl(url)) type = 'doc';
+      else if (isLikelyVideoUrl(url)) type = 'video';
+    }
+    out.push({ title, url, snippet: '', source, type });
     if (out.length >= 20) break;
   }
   return out;
@@ -487,31 +506,86 @@ function parseGoogleNewsRss(xml) {
   return out;
 }
 
-function extractYouTubeTitle(window) {
-  const run = window.match(/"title":\{"runs":\[\{"text":"((?:\\.|[^"\\])*)"/i);
+function extractYouTubeTitle(windowText) {
+  const run = windowText.match(/"title":\{"runs":\[\{"text":"((?:\\.|[^"\\])*)"/i);
   if (run?.[1]) return decodeHtml(run[1].replace(/\\"/g, '"').replace(/\\u0026/g, '&'));
-  const simple = window.match(/"title":\{"simpleText":"((?:\\.|[^"\\])*)"/i);
+  const simple = windowText.match(/"title":\{"simpleText":"((?:\\.|[^"\\])*)"/i);
   if (simple?.[1]) return decodeHtml(simple[1].replace(/\\"/g, '"').replace(/\\u0026/g, '&'));
   return '';
+}
+
+function findJsonObjectAfterMarker(text, marker, maxScan = 250000) {
+  const idx = String(text || '').indexOf(marker);
+  if (idx < 0) return null;
+  const start = String(text).indexOf('{', idx + marker.length);
+  if (start < 0 || start - idx > maxScan) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < Math.min(String(text).length, start + 900000); i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        try { return JSON.parse(text.slice(start, i + 1)); } catch { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+function collectYouTubeVideoRenderers(value, out = []) {
+  if (!value || out.length >= 20) return out;
+  if (Array.isArray(value)) {
+    for (const item of value) collectYouTubeVideoRenderers(item, out);
+    return out;
+  }
+  if (typeof value !== 'object') return out;
+  if (value.videoRenderer?.videoId) out.push(value.videoRenderer);
+  for (const key of Object.keys(value)) {
+    if (key === 'videoRenderer') continue;
+    collectYouTubeVideoRenderers(value[key], out);
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+function youtubeRendererTitle(renderer) {
+  return decodeHtml(renderer?.title?.runs?.map(x => x?.text || '').join('') || renderer?.title?.simpleText || '').trim();
 }
 
 function parseYoutube(html) {
   const out = [];
   const seen = new Set();
+  const initialData = findJsonObjectAfterMarker(html, 'ytInitialData');
+  const renderers = collectYouTubeVideoRenderers(initialData, []);
+  for (const renderer of renderers) {
+    const id = renderer?.videoId;
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const title = youtubeRendererTitle(renderer) || `YouTube video ${id}`;
+    const snippet = decodeHtml(renderer?.detailedMetadataSnippets?.[0]?.snippetText?.runs?.map(x => x?.text || '').join('') || renderer?.descriptionSnippet?.runs?.map(x => x?.text || '').join('') || 'YouTube video result');
+    out.push({ title, url: `https://www.youtube.com/watch?v=${id}`, snippet, source: 'youtube', type: 'video' });
+    if (out.length >= 20) break;
+  }
+  if (out.length) return out;
+
   const rendererMatches = [...html.matchAll(/"videoRenderer":\{[\s\S]*?"videoId":"([\w-]{6,20})"[\s\S]*?\}/g)];
   for (const m of rendererMatches) {
     const id = m[1];
-    if (seen.has(id)) continue;
+    if (!id || seen.has(id)) continue;
     seen.add(id);
     const idx = m.index || 0;
-    const window = html.slice(Math.max(0, idx - 200), Math.min(html.length, idx + 5000));
-    out.push({
-      title: extractYouTubeTitle(window) || `YouTube video ${id}`,
-      url: `https://www.youtube.com/watch?v=${id}`,
-      snippet: 'YouTube video result',
-      source: 'youtube',
-      type: 'video',
-    });
+    const windowText = html.slice(Math.max(0, idx - 200), Math.min(html.length, idx + 7000));
+    out.push({ title: extractYouTubeTitle(windowText) || `YouTube video ${id}`, url: `https://www.youtube.com/watch?v=${id}`, snippet: 'YouTube video result', source: 'youtube', type: 'video' });
     if (out.length >= 20) break;
   }
   if (!out.length) {
@@ -520,15 +594,7 @@ function parseYoutube(html) {
       const id = m[1];
       if (seen.has(id)) continue;
       seen.add(id);
-      const idx = m.index || 0;
-      const window = html.slice(Math.max(0, idx - 500), Math.min(html.length, idx + 2500));
-      out.push({
-        title: extractYouTubeTitle(window) || `YouTube video ${id}`,
-        url: `https://www.youtube.com/watch?v=${id}`,
-        snippet: 'YouTube video result',
-        source: 'youtube',
-        type: 'video',
-      });
+      out.push({ title: `YouTube video ${id}`, url: `https://www.youtube.com/watch?v=${id}`, snippet: 'YouTube video result', source: 'youtube', type: 'video' });
       if (out.length >= 20) break;
     }
   }
@@ -617,32 +683,57 @@ function parseDateIntent(query) {
 }
 
 function buildSearchQueries(query, intent, mode, dateIntent) {
-  const qs = new Set([query]);
-  if (intent.wantsNews) qs.add(`${query} latest news`);
+  const qs = [];
+  const add = q => { if (q && !qs.includes(q)) qs.push(q); };
+  const gov = intent.wantsGov || mode === 'gov';
+  const docs = intent.wantsDocs || mode === 'doc';
+  const video = intent.wantsVideo || mode === 'video';
+  const news = intent.wantsNews || mode === 'news';
+
+  // Put the exact intent-relevant query first so MAX_ENGINE_REQUESTS cannot starve it.
+  if (gov) {
+    add(`${query} site:gov.in`);
+    add(`${query} site:nic.in`);
+    add(`${query} site:india.gov.in`);
+    add(`${query} site:mygov.in`);
+  }
+  if (docs) {
+    add(`${query} filetype:pdf`);
+    add(`${query} official PDF`);
+    add(`${query} site:gov.in filetype:pdf`);
+  }
+  if (video) {
+    add(`site:youtube.com ${query}`);
+    add(`${query} YouTube`);
+  }
+  if (news) add(`${query} latest news`);
+
+  add(query);
   if (dateIntent.kind === 'explicit-month' || dateIntent.kind === 'explicit-year') {
-    qs.add(`${query} after:${dateIntent.start.slice(0, 10)} before:${dateIntent.end.slice(0, 10)}`);
+    add(`${query} after:${dateIntent.start.slice(0, 10)} before:${dateIntent.end.slice(0, 10)}`);
   }
   if (mode === 'deep') {
-    qs.add(`${query} latest update`);
-    qs.add(`${query} official source`);
+    add(`${query} latest update`);
+    add(`${query} official source`);
   }
-  if (intent.wantsGov || mode === 'gov') {
-    qs.add(`${query} site:gov.in`);
-    qs.add(`${query} site:nic.in`);
-    qs.add(`${query} site:india.gov.in`);
-  }
-  if (intent.wantsDocs || mode === 'doc') qs.add(`${query} filetype:pdf`);
-  return [...qs].slice(0, 6);
+  if (news && !qs.includes(`${query} latest news`)) add(`${query} latest news`);
+  if (docs && !qs.includes(`${query} filetype:pdf`)) add(`${query} filetype:pdf`);
+  if (gov && !qs.includes(`${query} site:gov.in`)) add(`${query} site:gov.in`);
+  return qs.slice(0, 6);
 }
 
 function buildEngineUrls(q, intent) {
   const encoded = encodeURIComponent(q);
+  const isPdfQuery = /filetype:\s*pdf|\bpdf\b|official pdf/i.test(q);
+  const isGovQuery = /site:(?:gov\.in|nic\.in|india\.gov\.in|mygov\.in)/i.test(q);
+  const isVideoQuery = /site:youtube\.com|\byoutube\b/i.test(q);
+  const typeForQuery = isGovQuery ? 'gov' : isPdfQuery ? 'doc' : isVideoQuery ? 'video' : 'web';
   const urls = [
-    { provider: 'bing', type: 'web', url: `https://www.bing.com/search?q=${encoded}&count=20&setlang=en-IN&cc=in` },
-    { provider: 'duckduckgo', type: 'web', url: `https://html.duckduckgo.com/html/?q=${encoded}&kl=in-en` },
-    { provider: 'mojeek', type: 'web', url: `https://www.mojeek.com/search?q=${encoded}` },
-    { provider: 'yahoo', type: 'web', url: `https://search.yahoo.com/search?p=${encoded}` },
-    { provider: 'google', type: 'web', url: `https://www.google.com/search?q=${encoded}&num=20&hl=en&gl=in` },
+    { provider: 'bing', type: typeForQuery, url: `https://www.bing.com/search?q=${encoded}&count=20&setlang=en-IN&cc=in` },
+    { provider: 'duckduckgo', type: typeForQuery, url: `https://html.duckduckgo.com/html/?q=${encoded}&kl=in-en` },
+    { provider: 'mojeek', type: typeForQuery, url: `https://www.mojeek.com/search?q=${encoded}` },
+    { provider: 'yahoo', type: typeForQuery, url: `https://search.yahoo.com/search?p=${encoded}` },
+    { provider: 'google', type: typeForQuery, url: `https://www.google.com/search?q=${encoded}&num=20&hl=en&gl=in` },
   ];
   if (intent.wantsNews) {
     urls.push({ provider: 'google-news', type: 'news', url: `https://news.google.com/rss/search?q=${encoded}&hl=en-IN&gl=IN&ceid=IN:en` });
@@ -651,34 +742,35 @@ function buildEngineUrls(q, intent) {
     urls.push({ provider: 'youtube', type: 'video', url: `https://www.youtube.com/results?search_query=${encoded}&hl=en-IN` });
     urls.push({ provider: 'google-video', type: 'video', url: `https://www.google.com/search?q=${encodeURIComponent(`site:youtube.com ${q}`)}&num=20&hl=en&gl=in` });
   }
+  // A direct official-domain probe is especially useful when public SERPs return weak/no gov results.
+  if (isGovQuery) {
+    urls.push({ provider: 'google-gov', type: 'gov', url: `https://www.google.com/search?q=${encodeURIComponent(`${q} site:gov.in`)}&num=20&hl=en&gl=in` });
+  }
+  // Explicit PDF search receives a document-only Google surface.
+  if (isPdfQuery) {
+    urls.push({ provider: 'google-doc', type: 'doc', url: `https://www.google.com/search?q=${encodeURIComponent(`${q} filetype:pdf`)}&num=20&hl=en&gl=in` });
+  }
   return urls;
 }
 
 function prioritizeEngineRequests(requests, maxRequests) {
-  // Provider-first round-robin: one query cannot monopolize the entire request cap,
-  // and a single flaky engine cannot crowd out independent search surfaces.
-  const byProvider = new Map();
-  const providerOrder = [];
+  // Query-first round robin: the first few intent-specific queries (gov/pdf/youtube/news)
+  // must reach multiple independent providers before generic variants consume the cap.
+  const byQuery = new Map();
+  const queryOrder = [];
   for (const req of requests) {
-    const provider = req.provider || 'unknown';
-    if (!byProvider.has(provider)) {
-      byProvider.set(provider, []);
-      providerOrder.push(provider);
-    }
-    byProvider.get(provider).push(req);
+    const qi = Number.isInteger(req.__queryIndex) ? req.__queryIndex : 0;
+    if (!byQuery.has(qi)) { byQuery.set(qi, []); queryOrder.push(qi); }
+    byQuery.get(qi).push(req);
   }
   const out = [];
   let cursor = 0;
-  while (out.length < maxRequests && providerOrder.length) {
-    let added = false;
-    for (const provider of providerOrder) {
-      const bucket = byProvider.get(provider);
-      if (cursor < bucket.length && out.length < maxRequests) {
-        out.push(bucket[cursor]);
-        added = true;
-      }
+  while (out.length < maxRequests && cursor < queryOrder.length) {
+    const qi = queryOrder[cursor];
+    for (const req of byQuery.get(qi) || []) {
+      if (out.length >= maxRequests) break;
+      out.push(req);
     }
-    if (!added) break;
     cursor += 1;
   }
   return out;
@@ -688,7 +780,7 @@ async function discoverOne(engine, deadline) {
   try {
     const text = await fetchText(engine.url, {
       timeout: SEARCH_TIMEOUT_MS,
-      maxBytes: 600_000,
+      maxBytes: engine.provider === 'youtube' ? 1_600_000 : 600_000,
       deadline,
     });
     let results = [];
@@ -698,6 +790,8 @@ async function discoverOne(engine, deadline) {
     else if (engine.provider === 'yahoo') results = parseYahoo(text);
     else if (engine.provider === 'google') results = parseGoogleWeb(text);
     else if (engine.provider === 'google-video') results = parseGoogleWeb(text, 'google-video', 'video');
+    else if (engine.provider === 'google-gov') results = parseGoogleWeb(text, 'google-gov', 'gov');
+    else if (engine.provider === 'google-doc') results = parseGoogleWeb(text, 'google-doc', 'doc');
     else if (engine.provider === 'google-news') results = parseGoogleNewsRss(text);
     else if (engine.provider === 'youtube') results = parseYoutube(text);
     return { provider: engine.provider, results, ok: true };
@@ -840,22 +934,311 @@ async function readBodyText(res, maxBytes, deadline) {
   return new TextDecoder().decode(bytes);
 }
 
+
+async function readBodyBytes(res, maxBytes, deadline) {
+  const reader = res.body?.getReader?.();
+  if (!reader) {
+    const ab = await res.arrayBuffer();
+    return new Uint8Array(ab).slice(0, maxBytes);
+  }
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    if (remainingMs(deadline) <= 100) break;
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    const room = maxBytes - total;
+    if (room <= 0) break;
+    const piece = value.byteLength > room ? value.slice(0, room) : value;
+    chunks.push(piece);
+    total += piece.byteLength;
+    if (total >= maxBytes) break;
+  }
+  const bytes = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { bytes.set(c, off); off += c.byteLength; }
+  return bytes;
+}
+
+function bytesToLatin1(bytes) {
+  let out = '';
+  const step = 8192;
+  for (let i = 0; i < bytes.length; i += step) {
+    out += String.fromCharCode(...bytes.subarray(i, Math.min(bytes.length, i + step)));
+  }
+  return out;
+}
+
+function decodePdfLiteral(raw) {
+  let s = String(raw || '');
+  s = s.replace(/\\([nrtbf\\()])/g, (_, c) => ({n:'\n',r:'\r',t:'\t',b:'\b',f:'\f','\\':'\\','(':'(',')':')'})[c] || c);
+  s = s.replace(/\\([0-7]{1,3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)));
+  return s;
+}
+
+function decodePdfHex(raw) {
+  const hex = String(raw || '').replace(/[^0-9a-f]/gi, '');
+  if (!hex) return '';
+  const even = hex.length % 2 ? `${hex}0` : hex;
+  const bytes = new Uint8Array(even.length / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(even.slice(i * 2, i * 2 + 2), 16);
+  try {
+    if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes.slice(2));
+  } catch {}
+  return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+}
+
+function extractPdfStringsFromStream(stream) {
+  const out = [];
+  let i = 0;
+  while (i < stream.length) {
+    if (stream[i] === '(') {
+      let depth = 1;
+      let j = i + 1;
+      let escaped = false;
+      for (; j < stream.length; j++) {
+        const ch = stream[j];
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (ch === '(') depth += 1;
+        else if (ch === ')') { depth -= 1; if (depth === 0) break; }
+      }
+      if (j < stream.length) {
+        const raw = stream.slice(i + 1, j);
+        const text = decodePdfLiteral(raw);
+        if (text.trim()) out.push(text);
+        i = j + 1;
+        continue;
+      }
+    }
+    if (stream[i] === '<' && stream[i + 1] !== '<') {
+      const j = stream.indexOf('>', i + 1);
+      if (j > i) {
+        const text = decodePdfHex(stream.slice(i + 1, j));
+        if (text.trim()) out.push(text);
+        i = j + 1;
+        continue;
+      }
+    }
+    i += 1;
+  }
+  return out.join(' ');
+}
+
+async function inflateDeflate(bytes, deadline) {
+  if (typeof DecompressionStream === 'undefined') return null;
+  const timeout = boundedTimeout(PDF_DECOMPRESS_TIMEOUT_MS, deadline, 500);
+  if (!timeout) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const ds = new DecompressionStream('deflate');
+    const writer = ds.writable.getWriter();
+    await writer.write(bytes);
+    await writer.close();
+    const ab = await new Response(ds.readable).arrayBuffer();
+    if (controller.signal.aborted) return null;
+    return new Uint8Array(ab);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function extractPdfText(bytes, deadline) {
+  const raw = bytesToLatin1(bytes);
+  const streams = [];
+  const re = /<<(?:[\s\S]{0,5000}?)>>\s*stream\r?\n([\s\S]*?)\r?\nendstream/g;
+  let match;
+  while ((match = re.exec(raw)) && streams.length < 80) {
+    const dict = match[0].slice(0, Math.max(0, match[0].indexOf('stream')));
+    const payloadStart = match.index + match[0].indexOf(match[1]);
+    const payloadEnd = payloadStart + match[1].length;
+    const rawBytes = bytes.slice(payloadStart, payloadEnd);
+    if (/\/FlateDecode/i.test(dict)) {
+      const inflated = await inflateDeflate(rawBytes, deadline);
+      if (inflated) streams.push(bytesToLatin1(inflated));
+    } else {
+      streams.push(match[1]);
+    }
+  }
+  const extracted = streams.map(extractPdfStringsFromStream).filter(Boolean).join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return truncate(extracted, MAX_TEXT_CHARS);
+}
+
+function readerUrl(url) {
+  return `https://r.jina.ai/${url}`;
+}
+
+async function readerFallback(url, deadline) {
+  if (!safeHttpUrl(url) || remainingMs(deadline) < 1100) return null;
+  try {
+    const timeout = boundedTimeout(READER_TIMEOUT_MS, deadline, 700);
+    if (!timeout) return null;
+    const res = await fetchResponse(readerUrl(url), {
+      timeout,
+      deadline,
+      headers: {
+        accept: 'text/plain,text/markdown,application/json;q=0.9,*/*;q=0.2',
+        'x-no-cache': 'true',
+      },
+    });
+    if (!res.ok) {
+      try { await res.body?.cancel?.(); } catch {}
+      return null;
+    }
+    const text = await readBodyText(res, MAX_PAGE_BYTES, deadline);
+    if (!text || text.length < 120) return null;
+    return {
+      content: truncate(text, MAX_TEXT_CHARS),
+      finalUrl: url,
+      title: parseTitleFromHtml(text) || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractPlayerResponse(html) {
+  return findJsonObjectAfterMarker(html, 'ytInitialPlayerResponse') || findJsonObjectAfterMarker(html, 'PLAYER_RESPONSE');
+}
+
+function chooseCaptionTrack(tracks) {
+  if (!Array.isArray(tracks) || !tracks.length) return null;
+  return tracks.find(t => /^en(?:-|$)/i.test(t?.languageCode || '')) ||
+    tracks.find(t => /^en/i.test(t?.languageCode || '')) ||
+    tracks[0] || null;
+}
+
+function captionXmlToText(xml) {
+  const rows = [];
+  for (const m of String(xml || '').matchAll(/<text\b[^>]*>([\s\S]*?)<\/text>/gi)) {
+    const text = stripTags(m[1]).replace(/\s+/g, ' ').trim();
+    if (text) rows.push(text);
+  }
+  return truncate(rows.join(' '), MAX_TRANSCRIPT_CHARS);
+}
+
+async function fetchYoutubePlayer(videoId, deadline) {
+  const watchUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=en`;
+  const html = await fetchText(watchUrl, {
+    timeout: YOUTUBE_TIMEOUT_MS,
+    maxBytes: 1_600_000,
+    deadline,
+    headers: { accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.2' },
+  });
+  let player = extractPlayerResponse(html);
+  if (player) return { player, html };
+
+  const apiKey = (html.match(/"INNERTUBE_API_KEY":"([^"]+)"/) || [,''])[1] ||
+    (html.match(/INNERTUBE_API_KEY['"]?\s*[:=]\s*['"]([^'"]+)/i) || [,''])[1];
+  if (!apiKey) return { player: null, html };
+  const timeout = boundedTimeout(YOUTUBE_TIMEOUT_MS, deadline, 700);
+  if (!timeout) return { player: null, html };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${encodeURIComponent(apiKey)}`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'content-type': 'application/json', 'user-agent': USER_AGENT },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: 'WEB',
+            clientVersion: (html.match(/"INNERTUBE_CLIENT_VERSION":"([^"]+)"/) || [,'2.20260915.01.00'])[1],
+            hl: 'en',
+            gl: 'IN',
+          },
+        },
+        videoId,
+      }),
+    });
+    if (!response.ok) return { player: null, html };
+    const data = await response.json();
+    return { player: data, html };
+  } catch {
+    return { player: null, html };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function enrichYouTubeResult(result, deadline) {
+  const match = String(result.url || '').match(/(?:v=|youtu\.be\/|shorts\/)([A-Za-z0-9_-]{6,20})/i);
+  const videoId = match?.[1];
+  if (!videoId) return { ...result, verified: false, verificationError: 'YOUTUBE_VIDEO_ID_MISSING' };
+  try {
+    const { player } = await fetchYoutubePlayer(videoId, deadline);
+    const videoDetails = player?.videoDetails || {};
+    const captions = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    const track = chooseCaptionTrack(captions);
+    let transcript = null;
+    if (track?.baseUrl && remainingMs(deadline) > 700) {
+      const timeout = boundedTimeout(YOUTUBE_TIMEOUT_MS, deadline, 500);
+      const res = await fetchResponse(track.baseUrl, {
+        timeout,
+        deadline,
+        headers: { accept: 'text/xml,application/xml,text/plain;q=0.9,*/*;q=0.2' },
+      });
+      if (res.ok) transcript = captionXmlToText(await readBodyText(res, 900_000, deadline));
+      else { try { await res.body?.cancel?.(); } catch {} }
+    }
+    const title = decodeHtml(videoDetails.title || result.title || '').trim() || result.title;
+    const description = decodeHtml(videoDetails.shortDescription || result.snippet || '').trim();
+    const transcriptText = transcript || null;
+    const body = transcriptText ? `YouTube transcript:\n${transcriptText}` : description;
+    return {
+      ...result,
+      title: truncate(title, 300),
+      snippet: truncate(description || (transcriptText ? transcriptText.slice(0, 1000) : result.snippet), 1200),
+      extractedText: body ? truncate(body, MAX_TEXT_CHARS) : null,
+      pageContent: body ? truncate(body, MAX_TEXT_CHARS) : null,
+      transcript: transcriptText,
+      transcriptAvailable: Boolean(transcriptText),
+      transcriptLanguage: track?.languageCode || null,
+      transcriptKind: track?.kind || null,
+      verified: Boolean(player),
+      httpStatus: player ? 200 : null,
+      contentType: player ? 'application/json' : null,
+      domain: 'youtube.com',
+      trust: domainTrust(result.url),
+    };
+  } catch (error) {
+    return { ...result, verified: false, verificationError: error?.message || 'YOUTUBE_ENRICH_FAILED' };
+  }
+}
+
 async function resolvePublisherUrl(result, deadline) {
   if (!/^news\.google\.com$/i.test(hostname(result.url))) return result;
-  if (!/^\/rss\/articles\//i.test(new URL(result.url).pathname)) return result;
+  let parsed;
+  try { parsed = new URL(result.url); } catch { return result; }
+  if (!/^\/rss\/articles\//i.test(parsed.pathname)) return result;
   try {
     const timeout = boundedTimeout(NEWS_RESOLVE_TIMEOUT_MS, deadline, 350);
     if (!timeout) return { ...result, verificationError: 'BUDGET_EXHAUSTED' };
     const res = await fetchResponse(result.url, {
       timeout,
       deadline,
-      headers: { accept: 'text/html,application/xhtml+xml;q=0.8,*/*;q=0.1' },
+      headers: { accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1' },
     });
     const finalUrl = cleanUrl(res.url || result.url, result.url);
-    try { await res.body?.cancel?.(); } catch {}
+    const body = await readBodyText(res, 220_000, deadline).catch(() => '');
     if (finalUrl && hostname(finalUrl) && !/^news\.google\.com$/i.test(hostname(finalUrl))) {
       return { ...result, url: finalUrl, domain: hostname(finalUrl), publisherResolved: true };
     }
+    // Google News can expose the publisher link inside the redirect/landing HTML even when
+    // the platform does not surface it as the final response URL.
+    const externalLinks = [...body.matchAll(/href=["'](https?:\/\/[^"']+)["']/gi)]
+      .map(m => cleanUrl(m[1], result.url))
+      .filter(Boolean)
+      .filter(u => !/^news\.google\.com$/i.test(hostname(u)) && !/^www\.google\./i.test(hostname(u)) && !/^accounts\.google\./i.test(hostname(u)));
+    const candidate = externalLinks.find(u => !/googleusercontent|gstatic|doubleclick|googletagmanager/i.test(u));
+    if (candidate) return { ...result, url: candidate, domain: hostname(candidate), publisherResolved: true };
     return { ...result, publisherResolved: false };
   } catch (error) {
     return { ...result, publisherResolved: false, resolutionError: error?.message || 'RESOLVE_FAILED' };
@@ -863,77 +1246,129 @@ async function resolvePublisherUrl(result, deadline) {
 }
 
 async function enrichResult(result, deadline) {
+  if (result.type === 'video' && /youtube\.com|youtu\.be/i.test(result.url || '')) {
+    return enrichYouTubeResult(result, deadline);
+  }
   if (!safeHttpUrl(result.url)) return { ...result, verified: false, verificationError: 'UNSAFE_URL' };
   try {
     const remaining = remainingMs(deadline);
     if (remaining < 500) return { ...result, verified: false, verificationError: 'BUDGET_EXHAUSTED' };
     const res = await fetchResponse(result.url, {
-      timeout: Math.min(PAGE_TIMEOUT_MS, Math.max(700, remaining - 150)),
+      timeout: Math.min(PAGE_TIMEOUT_MS, Math.max(900, remaining - 150)),
       deadline,
-      headers: { accept: 'text/html,application/xhtml+xml;q=0.9,text/plain;q=0.8,*/*;q=0.2' },
+      headers: {
+        accept: 'text/html,application/xhtml+xml;q=0.9,application/pdf;q=0.8,text/plain;q=0.8,*/*;q=0.2',
+        'accept-language': 'en-IN,en;q=0.9',
+        'cache-control': 'no-cache',
+        pragma: 'no-cache',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'upgrade-insecure-requests': '1',
+      },
     });
     const contentType = res.headers.get('content-type') || '';
+    const finalUrl = cleanUrl(res.url || result.url, result.url) || result.url;
     if (!res.ok) {
       try { await res.body?.cancel?.(); } catch {}
-      return {
-        ...result,
-        verified: false,
-        httpStatus: res.status,
-        contentType,
-        domain: hostname(res.url || result.url),
-        trust: domainTrust(res.url || result.url),
-      };
+      if (remainingMs(deadline) > 1600) {
+        const reader = await readerFallback(finalUrl, deadline);
+        if (reader?.content) {
+          return {
+            ...result,
+            url: finalUrl,
+            title: truncate(reader.title || result.title, 300),
+            extractedText: reader.content,
+            pageContent: reader.content,
+            verified: true,
+            verificationMethod: 'jina-reader-fallback',
+            httpStatus: res.status,
+            contentType: 'text/markdown',
+            domain: hostname(finalUrl),
+            trust: domainTrust(finalUrl),
+          };
+        }
+      }
+      return { ...result, verified: false, httpStatus: res.status, contentType, domain: hostname(finalUrl), trust: domainTrust(finalUrl) };
     }
 
-    if (!/text\/html|application\/xhtml|text\/plain|application\/json|application\/pdf/i.test(contentType)) {
-      try { await res.body?.cancel?.(); } catch {}
-      return {
-        ...result,
-        verified: true,
-        httpStatus: res.status,
-        contentType,
-        domain: hostname(res.url || result.url),
-        trust: domainTrust(res.url || result.url),
-      };
-    }
-
-    const text = await readBodyText(res, MAX_PAGE_BYTES, deadline);
-    const finalUrl = cleanUrl(res.url || result.url, result.url) || result.url;
-    if (/application\/pdf/i.test(contentType)) {
+    if (/application\/pdf/i.test(contentType) || /\.pdf(?:\?|$)/i.test(finalUrl)) {
+      const bytes = await readBodyBytes(res, MAX_PAGE_BYTES, deadline);
+      let pdfText = await extractPdfText(bytes, deadline);
+      if (!pdfText && remainingMs(deadline) > 1600) {
+        const reader = await readerFallback(finalUrl, deadline);
+        pdfText = reader?.content || '';
+      }
+      const title = result.title || finalUrl.split('/').pop() || 'PDF document';
       return {
         ...result,
         url: finalUrl,
-        domain: hostname(finalUrl),
+        title: truncate(title, 300),
         verified: true,
         httpStatus: res.status,
-        contentType,
+        contentType: contentType || 'application/pdf',
         trust: domainTrust(finalUrl),
-        extractedText: null,
+        domain: hostname(finalUrl),
+        extractedText: pdfText || null,
+        pageContent: pdfText || null,
+        contentTruncated: Boolean(pdfText && pdfText.length >= MAX_TEXT_CHARS),
+        verificationMethod: pdfText ? 'direct-pdf-text' : 'direct-pdf-no-text',
       };
     }
 
+    if (!/text\/html|application\/xhtml|text\/plain|application\/json/i.test(contentType)) {
+      try { await res.body?.cancel?.(); } catch {}
+      return { ...result, verified: true, httpStatus: res.status, contentType, domain: hostname(finalUrl), trust: domainTrust(finalUrl), url: finalUrl };
+    }
+
+    const text = await readBodyText(res, MAX_PAGE_BYTES, deadline);
+    // Never call a Google News wrapper a verified publisher page. A wrapper may be
+    // reachable while the real article is still unavailable.
+    if (result.type === 'news' && /^news\.google\.com$/i.test(hostname(finalUrl))) {
+      return {
+        ...result,
+        url: finalUrl,
+        verified: false,
+        httpStatus: res.status,
+        contentType,
+        domain: hostname(finalUrl),
+        trust: domainTrust(finalUrl),
+        verificationError: 'PUBLISHER_URL_NOT_RESOLVED',
+      };
+    }
     if (/text\/html|application\/xhtml/i.test(contentType) || /<html\b/i.test(text)) {
       const canonical = parseCanonical(text, finalUrl);
-      const canonicalUrl = canonical || finalUrl;
+      const canonicalUrl = canonical && safeHttpUrl(canonical) ? canonical : finalUrl;
       const title = parseTitleFromHtml(text) || result.title;
       const description = parseMeta(text, 'description') || parseMeta(text, 'og:description') || result.snippet;
       const publishedAt = parseDateCandidate(text) || result.publishedAt || null;
-      const bodyText = extractVisibleText(text);
+      let bodyText = extractVisibleText(text);
+      let method = 'direct-html';
+      if (bodyText.length < 350 && remainingMs(deadline) > 1600) {
+        const reader = await readerFallback(canonicalUrl, deadline);
+        if (reader?.content && reader.content.length > bodyText.length) {
+          bodyText = reader.content;
+          method = 'jina-reader-fallback';
+        }
+      }
       return {
         ...result,
         url: canonicalUrl,
         title: truncate(title, 300),
         snippet: truncate(description || result.snippet, 1000),
         publishedAt,
-        extractedText: bodyText,
+        extractedText: bodyText || null,
+        pageContent: bodyText || null,
+        contentTruncated: Boolean(bodyText && bodyText.length >= MAX_TEXT_CHARS),
         verified: true,
         httpStatus: res.status,
         contentType,
         domain: hostname(canonicalUrl),
         trust: domainTrust(canonicalUrl),
+        verificationMethod: method,
       };
     }
 
+    const plain = truncate(text, MAX_TEXT_CHARS);
     return {
       ...result,
       url: finalUrl,
@@ -942,21 +1377,32 @@ async function enrichResult(result, deadline) {
       contentType,
       domain: hostname(finalUrl),
       trust: domainTrust(finalUrl),
-      extractedText: truncate(text, MAX_TEXT_CHARS),
+      extractedText: plain,
+      pageContent: plain,
+      contentTruncated: Boolean(plain && plain.length >= MAX_TEXT_CHARS),
+      verificationMethod: 'direct-text',
     };
   } catch (error) {
-    return {
-      ...result,
-      verified: false,
-      verificationError: error?.message || 'ENRICH_FAILED',
-      domain: hostname(result.url),
-      trust: domainTrust(result.url),
-    };
+    if (remainingMs(deadline) > 1500 && result.type !== 'video') {
+      const reader = await readerFallback(result.url, deadline);
+      if (reader?.content) {
+        return {
+          ...result,
+          extractedText: reader.content,
+          pageContent: reader.content,
+          verified: true,
+          verificationMethod: 'jina-reader-fallback',
+          domain: hostname(result.url),
+          trust: domainTrust(result.url),
+        };
+      }
+    }
+    return { ...result, verified: false, verificationError: error?.message || 'ENRICH_FAILED', domain: hostname(result.url), trust: domainTrust(result.url) };
   }
 }
 
 async function resolveTopNews(results, deadline) {
-  const candidates = results.filter(r => r.type === 'news').slice(0, MAX_NEWS_RESOLVES);
+  const candidates = results.filter(r => r.type === 'news' && /^news\.google\.com$/i.test(hostname(r.url))).slice(0, Math.min(8, MAX_NEWS_RESOLVES));
   if (!candidates.length || remainingMs(deadline) < 1000) return results;
   const resolved = await Promise.all(candidates.map(r => resolvePublisherUrl(r, deadline)));
   const byKey = new Map(candidates.map((r, i) => [normalizedKey(r.url), resolved[i]]));
@@ -967,7 +1413,11 @@ function selectVerificationCandidates(results, count) {
   const out = [];
   const usedDomains = new Set();
   const usedUrls = new Set();
-  const ranked = [...results].sort((a, b) => (b._score || 0) - (a._score || 0));
+  const ranked = [...results].sort((a, b) => {
+    const aw = (/^news\.google\.com$/i.test(hostname(a.url)) ? -8 : 0) + (a.extractedText ? 4 : 0);
+    const bw = (/^news\.google\.com$/i.test(hostname(b.url)) ? -8 : 0) + (b.extractedText ? 4 : 0);
+    return ((b._score || 0) + bw) - ((a._score || 0) + aw);
+  });
   for (const r of ranked) {
     if (out.length >= count) break;
     const key = normalizedKey(r.url);
@@ -1048,6 +1498,28 @@ function diversifyAndSelect(results, count, intent) {
     typeCounts.set(type, (typeCounts.get(type) || 0) + 1);
   }
   return selected;
+}
+
+
+function enforceRequestedType(results, requestedType, mode, warnings) {
+  const wanted = String(requestedType || mode || '').toLowerCase();
+  let type = null;
+  if (wanted === 'gov') type = 'gov';
+  else if (wanted === 'doc' || wanted === 'docs' || wanted === 'document') type = 'doc';
+  else if (wanted === 'video') type = 'video';
+  else if (wanted === 'news') type = 'news';
+  if (!type) return results;
+  const matching = results.filter(r => {
+    if (type === 'gov') return isGovUrl(r.url);
+    if (type === 'doc') return r.type === 'doc' || isDocUrl(r.url);
+    return r.type === type;
+  });
+  if (matching.length) {
+    if (matching.length < results.length) warnings.push(`Restricted selected results to requested ${type} sources.`);
+    return matching;
+  }
+  warnings.push(`No verified/discovered ${type} source matched the requested type; broader live results were retained.`);
+  return results;
 }
 
 function parseCount(value) {
@@ -1144,6 +1616,7 @@ async function aiRerank(query, results, mode, dateIntent, deadline) {
     domain: r.domain || hostname(r.url),
     type: r.type,
     snippet: truncate(r.snippet, 500),
+    pageContentPreview: truncate(r.pageContent || r.extractedText || '', 2200),
     publishedAt: r.publishedAt || null,
     verified: Boolean(r.verified),
     trust: r.trust || 0,
@@ -1370,7 +1843,7 @@ async function performSearch(input, started, deadline) {
   discovered.sort((a, b) => (b._score || 0) - (a._score || 0));
 
   // Google News returns wrapper URLs. Resolve them to the actual publisher before verification.
-  if (discovered.some(r => r.type === 'news') && remainingMs(deadline) > 2200) {
+  if (discovered.some(r => r.type === 'news' && /^news\.google\.com$/i.test(hostname(r.url))) && remainingMs(deadline) > 3000) {
     internalFlags.publisherResolutionAttempted = Math.min(MAX_NEWS_RESOLVES, discovered.filter(r => r.type === 'news').length);
     const beforeKeys = new Set(discovered.filter(r => r.type === 'news').map(r => normalizedKey(r.url)));
     discovered = await resolveTopNews(discovered, deadline);
@@ -1387,6 +1860,11 @@ async function performSearch(input, started, deadline) {
   }
 
   discovered = applyDateConstraint(discovered, dateIntent, count, warnings);
+  discovered = enforceRequestedType(discovered, requestedType, mode, warnings);
+  for (const r of discovered) {
+    r.domain = hostname(r.url);
+    r._score = scoreResult(r, query, baseIntent, dateIntent) + (r.verified ? 2 : 0) + domainTrust(r.url);
+  }
   discovered.sort((a, b) => (b._score || 0) - (a._score || 0));
 
   const requestedVerifyCount = verifyRequested ? Math.min(discovered.length, deep ? DEEP_VERIFY : DEFAULT_VERIFY) : 0;
@@ -1473,6 +1951,13 @@ async function performSearch(input, started, deadline) {
       relevanceScore,
       publisherResolved: Boolean(r.publisherResolved),
       extractedText: r.extractedText || null,
+      pageContent: r.pageContent || r.extractedText || null,
+      contentTruncated: Boolean(r.contentTruncated),
+      verificationMethod: r.verificationMethod || null,
+      transcript: r.transcript || null,
+      transcriptAvailable: Boolean(r.transcriptAvailable),
+      transcriptLanguage: r.transcriptLanguage || null,
+      transcriptKind: r.transcriptKind || null,
       commonCrawl: r.commonCrawl || null,
     };
   });
@@ -1519,6 +2004,7 @@ async function performSearch(input, started, deadline) {
       'Core discovery is keyless but depends on public web surfaces that may rate-limit or block automated requests.',
       'This endpoint is not a substitute for an internet-scale index; use a provider or your own persistent index for very high volume.',
       'The response uses Vercel-supported streaming heartbeats so long searches can continue without waiting silently at the Edge gateway.',
+      'AI-readable cleaned source content is exposed in pageContent/extractedText; YouTube captions are exposed in transcript when available.',
       ...warnings,
     ],
   };
