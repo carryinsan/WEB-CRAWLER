@@ -18,10 +18,11 @@
  * 5) Try the public Jina Reader endpoint as a keyless HTML-to-text fallback.
  * 6) For YouTube, retrieve real metadata and captions where available.
  * 7) For PDFs, extract real text when the PDF contains extractable text.
- * 8) If a site blocks all content extraction, NEVER return null content:
- *    pageContent/extractedText contain the real search snippet + metadata and
- *    contentStatus explains that it is a discovery/snippet fallback rather than
- *    silently pretending that the full page was retrieved.
+ * 8) Search snippets are kept as discovery evidence only. They are NEVER used
+ *    as pageContent for the default final result set. When requireRealContent is
+ *    true (the default), only validated live publisher/reader/PDF/transcript
+ *    content is returned to the AI; inaccessible sources are excluded rather
+ *    than mislabeled as page content.
  *
  * TIME / STREAMING
  * - The response begins with valid JSON immediately, not just whitespace.
@@ -36,16 +37,16 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-1.5.0';
+const VERSION = 'arix-crawler-1.6.0';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 500;
 const MAX_REQUEST_BODY = 64_000;
 
-const SEARCH_TIMEOUT_MS = 4500;
-const PAGE_TIMEOUT_MS = 6500;
-const READER_TIMEOUT_MS = 9000;
-const NEWS_RESOLVE_TIMEOUT_MS = 2500;
+const SEARCH_TIMEOUT_MS = 3600;
+const PAGE_TIMEOUT_MS = 5200;
+const READER_TIMEOUT_MS = 6500;
+const NEWS_RESOLVE_TIMEOUT_MS = 2200;
 const COMMON_CRAWL_TIMEOUT_MS = 3000;
 const YOUTUBE_TIMEOUT_MS = 8000;
 const PDF_DECOMPRESS_TIMEOUT_MS = 3500;
@@ -56,9 +57,9 @@ const MAX_YOUTUBE_BYTES = 1_800_000;
 const MAX_TEXT_CHARS = 30_000;
 const MAX_TRANSCRIPT_CHARS = 30_000;
 
-const DEFAULT_VERIFY = 12;
-const DEEP_VERIFY = 20;
-const MAX_VERIFY = 20;
+const DEFAULT_VERIFY = 10;
+const DEEP_VERIFY = 14;
+const MAX_VERIFY = 14;
 const MAX_ENGINE_REQUESTS = 12;
 const MAX_NEWS_RESOLVES = 10;
 const MAX_PUBLISHER_LOOKUPS = 6;
@@ -69,7 +70,7 @@ const STREAM_HEARTBEAT_MS = 4000;
 const SEARCH_WORK_BUDGET_MS = 240_000;
 
 const USER_AGENT =
-  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.5; +https://lexis-ai-chatini.vercel.app/)';
+  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.6; +https://lexis-ai-chatini.vercel.app/)';
 
 const COMMON_CRAWL_INDEXES = [
   'CC-MAIN-2026-34',
@@ -347,23 +348,42 @@ function sourceHostHint(result) {
   return source.replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
+function publisherHostHint(result) {
+  const candidates = [result?.publisherUrl, result?.publisherHost, result?.publisherDomain].filter(Boolean);
+  for (const raw of candidates) {
+    try {
+      const h = normalizedHost(cleanUrl(String(raw), 'https://example.com/'));
+      if (h && !/^(?:news\.google\.com|google\.|bing\.|search\.yahoo\.|duckduckgo\.|mojeek\.)/i.test(h)) return h;
+    } catch {}
+  }
+  return '';
+}
+
 function candidatePublisherScore(url, result, anchorText = '') {
   if (!isPublisherCandidateUrl(url, result)) return -Infinity;
   let score = 0;
   const u = new URL(url);
   const path = `${u.pathname}${u.search}`;
+  const sim = titleSimilarity(String(result?.title || ''), String(anchorText || ''));
   score += Math.min(6, pathDepth(url));
   if (ARTICLE_PATH_HINT.test(path)) score += 5;
   if (/^www\./i.test(u.hostname)) score += 0.2;
-  const hint = sourceHostHint(result);
-  if (hint) {
-    const hostWords = normalizedHost(url).replace(/\./g, ' ').split(/\s+/).filter(Boolean);
-    const hintWords = hint.split(/\s+/).filter(w => w.length > 2);
+
+  const sourceHint = sourceHostHint(result);
+  const publisherHint = publisherHostHint(result);
+  const targetHost = normalizedHost(url);
+  if (publisherHint && (targetHost === publisherHint || targetHost.endsWith(`.${publisherHint}`))) score += 18;
+  if (sourceHint) {
+    const hostWords = targetHost.replace(/\./g, ' ').split(/\s+/).filter(Boolean);
+    const hintWords = sourceHint.split(/\s+/).filter(w => w.length > 2);
     if (hintWords.some(w => hostWords.includes(w))) score += 8;
   }
-  const anchor = String(anchorText || '').toLowerCase();
-  const titleTokens = extractSearchTerms(String(result?.title || '')).slice(0, 12);
-  for (const t of titleTokens) if (anchor.includes(t)) score += 0.5;
+
+  if (sim >= 0.9) score += 45;
+  else if (sim >= 0.7) score += 30;
+  else if (sim >= 0.5) score += 18;
+  else if (sim >= 0.35) score += 6;
+
   return score;
 }
 
@@ -668,13 +688,28 @@ function extractSearchTerms(query) {
 function queryIntent(query, requestedType) {
   const q = query.toLowerCase();
   const hasAny = xs => xs.some(x => q.includes(x));
-  const mixed = requestedType === 'mixed' || requestedType === 'all';
-  const wantsNews = mixed || requestedType === 'news' || hasAny(NEWS_QUERY_HINTS);
-  const wantsVideo = mixed || requestedType === 'video' || hasAny(VIDEO_QUERY_HINTS);
-  const wantsDocs = mixed || requestedType === 'doc' || hasAny(DOC_QUERY_HINTS);
-  const wantsGov = mixed || requestedType === 'gov' || /\b(india|indian|government|govt|ministry|scheme|gst|income tax|mca|rbi|sebi|law|act|notification|circular|policy)\b/i.test(q);
+  const explicit = String(requestedType || '').toLowerCase();
+  const mixed = explicit === 'mixed' || explicit === 'all';
+  const indiaGovHint = /\b(india|indian|government|govt|ministry|scheme|gst|income tax|mca|rbi|sebi|law|act|notification|circular|policy)\b/i.test(q);
+
+  // An explicit requested type must dominate lexical hints.
+  // Example: "latest semiconductor policy India PDF" in mode=doc must NOT turn into a news search.
+  if (!mixed && explicit) {
+    return {
+      type: explicit,
+      wantsNews: explicit === 'news',
+      wantsVideo: explicit === 'video',
+      wantsDocs: explicit === 'doc' || explicit === 'docs' || explicit === 'document',
+      wantsGov: explicit === 'gov' || indiaGovHint || explicit === 'doc' || explicit === 'docs' || explicit === 'document',
+    };
+  }
+
+  const wantsNews = mixed || hasAny(NEWS_QUERY_HINTS);
+  const wantsVideo = mixed || hasAny(VIDEO_QUERY_HINTS);
+  const wantsDocs = mixed || hasAny(DOC_QUERY_HINTS);
+  const wantsGov = mixed || indiaGovHint;
   return {
-    type: requestedType || (wantsVideo ? 'video' : wantsNews ? 'news' : wantsDocs ? 'doc' : 'web'),
+    type: mixed ? 'mixed' : (wantsVideo ? 'video' : wantsNews ? 'news' : wantsDocs ? 'doc' : 'web'),
     wantsNews, wantsVideo, wantsGov, wantsDocs,
   };
 }
@@ -1149,11 +1184,7 @@ function contentPriorityScore(r, query, intent, dateIntent) {
 }
 
 function selectVerificationCandidates(results, count) {
-  const ranked = [...results].sort((a, b) => {
-    const aw = /^news\.google\.com$/i.test(hostname(a.url)) ? -10 : 0;
-    const bw = /^news\.google\.com$/i.test(hostname(b.url)) ? -10 : 0;
-    return ((b._score || 0) + bw) - ((a._score || 0) + aw);
-  });
+  const ranked = [...results];
   const selected = [], domains = new Set(), urls = new Set();
   for (const r of ranked) {
     if (selected.length >= count) break;
@@ -1171,24 +1202,30 @@ function resolveLinkFromHtml(html, baseUrl, result = null) {
   const addCandidate = (raw, anchorText = '', source = '') => {
     const u = cleanUrl(raw, baseUrl);
     if (!u || !isPublisherCandidateUrl(u, result)) return;
-    const score = candidatePublisherScore(u, result, anchorText);
+    const anchor = cleanExtractedText(stripTags(anchorText || ''));
+    const sim = titleSimilarity(String(result?.title || ''), anchor);
+    // For a news wrapper we want the title-matching article link, not an arbitrary deep link.
+    if (source === 'anchor' && sim < 0.35) return;
+    const score = candidatePublisherScore(u, result, anchor);
     if (!Number.isFinite(score)) return;
-    candidates.push({ url: u, score, source });
+    candidates.push({ url: u, score, source, sim });
   };
 
   const redirectMeta = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']/i)?.[1];
-  if (redirectMeta) addCandidate(redirectMeta, '', 'meta-refresh');
+  if (redirectMeta) addCandidate(redirectMeta, String(result?.title || ''), 'meta-refresh');
 
   for (const m of html.matchAll(/(?:location\.href|location\.replace|window\.location(?:\.href)?)[\s=]*(?:\(|)["']([^"']+)["']/gi)) {
-    addCandidate(m[1], '', 'javascript-redirect');
+    addCandidate(m[1], String(result?.title || ''), 'javascript-redirect');
   }
 
-  for (const m of html.matchAll(/<a[^>]+href=["'](https?:\/\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
-    addCandidate(m[1], stripTags(m[2]), 'anchor');
+  for (const m of html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+    addCandidate(m[1], m[2], 'anchor');
   }
 
   candidates.sort((a, b) => b.score - a.score);
-  return candidates[0]?.url || null;
+  const best = candidates[0];
+  if (best && (best.sim >= 0.35 || publisherHostHint(result) && normalizedHost(best.url) === publisherHostHint(result))) return best.url;
+  return null;
 }
 
 async function resolveNewsWrapper(result, deadline) {
@@ -1218,34 +1255,79 @@ async function resolveNewsWrapper(result, deadline) {
   return result;
 }
 
+async function publisherHomeLookup(result, deadline) {
+  if (!/^news\.google\.com$/i.test(hostname(result.url))) return result;
+  const sourceUrl = cleanUrl(result.publisherUrl, result.url);
+  const host = normalizedHost(sourceUrl);
+  if (!sourceUrl || !host || !isPublisherCandidateUrl(sourceUrl, result) || remainingMs(deadline) < 1700) return result;
+  try {
+    const res = await fetchResponse(sourceUrl, {
+      timeout: 2500, deadline,
+      headers: { accept: 'text/html,application/xhtml+xml;q=0.95,*/*;q=0.2' },
+    });
+    if (!res.ok) { try { await res.body?.cancel?.(); } catch {} return result; }
+    const html = await readBodyText(res, 650_000, deadline);
+    const anchors = [];
+    for (const m of html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+      const href = cleanUrl(m[1], sourceUrl);
+      const text = cleanExtractedText(stripTags(m[2]));
+      if (!href || !text || !isPublisherCandidateUrl(href, result)) continue;
+      const sim = titleSimilarity(result.title, text);
+      if (sim < 0.55) continue;
+      anchors.push({ href, text, sim, score: sim * 100 + candidatePublisherScore(href, result, text) });
+    }
+    anchors.sort((a, b) => b.score - a.score);
+    const best = anchors[0];
+    if (best) {
+      try { await res.body?.cancel?.(); } catch {}
+      return { ...result, publisherWrapperUrl: result.url, url: best.href, domain: hostname(best.href), publisherUrl: sourceUrl, publisherResolved: true, publisherResolutionMethod: 'publisher-home-title-link' };
+    }
+  } catch {}
+  return result;
+}
+
 async function publisherLookupByTitle(result, deadline) {
   if (!/^news\.google\.com$/i.test(hostname(result.url))) return result;
-  if (!result.title || remainingMs(deadline) < 1300) return result;
+  if (!result.title || remainingMs(deadline) < 1200) return result;
+
   const title = String(result.title).replace(/["']/g, ' ').replace(/\s+/g, ' ').trim();
   const source = String(result.source || '').replace(/^google-news:/, '').trim();
-  const q = `"${truncate(title, 220)}" ${source}`;
-  const urls = [
-    `https://www.bing.com/search?q=${encodeURIComponent(q)}&count=10&setlang=en-IN&cc=in`,
-    `https://www.google.com/search?q=${encodeURIComponent(q)}&num=10&hl=en&gl=in`,
+  const publisherHost = publisherHostHint(result);
+  const queries = [];
+  if (publisherHost) queries.push(`"${truncate(title, 220)}" site:${publisherHost}`);
+  if (source) queries.push(`"${truncate(title, 220)}" ${source}`);
+  queries.push(`"${truncate(title, 220)}"`);
+
+  const engineBases = [
+    q => `https://www.bing.com/search?q=${encodeURIComponent(q)}&count=10&setlang=en-IN&cc=in`,
+    q => `https://www.google.com/search?q=${encodeURIComponent(q)}&num=10&hl=en&gl=in`,
   ];
-  for (const engineUrl of urls) {
-    if (remainingMs(deadline) < 1000) break;
-    try {
-      const html = await fetchText(engineUrl, { timeout: 2300, maxBytes: 400_000, deadline });
-      const found = engineUrl.includes('bing') ? parseBing(html) : parseGoogleWeb(html);
-      const titleTokens = extractSearchTerms(title);
-      const scored = found.map(r => {
-        if (!isPublisherCandidateUrl(r.url, result)) return null;
-        const candidateTitle = String(r.title || '').toLowerCase();
-        const hits = titleTokens.filter(t => candidateTitle.includes(t)).length;
-        const ratio = titleTokens.length ? hits / titleTokens.length : 0;
-        if (hits < Math.max(2, Math.ceil(titleTokens.length * 0.25)) && ratio < 0.4) return null;
-        const score = hits * 4 + ratio * 10 + candidatePublisherScore(r.url, result, r.title);
-        return { r, score };
-      }).filter(Boolean).sort((a, b) => b.score - a.score);
-      const candidate = scored[0]?.r;
-      if (candidate) return { ...result, publisherWrapperUrl: result.url, url: candidate.url, domain: hostname(candidate.url), publisherResolved: true, publisherResolutionMethod: 'title-search', publisherSearchSource: candidate.source };
-    } catch {}
+
+  for (const q of queries.slice(0, 3)) {
+    for (const makeUrl of engineBases) {
+      if (remainingMs(deadline) < 1000) break;
+      try {
+        const engineUrl = makeUrl(q);
+        const html = await fetchText(engineUrl, { timeout: 2200, maxBytes: 400_000, deadline });
+        const found = engineUrl.includes('bing') ? parseBing(html) : parseGoogleWeb(html);
+        const scored = found.map(r => {
+          if (!isPublisherCandidateUrl(r.url, result)) return null;
+          const sim = titleSimilarity(title, r.title);
+          const host = normalizedHost(r.url);
+          if (sim < 0.5) return null;
+          if (publisherHost && !(host === publisherHost || host.endsWith(`.${publisherHost}`))) return null;
+          return { r, score: sim * 60 + candidatePublisherScore(r.url, result, r.title) };
+        }).filter(Boolean).sort((a, b) => b.score - a.score);
+        const candidate = scored[0]?.r;
+        if (candidate) {
+          return {
+            ...result, publisherWrapperUrl: result.url, url: candidate.url, domain: hostname(candidate.url),
+            publisherResolved: true, publisherResolutionMethod: publisherHost ? 'targeted-title-search' : 'title-search',
+            publisherSearchSource: candidate.source,
+          };
+        }
+      } catch {}
+    }
   }
   return result;
 }
@@ -1784,6 +1866,26 @@ async function aiRerank(query, results, mode, dateIntent, deadline) {
   return parsed.order.map(Number).filter(Number.isInteger).filter(i => i >= 0 && i < results.length);
 }
 
+function isRealContentResult(result) {
+  const status = String(result?.contentStatus || '').toLowerCase();
+  const method = String(result?.contentMethod || '').toLowerCase();
+  const content = String(result?.pageContent || result?.extractedText || '').trim();
+  if (!content) return false;
+  if (!['full', 'reader', 'alternate'].includes(status)) return false;
+  if (method === 'search-snippet' || method === 'metadata-fallback') return false;
+  if (isBlockedContentUrl(result?.url)) return false;
+  if (/javascript|ecmascript|json|xml|css|image\//i.test(String(result?.contentType || ''))) return false;
+  if (looksLikeJavaScriptBody(content, result?.contentType || '')) return false;
+  return content.length >= 250;
+}
+
+function contentOnlySelection(results, count, requireRealContent, warnings) {
+  const real = results.filter(isRealContentResult);
+  if (!requireRealContent) return diversifyAndSelect(results, count, { wantsNews: false, wantsVideo: false, wantsDocs: false });
+  if (real.length < count) warnings.push(`Only ${real.length} result(s) had validated publisher content; ${count} were requested. Unvalidated snippet-only results were excluded.`);
+  return diversifyAndSelect(real, count, { wantsNews: results.some(r => r.type === 'news'), wantsVideo: results.some(r => r.type === 'video'), wantsDocs: results.some(r => r.type === 'doc') });
+}
+
 async function commonCrawlLookup(url, deadline) {
   if (!safeHttpUrl(url) || remainingMs(deadline) < 800) return null;
   const encoded = encodeURIComponent(url);
@@ -1835,6 +1937,7 @@ async function performSearch(input, started, deadline) {
   const useAi = String(input.ai ?? input.useAi ?? 'auto').toLowerCase();
   const verifyRequested = input.verify == null ? true : String(input.verify).toLowerCase() !== 'false';
   const useCc = input.commonCrawl == null ? false : String(input.commonCrawl).toLowerCase() === 'true';
+  const requireRealContent = input.requireRealContent == null ? true : String(input.requireRealContent).toLowerCase() !== 'false';
 
   const baseIntent = queryIntent(query, requestedType || null);
   const dateIntent = parseDateIntent(query);
@@ -1887,18 +1990,16 @@ async function performSearch(input, started, deadline) {
   const newsCandidates = discovered.filter(r => r.type === 'news' && /^news\.google\.com$/i.test(hostname(r.url))).slice(0, MAX_NEWS_RESOLVES);
   if (newsCandidates.length && remainingMs(deadline) > 2800) {
     flags.publisherResolutionAttempted = newsCandidates.length;
-    const firstPass = await Promise.all(newsCandidates.map(r => resolveNewsWrapper(r, deadline)));
-    const unresolved = firstPass.filter(r => /^news\.google\.com$/i.test(hostname(r.url)));
-    let secondPass = firstPass;
-    if (unresolved.length && remainingMs(deadline) > 1800) {
-      const lookup = unresolved.slice(0, MAX_PUBLISHER_LOOKUPS);
-      const mapped = await Promise.all(lookup.map(r => publisherLookupByTitle(r, deadline)));
-      const map = new Map(mapped.map(x => [normalizedKey(x.url), x]));
-      secondPass = firstPass.map(x => map.get(normalizedKey(x.url)) || x);
-    }
-    const byOldKey = new Map(newsCandidates.map((x, i) => [normalizedKey(x.url), secondPass[i]]));
+    const resolvedPairs = await Promise.all(newsCandidates.map(async original => {
+      let current = await resolveNewsWrapper(original, deadline);
+      if (/^news\.google\.com$/i.test(hostname(current.url)) && remainingMs(deadline) > 1800) current = await publisherHomeLookup(current, deadline);
+      if (/^news\.google\.com$/i.test(hostname(current.url)) && remainingMs(deadline) > 1400) current = await publisherLookupByTitle(current, deadline);
+      return { oldKey: normalizedKey(original.url), result: current };
+    }));
+
+    const byOldKey = new Map(resolvedPairs.map(x => [x.oldKey, x.result]));
     discovered = discovered.map(r => byOldKey.get(normalizedKey(r.url)) || r);
-    flags.publisherResolutionSucceeded = discovered.filter(r => r.publisherResolved).length;
+    flags.publisherResolutionSucceeded = discovered.filter(r => r.publisherResolved && !/^news\.google\.com$/i.test(hostname(r.url))).length;
     if (flags.publisherResolutionSucceeded) warnings.push(`Resolved ${flags.publisherResolutionSucceeded} news result(s) to publisher URLs before content extraction.`);
   }
 
@@ -1951,7 +2052,7 @@ async function performSearch(input, started, deadline) {
     warnings.push('Returned the best available live evidence before the crawler safety budget was exhausted.');
   }
 
-  discovered = diversifyAndSelect(discovered, count, baseIntent);
+  discovered = contentOnlySelection(discovered, count, requireRealContent, warnings);
   const finalResults = discovered.slice(0, count).map((r, i) => ({
     rank: i + 1,
     title: truncate(r.title || 'Untitled', 300),
@@ -1972,16 +2073,17 @@ async function performSearch(input, started, deadline) {
     publisherResolutionMethod: r.publisherResolutionMethod || null,
     searchWrapperResolved: Boolean(r.searchWrapperResolved),
     searchWrapperProvider: r.searchWrapperProvider || null,
-    extractedText: truncate(r.extractedText || r.pageContent || extractFallbackContent(r, query), MAX_TEXT_CHARS),
-    pageContent: truncate(r.pageContent || r.extractedText || extractFallbackContent(r, query), MAX_TEXT_CHARS),
-    contentAvailable: true,
+    extractedText: truncate(r.extractedText || r.pageContent || '', MAX_TEXT_CHARS),
+    pageContent: truncate(r.pageContent || r.extractedText || '', MAX_TEXT_CHARS),
+    contentAvailable: isRealContentResult(r),
     contentStatus: r.contentStatus || 'snippet_fallback',
     contentMethod: r.contentMethod || 'search-snippet',
     contentLength: Number(r.contentLength || String(r.pageContent || r.extractedText || '').length),
     contentConfidence: Number(r.contentConfidence ?? 0.35),
     contentSourceUrl: r.contentSourceUrl || r.url,
     contentFormat: 'plain_text',
-    contentRole: (r.contentStatus === 'full' || r.contentStatus === 'reader' || r.contentStatus === 'alternate') ? 'publisher_page_content' : 'search_evidence_fallback',
+    contentRole: isRealContentResult(r) ? 'publisher_page_content' : 'search_evidence_fallback',
+    contentForAI: isRealContentResult(r) ? `SOURCE_URL: ${r.contentSourceUrl || r.url}\nTITLE: ${truncate(r.title || '', 300)}\nCONTENT_STATUS: ${r.contentStatus}\n\n${truncate(r.pageContent || r.extractedText || '', MAX_TEXT_CHARS)}` : '',
     contentError: r.contentError || null,
     contentTruncated: String(r.pageContent || r.extractedText || '').length >= MAX_TEXT_CHARS,
     verificationMethod: r.verificationMethod || null,
@@ -1991,8 +2093,8 @@ async function performSearch(input, started, deadline) {
     commonCrawl: r.commonCrawl || null,
   }));
 
-  if (verifyRequested && finalResults.length && !finalResults.some(r => r.contentStatus === 'full' || r.contentStatus === 'reader' || r.contentStatus === 'alternate')) {
-    warnings.push('The selected sources were discoverable but their publishers did not expose full page text to the crawler; pageContent therefore contains the real search evidence/snippet instead of null.');
+  if (requireRealContent && !finalResults.length) {
+    warnings.push('No result was returned because no candidate produced validated live publisher content within the crawler safety budget. Snippet-only evidence was deliberately excluded.');
   }
 
   return {
@@ -2027,7 +2129,8 @@ async function performSearch(input, started, deadline) {
       publisherResolutionSucceeded: flags.publisherResolutionSucceeded,
       dateIntent,
       streamed: true,
-      contentGuarantee: 'non-null AI-readable pageContent; full/reader/alternate status only when page content passes non-asset/article validation',
+      contentGuarantee: requireRealContent ? 'final results contain only validated publisher/reader page content; snippet-only candidates are excluded' : 'fallback content allowed because requireRealContent=false',
+      requireRealContent,
     },
     results: finalResults,
     warnings: [
