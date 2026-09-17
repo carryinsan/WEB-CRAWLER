@@ -36,7 +36,7 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-1.3.0';
+const VERSION = 'arix-crawler-1.4.0';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 500;
@@ -212,6 +212,74 @@ function normalizedKey(url) {
     const p = u.pathname.replace(/\/{2,}/g, '/').replace(/\/$/, '');
     return `${normalizedHost(url)}${p}${u.search}`;
   } catch { return String(url || '').toLowerCase(); }
+}
+
+const BLOCKED_CONTENT_HOSTS = [
+  'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'googlesyndication.com',
+  'googleadservices.com', 'googleusercontent.com', 'gstatic.com', 'googleapis.com',
+  'facebook.net', 'connect.facebook.net', 'scorecardresearch.com', 'pixel.wp.com',
+  'adsrvr.org', 'amazon-adsystem.com', 'taboola.com', 'outbrain.com',
+];
+
+const BLOCKED_CONTENT_EXTENSIONS = /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|woff2?|ttf|otf|eot|mp3|wav|m4a|mp4|webm|mov|avi|zip|rar|7z|exe|dmg)(?:$|[?#])/i;
+const BLOCKED_DATA_PATH = /(?:^|[\/_-])(analytics|gtag|ga4|collect|pixel|beacon|tracking|tracker|telemetry|consent|ads?)(?:[\/_-]|$)/i;
+const ARTICLE_PATH_HINT = /(?:article|articles|story|stories|news|post|posts|blog|blogs|update|updates|report|reports|press-release|pressrelease|explained|live|202\d[\/.-]\d{1,2}[\/.-]\d{1,2})/i;
+
+function isBlockedContentHost(url) {
+  const h = normalizedHost(url);
+  return BLOCKED_CONTENT_HOSTS.some(d => h === d || h.endsWith(`.${d}`));
+}
+
+function isBlockedContentUrl(url) {
+  if (!url) return true;
+  if (isBlockedContentHost(url)) return true;
+  let u;
+  try { u = new URL(url); } catch { return true; }
+  const pathAndQuery = `${u.pathname}${u.search}`;
+  if (BLOCKED_CONTENT_EXTENSIONS.test(pathAndQuery)) return true;
+  if (BLOCKED_DATA_PATH.test(u.pathname)) return true;
+  if (/(?:[?&](?:collect|measurement|tid|cid|ea|ec|el|t|v|_ga|_gl)=)/i.test(u.search)) return true;
+  return false;
+}
+
+function isPublisherCandidateUrl(url, result = null) {
+  if (!safeHttpUrl(url) || isBlockedContentUrl(url)) return false;
+  const h = normalizedHost(url);
+  if (!h || /^(?:news\.)?google\./i.test(h) || /^gstatic\./i.test(h)) return false;
+  if (/^(?:www\.)?(bing|search\.yahoo|duckduckgo|mojeek)\./i.test(h)) return false;
+  if (result?.type === 'doc') return isDocUrl(url) && !isBlockedContentUrl(url);
+  if (result?.type === 'video') return isLikelyVideoUrl(url);
+  return true;
+}
+
+function pathDepth(url) {
+  try { return new URL(url).pathname.split('/').filter(Boolean).length; } catch { return 0; }
+}
+
+function sourceHostHint(result) {
+  const source = String(result?.source || '').replace(/^google-news:/i, '').trim().toLowerCase();
+  if (!source) return '';
+  return source.replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function candidatePublisherScore(url, result, anchorText = '') {
+  if (!isPublisherCandidateUrl(url, result)) return -Infinity;
+  let score = 0;
+  const u = new URL(url);
+  const path = `${u.pathname}${u.search}`;
+  score += Math.min(6, pathDepth(url));
+  if (ARTICLE_PATH_HINT.test(path)) score += 5;
+  if (/^www\./i.test(u.hostname)) score += 0.2;
+  const hint = sourceHostHint(result);
+  if (hint) {
+    const hostWords = normalizedHost(url).replace(/\./g, ' ').split(/\s+/).filter(Boolean);
+    const hintWords = hint.split(/\s+/).filter(w => w.length > 2);
+    if (hintWords.some(w => hostWords.includes(w))) score += 8;
+  }
+  const anchor = String(anchorText || '').toLowerCase();
+  const titleTokens = extractSearchTerms(String(result?.title || '')).slice(0, 12);
+  for (const t of titleTokens) if (anchor.includes(t)) score += 0.5;
+  return score;
 }
 
 function isGovUrl(url) {
@@ -684,7 +752,7 @@ function parseGoogleWeb(html, source = 'google', forcedType = 'web') {
     } catch {}
     if (!/^https?:\/\//i.test(raw)) continue;
     const url = cleanUrl(raw, 'https://www.google.com/');
-    if (!url) continue;
+    if (!url || isBlockedContentUrl(url)) continue;
     const host = normalizedHost(url);
     if (/^google\.(com|co\.in)$/.test(host) && /\/search|\/url\b/i.test(new URL(url).pathname + new URL(url).search)) continue;
     const title = stripTags(m[2]).replace(/\s+/g, ' ').trim();
@@ -848,7 +916,7 @@ async function discoverOne(engine, deadline) {
 function dedupeResults(results) {
   const map = new Map();
   for (const r of results) {
-    if (!r?.url || !safeHttpUrl(r.url)) continue;
+    if (!r?.url || !safeHttpUrl(r.url) || isBlockedContentUrl(r.url)) continue;
     const key = normalizedKey(r.url);
     const existing = map.get(key);
     if (!existing || (r.verified && !existing.verified) || ((r.snippet || '').length > (existing.snippet || '').length)) {
@@ -983,21 +1051,29 @@ function selectVerificationCandidates(results, count) {
   return selected;
 }
 
-function resolveLinkFromHtml(html, baseUrl) {
+function resolveLinkFromHtml(html, baseUrl, result = null) {
   const candidates = [];
-  const redirectMeta = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']/i)?.[1];
-  if (redirectMeta) candidates.push(redirectMeta);
-  for (const m of html.matchAll(/(?:location\.href|location\.replace|window\.location(?:\.href)?)[\s=]*(?:\(|)["']([^"']+)["']/gi)) candidates.push(m[1]);
-  for (const m of html.matchAll(/href=["'](https?:\/\/[^"']+)["']/gi)) candidates.push(m[1]);
-  for (const raw of candidates) {
+  const addCandidate = (raw, anchorText = '', source = '') => {
     const u = cleanUrl(raw, baseUrl);
-    if (!u || !safeHttpUrl(u)) continue;
-    const h = hostname(u);
-    if (!h || /^news\.google\.com$/i.test(h) || /^google\./i.test(h) || /^gstatic\./i.test(h)) continue;
-    if (/doubleclick|googletagmanager|googleusercontent/i.test(u)) continue;
-    return u;
+    if (!u || !isPublisherCandidateUrl(u, result)) return;
+    const score = candidatePublisherScore(u, result, anchorText);
+    if (!Number.isFinite(score)) return;
+    candidates.push({ url: u, score, source });
+  };
+
+  const redirectMeta = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']/i)?.[1];
+  if (redirectMeta) addCandidate(redirectMeta, '', 'meta-refresh');
+
+  for (const m of html.matchAll(/(?:location\.href|location\.replace|window\.location(?:\.href)?)[\s=]*(?:\(|)["']([^"']+)["']/gi)) {
+    addCandidate(m[1], '', 'javascript-redirect');
   }
-  return null;
+
+  for (const m of html.matchAll(/<a[^>]+href=["'](https?:\/\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+    addCandidate(m[1], stripTags(m[2]), 'anchor');
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]?.url || null;
 }
 
 async function resolveNewsWrapper(result, deadline) {
@@ -1015,13 +1091,13 @@ async function resolveNewsWrapper(result, deadline) {
         headers: { accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1' },
       });
       const finalUrl = cleanUrl(res.url || result.url, result.url);
-      if (finalUrl && !/^news\.google\.com$/i.test(hostname(finalUrl))) {
+      if (finalUrl && isPublisherCandidateUrl(finalUrl, result)) {
         try { await res.body?.cancel?.(); } catch {}
-        return { ...result, url: finalUrl, domain: hostname(finalUrl), publisherResolved: true, publisherResolutionMethod: 'redirect' };
+        return { ...result, publisherWrapperUrl: result.url, url: finalUrl, domain: hostname(finalUrl), publisherResolved: true, publisherResolutionMethod: 'redirect' };
       }
       const html = await readBodyText(res, 220_000, deadline).catch(() => '');
-      const embedded = resolveLinkFromHtml(html, result.url);
-      if (embedded) return { ...result, url: embedded, domain: hostname(embedded), publisherResolved: true, publisherResolutionMethod: 'wrapper-html' };
+      const embedded = resolveLinkFromHtml(html, result.url, result);
+      if (embedded) return { ...result, publisherWrapperUrl: result.url, url: embedded, domain: hostname(embedded), publisherResolved: true, publisherResolutionMethod: 'wrapper-html' };
     } catch {}
   }
   return result;
@@ -1042,15 +1118,18 @@ async function publisherLookupByTitle(result, deadline) {
     try {
       const html = await fetchText(engineUrl, { timeout: 2300, maxBytes: 400_000, deadline });
       const found = engineUrl.includes('bing') ? parseBing(html) : parseGoogleWeb(html);
-      const candidate = found.find(r => {
-        const h = normalizedHost(r.url);
-        if (!h || /^google\.|^news\.google\.com$|^bing\.com$/.test(h)) return false;
-        const titleTokens = extractSearchTerms(title);
+      const titleTokens = extractSearchTerms(title);
+      const scored = found.map(r => {
+        if (!isPublisherCandidateUrl(r.url, result)) return null;
         const candidateTitle = String(r.title || '').toLowerCase();
         const hits = titleTokens.filter(t => candidateTitle.includes(t)).length;
-        return hits >= Math.max(2, Math.ceil(titleTokens.length * 0.25));
-      });
-      if (candidate) return { ...result, url: candidate.url, domain: hostname(candidate.url), publisherResolved: true, publisherResolutionMethod: 'title-search', publisherSearchSource: candidate.source };
+        const ratio = titleTokens.length ? hits / titleTokens.length : 0;
+        if (hits < Math.max(2, Math.ceil(titleTokens.length * 0.25)) && ratio < 0.4) return null;
+        const score = hits * 4 + ratio * 10 + candidatePublisherScore(r.url, result, r.title);
+        return { r, score };
+      }).filter(Boolean).sort((a, b) => b.score - a.score);
+      const candidate = scored[0]?.r;
+      if (candidate) return { ...result, publisherWrapperUrl: result.url, url: candidate.url, domain: hostname(candidate.url), publisherResolved: true, publisherResolutionMethod: 'title-search', publisherSearchSource: candidate.source };
     } catch {}
   }
   return result;
@@ -1075,7 +1154,7 @@ function readerUrls(url) {
 }
 
 async function readerFallback(url, deadline) {
-  if (!safeHttpUrl(url) || remainingMs(deadline) < 1200) return null;
+  if (!safeHttpUrl(url) || isBlockedContentUrl(url) || remainingMs(deadline) < 1200) return null;
   for (const proxyUrl of readerUrls(url).slice(0, 2)) {
     if (remainingMs(deadline) < 1000) break;
     try {
@@ -1094,6 +1173,7 @@ async function readerFallback(url, deadline) {
 }
 
 async function fetchVariantContent(url, deadline) {
+  if (!isPublisherCandidateUrl(url)) return null;
   try {
     const u = new URL(url);
     const candidates = [];
@@ -1316,9 +1396,68 @@ function ensureContentFields(result, query, info = {}) {
   };
 }
 
+
+function titleSimilarity(a, b) {
+  const aa = new Set(extractSearchTerms(String(a || '')));
+  const bb = new Set(extractSearchTerms(String(b || '')));
+  if (!aa.size || !bb.size) return 0;
+  let hits = 0;
+  for (const token of aa) if (bb.has(token)) hits++;
+  return hits / Math.max(aa.size, bb.size);
+}
+
+function looksLikeJavaScriptBody(body, contentType) {
+  const ct = String(contentType || '').toLowerCase();
+  if (/javascript|ecmascript/.test(ct)) return true;
+  const sample = String(body || '').slice(0, 6000).trim();
+  if (!sample) return false;
+  if (/^(?:!function|function\s+|\(function|window\.|document\.|(?:var|let|const)\s+[A-Za-z_$]|[A-Za-z_$][\w$]*\s*=\s*function)/i.test(sample)) return true;
+  if (/(?:google-analytics|googletagmanager|gtag\(|google_tag_manager|doubleclick|dataLayer\.push|window\.__)/i.test(sample)) return true;
+  return false;
+}
+
+function assessHtmlContent(html, text, result, finalUrl, title) {
+  const bodyText = String(text || '').trim();
+  const lowerHtml = String(html || '').toLowerCase();
+  let score = 0;
+  const signals = [];
+  if (/<article\b/i.test(html)) { score += 5; signals.push('article'); }
+  if (/<main\b/i.test(html)) { score += 3; signals.push('main'); }
+  if (/<h1\b/i.test(html)) { score += 2; signals.push('h1'); }
+  if (/<time\b/i.test(html) || /datepublished|datepublished/i.test(html)) { score += 1; signals.push('date'); }
+  if (/application\/ld\+json/i.test(lowerHtml) && /articlebody|newsarticle|article/i.test(lowerHtml)) { score += 4; signals.push('jsonld-article'); }
+  const pCount = (html.match(/<p\b/gi) || []).length;
+  if (pCount >= 5) { score += 2; signals.push('paragraphs'); }
+  if (pCount >= 12) { score += 1; signals.push('many-paragraphs'); }
+  const sim = titleSimilarity(result.title, title);
+  if (sim >= 0.75) { score += 5; signals.push('title-match'); }
+  else if (sim >= 0.45) { score += 3; signals.push('title-partial-match'); }
+  if (ARTICLE_PATH_HINT.test(finalUrl)) { score += 2; signals.push('article-path'); }
+  if (bodyText.length >= 1500) { score += 2; signals.push('long-text'); }
+  if (bodyText.length >= 5000) { score += 1; signals.push('very-long-text'); }
+  if (/google-analytics|googletagmanager|doubleclick|dataLayer\.push|gtag\(/i.test(bodyText.slice(0, 12000))) {
+    score -= 20; signals.push('tracking-code');
+  }
+  if (/^untitled$|enable javascript|javascript required/i.test(String(title || ''))) score -= 4;
+
+  const minimum = result.type === 'news' ? 8 : 5;
+  const acceptable = bodyText.length >= 350 && score >= minimum;
+  return { acceptable, score, signals, titleSimilarity: Number(sim.toFixed(2)) };
+}
+
+function contentTypeIsPageLike(contentType, body) {
+  const ct = String(contentType || '').toLowerCase();
+  if (/javascript|ecmascript|json|xml|css|image\/|font\//i.test(ct)) return false;
+  return /text\/html|application\/xhtml/i.test(ct) || /<html\b/i.test(String(body || ''));
+}
+
 async function enrichResult(result, query, deadline) {
   if (result.type === 'video' && isYouTube(result.url)) return enrichYouTubeResult(result, query, deadline);
   if (!safeHttpUrl(result.url)) return ensureContentFields({ ...result, verified: false, verificationError: 'UNSAFE_URL' }, query);
+
+  if (isBlockedContentUrl(result.url)) {
+    return ensureContentFields({ ...result, verified: false, verificationError: 'BLOCKED_NON_CONTENT_URL' }, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(result, query), confidence: 0.35, error: 'BLOCKED_NON_CONTENT_URL' });
+  }
 
   const fallbackBase = ensureContentFields(result, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(result, query), confidence: 0.35 });
   try {
@@ -1335,6 +1474,18 @@ async function enrichResult(result, query, deadline) {
 
     const finalUrl = cleanUrl(res.url || result.url, result.url) || result.url;
     const contentType = res.headers.get('content-type') || '';
+
+    if (!isPublisherCandidateUrl(finalUrl, result)) {
+      try { await res.body?.cancel?.(); } catch {}
+      if (result.publisherWrapperUrl && !result._publisherRetry && remainingMs(deadline) > 2200) {
+        const retryBase = { ...result, url: result.publisherWrapperUrl, _publisherRetry: true };
+        const retry = await publisherLookupByTitle(retryBase, deadline);
+        if (retry?.url && retry.url !== result.publisherWrapperUrl && isPublisherCandidateUrl(retry.url, result)) {
+          return enrichResult(retry, query, deadline);
+        }
+      }
+      return ensureContentFields({ ...result, verified: false, verificationError: 'NON_CONTENT_FINAL_URL', httpStatus: res.status, contentType }, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(result, query), confidence: 0.35, error: 'NON_CONTENT_FINAL_URL' });
+    }
 
     if (/application\/pdf/i.test(contentType) || /\.pdf(?:\?|$)/i.test(finalUrl)) {
       const bytes = await readBodyBytes(res, MAX_PAGE_BYTES, deadline);
@@ -1375,46 +1526,79 @@ async function enrichResult(result, query, deadline) {
       return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: false, httpStatus: res.status, contentType, verificationError: 'PUBLISHER_URL_NOT_RESOLVED' }, query);
     }
 
-    const htmlLike = /text\/html|application\/xhtml/i.test(contentType) || /<html\b/i.test(body);
+    if (looksLikeJavaScriptBody(body, contentType) || !contentTypeIsPageLike(contentType, body)) {
+      const reader = remainingMs(deadline) > 1800 ? await readerFallback(finalUrl, deadline) : null;
+      if (reader?.content && !isBlockedContentUrl(reader.sourceUrl || finalUrl)) {
+        return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: true, httpStatus: res.status, contentType, verificationMethod: 'jina-reader-nonpage-fallback' }, query, { status: 'reader', method: 'jina-reader', content: reader.content, confidence: 0.92 });
+      }
+      return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: false, httpStatus: res.status, contentType, verificationError: 'NON_ARTICLE_CONTENT' }, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent({ ...result, url: finalUrl }, query), confidence: 0.35, error: 'NON_ARTICLE_CONTENT' });
+    }
+
+    const htmlLike = contentTypeIsPageLike(contentType, body);
     if (htmlLike) {
       const canonical = parseCanonical(body, finalUrl);
-      const canonicalUrl = canonical && safeHttpUrl(canonical) ? canonical : finalUrl;
+      const canonicalUrl = canonical && isPublisherCandidateUrl(canonical, result) ? canonical : finalUrl;
       const title = parseTitleFromHtml(body) || result.title;
       const description = parseMeta(body, 'description') || parseMeta(body, 'og:description') || result.snippet;
       const publishedAt = parseDateFromHtml(body) || result.publishedAt || null;
       let content = extractVisibleText(body);
       let method = 'direct-html';
-      let status = content.length >= 350 ? 'full' : 'metadata';
-      let confidence = content.length >= 350 ? 0.9 : 0.55;
+      let status = 'metadata';
+      let confidence = 0.55;
+      let assessment = assessHtmlContent(body, content, result, canonicalUrl, title);
 
-      if (content.length < 500 && remainingMs(deadline) > 1500) {
-        const alternate = await fetchVariantContent(canonicalUrl, deadline);
+      if (content.length < 800 || !assessment.acceptable) {
+        const alternate = remainingMs(deadline) > 1500 ? await fetchVariantContent(canonicalUrl, deadline) : null;
         if (alternate?.content && alternate.content.length > content.length) {
-          content = alternate.content; method = alternate.method; status = 'alternate'; confidence = 0.9;
+          content = alternate.content;
+          method = alternate.method;
+          status = 'alternate';
+          confidence = 0.9;
+          assessment = { acceptable: true, score: assessment.score + 1, signals: [...assessment.signals, 'alternate-page'], titleSimilarity: assessment.titleSimilarity };
         }
       }
-      if (content.length < 500 && remainingMs(deadline) > 1500) {
+
+      if ((content.length < 800 || !assessment.acceptable) && remainingMs(deadline) > 1500) {
         const reader = await readerFallback(canonicalUrl, deadline);
         if (reader?.content && reader.content.length > content.length) {
-          content = reader.content; method = reader.method; status = 'reader'; confidence = 0.95;
+          content = reader.content;
+          method = reader.method;
+          status = 'reader';
+          confidence = 0.95;
+          assessment = { acceptable: content.length >= 500, score: Math.max(assessment.score, 8), signals: [...assessment.signals, 'reader'], titleSimilarity: assessment.titleSimilarity };
         }
       }
-      if (content.length < 250) {
-        content = `${description ? `Description: ${description}\n` : ''}${extractFallbackContent({ ...result, title, snippet: description || result.snippet, url: canonicalUrl, publishedAt }, query)}`;
-        method = 'search-snippet'; status = 'snippet_fallback'; confidence = 0.35;
+
+      if (content.length >= 350 && assessment.acceptable && !looksLikeJavaScriptBody(content, contentType)) {
+        status = status === 'metadata' ? 'full' : status;
+        if (status === 'full') confidence = 0.9;
+        return ensureContentFields({
+          ...result, url: canonicalUrl, domain: hostname(canonicalUrl), title: truncate(title, 300),
+          snippet: truncate(description || result.snippet, 1200), publishedAt, verified: true,
+          httpStatus: res.status, contentType, verificationMethod: method,
+          contentSignals: assessment.signals, contentQualityScore: assessment.score,
+          titleSimilarity: assessment.titleSimilarity,
+        }, query, { status, method, content, confidence });
       }
 
+      const fallback = `${description ? `Description: ${description}\n` : ''}${extractFallbackContent({ ...result, title, snippet: description || result.snippet, url: canonicalUrl, publishedAt }, query)}`;
       return ensureContentFields({
         ...result, url: canonicalUrl, domain: hostname(canonicalUrl), title: truncate(title, 300),
         snippet: truncate(description || result.snippet, 1200), publishedAt, verified: true,
-        httpStatus: res.status, contentType, verificationMethod: method,
-      }, query, { status, method, content, confidence });
+        httpStatus: res.status, contentType, verificationMethod: 'search-snippet',
+        contentSignals: assessment.signals, contentQualityScore: assessment.score,
+        titleSimilarity: assessment.titleSimilarity,
+      }, query, { status: 'snippet_fallback', method: 'search-snippet', content: fallback, confidence: 0.35, error: 'ARTICLE_CONTENT_NOT_VALIDATED' });
     }
 
     const plain = cleanExtractedText(body);
-    return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: true, httpStatus: res.status, contentType, verificationMethod: 'direct-text' }, query, {
-      status: plain.length >= 250 ? 'full' : 'metadata',
-      method: 'direct-text', content: plain || extractFallbackContent({ ...result, url: finalUrl }, query), confidence: plain.length >= 250 ? 0.85 : 0.5,
+    if (plain.length >= 250 && !looksLikeJavaScriptBody(plain, contentType) && !isBlockedContentUrl(finalUrl)) {
+      return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: true, httpStatus: res.status, contentType, verificationMethod: 'direct-text' }, query, {
+        status: 'full', method: 'direct-text', content: plain, confidence: 0.82,
+      });
+    }
+    return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: false, httpStatus: res.status, contentType, verificationError: 'TEXT_CONTENT_NOT_VALIDATED' }, query, {
+      status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent({ ...result, url: finalUrl }, query), confidence: 0.35, error: 'TEXT_CONTENT_NOT_VALIDATED',
     });
   } catch (error) {
     if (remainingMs(deadline) > 1400) {
@@ -1666,6 +1850,7 @@ async function performSearch(input, started, deadline) {
     trust: Number((r.trust || domainTrust(r.url)).toFixed(2)),
     relevanceScore: Math.max(0, Math.min(100, Math.round(50 + (r._score || 0) * 2))),
     publisherResolved: Boolean(r.publisherResolved),
+    publisherWrapperUrl: r.publisherWrapperUrl || null,
     extractedText: truncate(r.extractedText || r.pageContent || extractFallbackContent(r, query), MAX_TEXT_CHARS),
     pageContent: truncate(r.pageContent || r.extractedText || extractFallbackContent(r, query), MAX_TEXT_CHARS),
     contentAvailable: true,
@@ -1719,13 +1904,13 @@ async function performSearch(input, started, deadline) {
       publisherResolutionSucceeded: flags.publisherResolutionSucceeded,
       dateIntent,
       streamed: true,
-      contentGuarantee: 'non-null AI-readable pageContent with contentStatus indicating extraction quality',
+      contentGuarantee: 'non-null AI-readable pageContent; full/reader/alternate status only when page content passes non-asset/article validation',
     },
     results: finalResults,
     warnings: [
       'Core discovery is keyless but depends on public web surfaces that may rate-limit or block automated requests.',
       'No crawler can guarantee full page extraction from every website because some sites block bots, require JavaScript, require authentication, or expose media without machine-readable text.',
-      'For blocked pages, pageContent is populated from real search evidence/metadata and contentStatus identifies the fallback instead of returning null.',
+      'Tracking scripts, analytics endpoints, and static assets are rejected as content sources; blocked/unvalidated pages use real search evidence/metadata instead of pretending scripts are article text.',
       'The response begins as valid JSON and streams heartbeats so the Edge gateway is not left idle during long searches.',
       ...warnings,
     ],
