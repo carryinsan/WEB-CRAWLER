@@ -36,7 +36,7 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-1.4.0';
+const VERSION = 'arix-crawler-1.5.0';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 500;
@@ -56,9 +56,9 @@ const MAX_YOUTUBE_BYTES = 1_800_000;
 const MAX_TEXT_CHARS = 30_000;
 const MAX_TRANSCRIPT_CHARS = 30_000;
 
-const DEFAULT_VERIFY = 8;
-const DEEP_VERIFY = 12;
-const MAX_VERIFY = 12;
+const DEFAULT_VERIFY = 12;
+const DEEP_VERIFY = 20;
+const MAX_VERIFY = 20;
 const MAX_ENGINE_REQUESTS = 12;
 const MAX_NEWS_RESOLVES = 10;
 const MAX_PUBLISHER_LOOKUPS = 6;
@@ -69,7 +69,7 @@ const STREAM_HEARTBEAT_MS = 4000;
 const SEARCH_WORK_BUDGET_MS = 240_000;
 
 const USER_AGENT =
-  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.3; +https://lexis-ai-chatini.vercel.app/)';
+  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.5; +https://lexis-ai-chatini.vercel.app/)';
 
 const COMMON_CRAWL_INDEXES = [
   'CC-MAIN-2026-34',
@@ -185,19 +185,100 @@ function absoluteUrl(raw, base = 'https://example.com/') {
   try { return new URL(decodeHtml(raw), base).href; } catch { return null; }
 }
 
-function cleanUrl(raw, base) {
-  const u = absoluteUrl(raw, base);
-  if (!u) return null;
+function safeDecodeURIComponent(value) {
+  try { return decodeURIComponent(String(value || '')); } catch { return String(value || ''); }
+}
+
+function decodeBase64Url(value) {
   try {
-    const parsed = new URL(u);
+    let s = String(value || '').trim();
+    if (!s) return null;
+    s = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    const bin = typeof atob === 'function' ? atob(s) : null;
+    if (!bin) return null;
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  } catch { return null; }
+}
+
+function looksLikeHttpUrl(value) {
+  return /^https?:\/\//i.test(String(value || '').trim());
+}
+
+function unwrapSearchResultUrl(raw, base) {
+  let current = absoluteUrl(raw, base);
+  if (!current) return null;
+
+  for (let depth = 0; depth < 4; depth++) {
+    let u;
+    try { u = new URL(current); } catch { return null; }
+    const host = u.hostname.toLowerCase().replace(/^www\./, '');
+    const path = u.pathname;
+    let next = null;
+
+    // Bing result click wrapper: /ck/a?...&u=a1<base64-url>.
+    if (host === 'bing.com' && /^\/ck\/a(?:\/|$)/i.test(path)) {
+      const encoded = u.searchParams.get('u') || u.searchParams.get('url') || u.searchParams.get('target');
+      if (encoded) {
+        const candidates = [
+          encoded,
+          encoded.length > 2 ? encoded.slice(2) : '',
+          safeDecodeURIComponent(encoded),
+          encoded.length > 2 ? safeDecodeURIComponent(encoded.slice(2)) : '',
+        ];
+        for (const candidate of candidates) {
+          if (looksLikeHttpUrl(candidate)) { next = candidate; break; }
+          const decoded = decodeBase64Url(candidate);
+          if (looksLikeHttpUrl(decoded)) { next = decoded; break; }
+        }
+      }
+    }
+
+    // Google redirect wrapper: /url?q=... or /url?url=....
+    if (!next && host.startsWith('google.') && /^\/url$/i.test(path)) {
+      next = u.searchParams.get('q') || u.searchParams.get('url') || u.searchParams.get('target');
+      if (next) next = safeDecodeURIComponent(next);
+    }
+
+    // DuckDuckGo redirect wrapper: /l/?uddg=<encoded target>.
+    if (!next && (host === 'duckduckgo.com' || host === 'html.duckduckgo.com') && /^\/l\/?$/i.test(path)) {
+      next = u.searchParams.get('uddg') || u.searchParams.get('u');
+      if (next) next = safeDecodeURIComponent(next);
+    }
+
+    // Yahoo redirect wrapper commonly embeds the target in /RU=<encoded>/RK=...
+    if (!next && (host === 'search.yahoo.com' || host === 'r.search.yahoo.com')) {
+      const ru = path.match(/\/RU=([^/]+)(?:\/|$)/i)?.[1];
+      if (ru) {
+        next = safeDecodeURIComponent(ru);
+      } else {
+        next = u.searchParams.get('RU') || u.searchParams.get('url');
+        if (next) next = safeDecodeURIComponent(next);
+      }
+    }
+
+    if (!next || !looksLikeHttpUrl(next)) break;
+    const normalized = absoluteUrl(next, current);
+    if (!normalized || normalized === current) break;
+    current = normalized;
+  }
+
+  try {
+    const parsed = new URL(current);
     parsed.hash = '';
     for (const key of [...parsed.searchParams.keys()]) {
-      if (/^(utm_|gclid$|fbclid$|ref$|referrer$|cmpid$|src$|msclkid$)/i.test(key)) {
+      if (/^(utm_|gclid$|fbclid$|ref$|referrer$|cmpid$|src$|msclkid$|ntb$)/i.test(key)) {
         parsed.searchParams.delete(key);
       }
     }
     return parsed.href;
   } catch { return null; }
+}
+
+function cleanUrl(raw, base) {
+  return unwrapSearchResultUrl(raw, base);
 }
 
 function hostname(url) {
@@ -246,6 +327,10 @@ function isPublisherCandidateUrl(url, result = null) {
   if (!safeHttpUrl(url) || isBlockedContentUrl(url)) return false;
   const h = normalizedHost(url);
   if (!h || /^(?:news\.)?google\./i.test(h) || /^gstatic\./i.test(h)) return false;
+  try {
+    const u = new URL(url);
+    if (/\/ck\/a(?:\/|$)/i.test(u.pathname) || /^\/url$/i.test(u.pathname) || /^\/l\/?$/i.test(u.pathname)) return false;
+  } catch { return false; }
   if (/^(?:www\.)?(bing|search\.yahoo|duckduckgo|mojeek)\./i.test(h)) return false;
   if (result?.type === 'doc') return isDocUrl(url) && !isBlockedContentUrl(url);
   if (result?.type === 'video') return isLikelyVideoUrl(url);
@@ -705,10 +790,22 @@ function parseBing(html) {
   for (const block of blocks) {
     const m = block.match(/<h2[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
     if (!m) continue;
-    const url = cleanUrl(m[1], 'https://www.bing.com/');
-    if (!url) continue;
+    const rawSearchUrl = absoluteUrl(m[1], 'https://www.bing.com/');
+    const url = cleanUrl(rawSearchUrl, 'https://www.bing.com/');
+    if (!url || !isPublisherCandidateUrl(url)) continue;
+    const title = stripTags(m[2]).replace(/\s+/g, ' ').trim();
+    if (title.length < 3) continue;
     const snippet = stripTags((block.match(/<p[^>]*>([\s\S]*?)<\/p>/i) || [, ''])[1]);
-    out.push({ title: stripTags(m[2]), url, snippet, source: 'bing', type: 'web' });
+    const wrapperResolved = Boolean(rawSearchUrl && rawSearchUrl !== url);
+    out.push({
+      title, url, snippet, source: 'bing', type: 'web',
+      searchEngineUrl: rawSearchUrl,
+      searchWrapperResolved: wrapperResolved,
+      searchWrapperProvider: wrapperResolved ? 'bing' : null,
+      publisherWrapperUrl: wrapperResolved ? rawSearchUrl : null,
+      publisherResolutionMethod: wrapperResolved ? 'bing-unwrapped' : null,
+      publisherResolved: wrapperResolved,
+    });
   }
   return out.slice(0, 20);
 }
@@ -718,7 +815,7 @@ function parseMojeek(html) {
   const anchors = [...html.matchAll(/<a[^>]+class=["'](?:ob|title|result)[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)];
   for (const m of anchors) {
     const url = cleanUrl(m[1], 'https://www.mojeek.com/');
-    if (!url || /mojeek\.com\/search/i.test(url)) continue;
+    if (!url || !isPublisherCandidateUrl(url) || /mojeek\.com\/search/i.test(url)) continue;
     out.push({ title: stripTags(m[2]), url, snippet: '', source: 'mojeek', type: 'web' });
   }
   return out.slice(0, 20);
@@ -729,7 +826,7 @@ function parseYahoo(html) {
   const headings = [...html.matchAll(/<h3[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)];
   for (const m of headings) {
     const url = cleanUrl(m[1], 'https://search.yahoo.com/');
-    if (!url || /search\.yahoo\.com\/search/i.test(url)) continue;
+    if (!url || !isPublisherCandidateUrl(url) || /search\.yahoo\.com\/search/i.test(url)) continue;
     const idx = m.index || 0;
     const tail = html.slice(idx, idx + 4500);
     const snippet = stripTags((tail.match(/<p[^>]*>([\s\S]*?)<\/p>/i) || [, ''])[1]);
@@ -775,7 +872,7 @@ function parseDuckDuckGo(html) {
   const anchors = [...html.matchAll(/<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)];
   for (const m of anchors) {
     const url = cleanUrl(m[1], 'https://html.duckduckgo.com/');
-    if (!url) continue;
+    if (!url || !isPublisherCandidateUrl(url)) continue;
     const tail = html.slice(m.index || 0, (m.index || 0) + 5000);
     const snippet = stripTags((tail.match(/class=["'][^"']*result__snippet[^"']*[^>]*>([\s\S]*?)(?:<\/a>|<\/span>|<\/div>)/i) || [, ''])[1]);
     out.push({ title: stripTags(m[2]), url, snippet, source: 'duckduckgo', type: 'web' });
@@ -1031,6 +1128,24 @@ function diversifyAndSelect(results, count, intent) {
     types.set(t, (types.get(t) || 0) + 1);
   }
   return selected;
+}
+
+function contentPriorityScore(r, query, intent, dateIntent) {
+  let score = Number(r._score || 0);
+  const u = String(r.url || '');
+  if (isBlockedContentUrl(u)) score -= 100;
+  if (isPublisherCandidateUrl(u, r)) score += 4;
+  if (r.publisherResolved) score += 6;
+  if (/^https?:\/\/www\.(bing|google|search\.)\w+/i.test(u)) score -= 30;
+  if (r.contentStatus === 'snippet_fallback') score += 2;
+  if (r.contentStatus === 'full' || r.contentStatus === 'reader' || r.contentStatus === 'alternate') score -= 3;
+  const terms = extractSearchTerms(query);
+  const title = String(r.title || '').toLowerCase();
+  const matched = terms.filter(t => title.includes(t)).length;
+  score += Math.min(10, matched * 1.5);
+  if (intent.wantsNews && r.type === 'news') score += 5;
+  score += scoreDate(r.publishedAt, dateIntent);
+  return score;
 }
 
 function selectVerificationCandidates(results, count) {
@@ -1794,7 +1909,10 @@ async function performSearch(input, started, deadline) {
 
   const verifyCount = verifyRequested ? Math.min(discovered.length, deep ? DEEP_VERIFY : DEFAULT_VERIFY, MAX_VERIFY) : 0;
   if (verifyCount && remainingMs(deadline) > 1500) {
-    const candidates = selectVerificationCandidates(discovered, verifyCount);
+    const candidates = selectVerificationCandidates(
+      [...discovered].sort((a, b) => contentPriorityScore(b, query, baseIntent, dateIntent) - contentPriorityScore(a, query, baseIntent, dateIntent)),
+      verifyCount,
+    );
     flags.verificationPerformed = candidates.length;
     const enriched = await Promise.all(candidates.map(r => enrichResult(r, query, deadline)));
     const byKey = new Map(enriched.map(r => [normalizedKey(r.url), r]));
@@ -1851,6 +1969,9 @@ async function performSearch(input, started, deadline) {
     relevanceScore: Math.max(0, Math.min(100, Math.round(50 + (r._score || 0) * 2))),
     publisherResolved: Boolean(r.publisherResolved),
     publisherWrapperUrl: r.publisherWrapperUrl || null,
+    publisherResolutionMethod: r.publisherResolutionMethod || null,
+    searchWrapperResolved: Boolean(r.searchWrapperResolved),
+    searchWrapperProvider: r.searchWrapperProvider || null,
     extractedText: truncate(r.extractedText || r.pageContent || extractFallbackContent(r, query), MAX_TEXT_CHARS),
     pageContent: truncate(r.pageContent || r.extractedText || extractFallbackContent(r, query), MAX_TEXT_CHARS),
     contentAvailable: true,
@@ -1859,6 +1980,8 @@ async function performSearch(input, started, deadline) {
     contentLength: Number(r.contentLength || String(r.pageContent || r.extractedText || '').length),
     contentConfidence: Number(r.contentConfidence ?? 0.35),
     contentSourceUrl: r.contentSourceUrl || r.url,
+    contentFormat: 'plain_text',
+    contentRole: (r.contentStatus === 'full' || r.contentStatus === 'reader' || r.contentStatus === 'alternate') ? 'publisher_page_content' : 'search_evidence_fallback',
     contentError: r.contentError || null,
     contentTruncated: String(r.pageContent || r.extractedText || '').length >= MAX_TEXT_CHARS,
     verificationMethod: r.verificationMethod || null,
