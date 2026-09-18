@@ -34,7 +34,7 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-content-algorithm-1.0.0';
+const VERSION = 'arix-content-algorithm-1.0.2';
 
 const MAX_RESULTS = 40;
 const MAX_QUERY_LEN = 700;
@@ -556,7 +556,7 @@ function relevanceDetails(candidate, plan) {
 
   const hardTopicMiss = plan.concepts.length >= 2 && conceptCombined.ratio < 0.34;
   const coreMiss = plan.concepts.length > 0 && conceptCombined.hits.length === 0;
-  const titleBodyConflict = titleCov >= 0.55 && bodyCov < 0.18;
+  const titleBodyConflict = titleCov >= 0.55 && bodyCov < 0.18 && !phraseExact && conceptBody.ratio < 0.5;
   const acceptable = !coreMiss && !hardTopicMiss && score >= 24 && !titleBodyConflict;
 
   return {
@@ -862,6 +862,35 @@ async function inflateDeflate(bytes, deadline) {
   finally { clearTimeout(timer); }
 }
 
+
+function decodeAscii85(bytes) {
+  const text = bytesToLatin1(bytes);
+  let s = text.replace(/\s+/g, '');
+  if (s.startsWith('<~')) s = s.slice(2);
+  s = s.replace(/~>.*$/s, '');
+  const out = [];
+  let tuple = [], i = 0;
+  const emitTuple = (vals, count = 4) => {
+    const acc = (((((vals[0] * 85) + vals[1]) * 85 + vals[2]) * 85 + vals[3]) * 85 + vals[4]) >>> 0;
+    const raw = [(acc >>> 24) & 255, (acc >>> 16) & 255, (acc >>> 8) & 255, acc & 255];
+    out.push(...raw.slice(0, count));
+  };
+  while (i < s.length) {
+    const ch = s[i++];
+    if (ch === 'z' && tuple.length === 0) { out.push(0, 0, 0, 0); continue; }
+    const code = ch.charCodeAt(0);
+    if (code < 33 || code > 117) continue;
+    tuple.push(code - 33);
+    if (tuple.length === 5) { emitTuple(tuple, 4); tuple = []; }
+  }
+  if (tuple.length > 1) {
+    const count = tuple.length - 1;
+    while (tuple.length < 5) tuple.push(84);
+    emitTuple(tuple, count);
+  }
+  return new Uint8Array(out);
+}
+
 async function extractPdfText(bytes, deadline) {
   const raw = bytesToLatin1(bytes);
   const pieces = [];
@@ -875,10 +904,14 @@ async function extractPdfText(bytes, deadline) {
     const payloadStart = m.index + Math.max(0, payloadRelative);
     const payloadEnd = payloadStart + m[1].length;
     const source = bytes.slice(Math.max(0, payloadStart), Math.min(bytes.length, payloadEnd));
+    let payload = source;
+    if (/\/ASCII85Decode/i.test(dict)) {
+      try { payload = decodeAscii85(payload); } catch {}
+    }
     if (/\/FlateDecode/i.test(dict)) {
-      const inflated = await inflateDeflate(source, deadline);
+      const inflated = await inflateDeflate(payload, deadline);
       if (inflated) pieces.push(bytesToLatin1(inflated));
-    } else pieces.push(m[1]);
+    } else pieces.push(bytesToLatin1(payload));
   }
   return cleanContent(pieces.map(extractPdfStrings).join(' '));
 }
@@ -906,10 +939,12 @@ export function validateSourceContent(content, result, plan, metadata = {}) {
   const boilerplateRatio = boilerplateTokens / totalTokens;
   const mismatch = plan.flags.wantsHistory && !coverage.hits.includes('history') && /\bnew cars?|upcoming cars?|car prices?|buy a car\b/i.test(text.slice(0, 8000));
 
+  const deepLike = plan.mode === 'deep' || plan.concepts.length >= 5;
   const targetMatched =
     sim >= 0.45 ||
     (coverage.ratio >= 0.55 && directQueryCoverage >= 0.18) ||
-    (plan.concepts.length <= 2 && coverage.ratio >= 0.5 && directQueryCoverage >= 0.25);
+    (plan.concepts.length <= 2 && coverage.ratio >= 0.5 && directQueryCoverage >= 0.25) ||
+    (deepLike && coverage.ratio >= 0.34 && directQueryCoverage >= 0.16);
 
   const quality = clamp(
     0.35 +
@@ -1016,9 +1051,85 @@ async function fetchUrl(url, timeout, deadline, headers = {}) {
   } finally { clearTimeout(timer); }
 }
 
+
+function youtubeVideoId(url) {
+  return String(url || '').match(/(?:[?&]v=|youtu\.be\/|youtube\.com\/shorts\/)([A-Za-z0-9_-]{6,20})/i)?.[1] || null;
+}
+function youtubePlayerJson(html) {
+  const s = String(html || ''), marker = 'ytInitialPlayerResponse', idx = s.indexOf(marker);
+  if (idx < 0) return null;
+  const start = s.indexOf('{', idx + marker.length); if (start < 0) return null;
+  let depth = 0, inString = false, escaped = false;
+  for (let i = start; i < Math.min(s.length, start + 900000); i++) {
+    const ch = s[i];
+    if (inString) { if (escaped) escaped = false; else if (ch === '\\\\') escaped = true; else if (ch === '"') inString = false; continue; }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (!depth) { try { return JSON.parse(s.slice(start, i + 1)); } catch { return null; } } }
+  }
+  return null;
+}
+function youtubeCaptionTrack(player) {
+  const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+  return tracks.find(x => /^en(?:-|$)/i.test(x?.languageCode || '')) || tracks.find(x => /^en/i.test(x?.languageCode || '')) || tracks[0] || null;
+}
+function youtubeCaptionText(xml) {
+  const rows = [];
+  for (const m of String(xml || '').matchAll(/<text\b[^>]*>([\s\S]*?)<\/text>/gi)) {
+    const t = decodeHtml(m[1]).replace(/\s+/g, ' ').trim(); if (t) rows.push(t);
+  }
+  return cleanContent(rows.join(' '));
+}
+async function fetchYouTubeContent(candidate, plan, deadline) {
+  const id = youtubeVideoId(candidate.url);
+  if (!id || left(deadline) < 700) return null;
+  try {
+    const res = await fetchUrl(`https://www.youtube.com/watch?v=${encodeURIComponent(id)}&hl=en&gl=IN`, DEFAULT_PAGE_TIMEOUT_MS, deadline);
+    if (!res.ok) return null;
+    const html = await readLimit(res, MAX_PAGE_BYTES);
+    const player = youtubePlayerJson(html);
+    const details = player?.videoDetails || {};
+    const title = String(details.title || candidate.title || '').trim();
+    const track = youtubeCaptionTrack(player);
+    if (!track?.baseUrl) return null;
+    const cap = await fetchUrl(track.baseUrl, 1000, deadline, { accept: 'text/xml,application/xml,text/plain;q=0.9' });
+    if (!cap.ok) return null;
+    const transcript = youtubeCaptionText(await readLimit(cap, 700_000));
+    if (transcript.length < 250) return null;
+    const text = `YouTube transcript:\n${transcript}`;
+    const validation = validateSourceContent(text, { ...candidate, title }, plan, { title, contentType: 'text/plain' });
+    if (!validation.valid) return null;
+    return {
+      ...candidate,
+      title,
+      pageContent: text,
+      extractedText: text,
+      contentStatus: 'full',
+      contentMethod: 'youtube-captions',
+      contentSourceUrl: candidate.url,
+      contentLength: text.length,
+      contentConfidence: 0.98,
+      contentTargetMatched: true,
+      contentTitleSimilarity: validation.targetSimilarity,
+      contentConceptCoverage: validation.conceptCoverage,
+      validatedBy: 'algorithm',
+      verificationMethod: 'youtube-captions',
+      httpStatus: 200,
+      contentType: 'text/plain',
+      transcript,
+      transcriptAvailable: true,
+      transcriptLanguage: track.languageCode || null,
+    };
+  } catch { return null; }
+}
+
 async function fetchDirectContent(candidate, plan, deadline) {
   const url = normalizedUrl(candidate.url);
   if (urlBlocked(url)) return { ...candidate, _contentFailure: 'BLOCKED_URL' };
+  if (isVideo(url) && youtubeVideoId(url)) {
+    const video = await fetchYouTubeContent(candidate, plan, deadline);
+    if (video) return video;
+  }
   try {
     const cached = cacheGet(CONTENT_CACHE, url, CONTENT_CACHE_TTL_MS);
     if (cached && isRealSourceContent(cached)) return { ...candidate, ...cached, cachedContent: true };
@@ -1030,8 +1141,14 @@ async function fetchDirectContent(candidate, plan, deadline) {
 
     if (/application\/pdf/i.test(type) || /\.pdf(?:[?#]|$)/i.test(finalUrl)) {
       const pdfBytes = await readLimitBytes(res, MAX_PAGE_BYTES);
-      const text = await extractPdfText(pdfBytes, deadline);
-      const validation = validateSourceContent(text, candidate, plan, { contentType: type, title: candidate.title });
+      let text = await extractPdfText(pdfBytes, deadline);
+      let validation = validateSourceContent(text, candidate, plan, { contentType: type, title: candidate.title });
+      if (!validation.valid && left(deadline) > 650) {
+        const reader = await readerContent(candidate, plan, deadline);
+        if (isRealSourceContent(reader)) {
+          return { ...candidate, ...reader, validatedBy: 'algorithm-pdf-reader-recovery' };
+        }
+      }
       if (!validation.valid) throw new Error(`PDF_${validation.reason}`);
       const result = {
         url: finalUrl,
