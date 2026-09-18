@@ -26,7 +26,6 @@
 import {
   analyzeQuery,
   buildPreciseQueries,
-  rankCandidates,
   enrichCandidates,
   isRealSourceContent,
 } from './algorithm.js';
@@ -35,7 +34,7 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-1.10.1';
+const VERSION = 'arix-crawler-1.10.3';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 700;
@@ -53,7 +52,7 @@ const MAX_DISCOVERY_RESULTS = 500;
 const MAX_COMMON_CRAWL = 4;
 const MAX_LIVE_LOG = 80;
 
-const DISCOVERY_CUTOFF_MS = 2_150;
+const DISCOVERY_CUTOFF_MS = 2_300;
 const ALGORITHM_BUDGET_MIN_MS = 1_350;
 const AI_RERANK_TIMEOUT_MS = 900;
 
@@ -88,7 +87,7 @@ const TRUSTED_DOMAINS = [
 ];
 
 const USER_AGENT =
-  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.10.1; +https://lexis-ai-chatini.vercel.app/)';
+  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.10.3; +https://lexis-ai-chatini.vercel.app/)';
 
 function nowIso() { return new Date().toISOString(); }
 function left(deadline) { return Math.max(0, deadline - Date.now()); }
@@ -766,7 +765,7 @@ async function performSearch(input, started, logger) {
   }
 
   // Preserve the complete discovered pool. The decisive relevance comparison happens only AFTER page fetch.
-  const ranked = rankCandidates(discovered, plan, { keepWeak: true });
+  const ranked = [...discovered];
   const acquisitionPool = [...discovered].sort((a,b) => {
     const ap = Number(a?.semanticSearchScore ?? 0), bp = Number(b?.semanticSearchScore ?? 0);
     if (bp !== ap) return bp - ap;
@@ -789,7 +788,7 @@ async function performSearch(input, started, logger) {
   }
 
   // Fetch pages first. The checker then performs only a lightweight query comparison.
-  const contentCandidates = acquisitionPool.slice(0, Math.min(acquisitionPool.length, 110));
+  const contentCandidates = acquisitionPool.slice(0, MAX_DISCOVERY_RESULTS);
   logger.add('content-start', `Fetching real page content for ${contentCandidates.length} candidates concurrently.`);
 
   const algorithmBudget = Math.max(1_350, Math.min(7_800, left(deadline) - 160));
@@ -809,32 +808,15 @@ async function performSearch(input, started, logger) {
     returned: enriched.length,
   });
 
-  // If the first wave is short, use untouched candidates. This remains the same
-  // lightweight operation: fetch page -> compare page with query.
-  if (enriched.length < count && left(deadline) > 700) {
-    const used = new Set(enriched.map(r => normalizedKey(r.url)));
-    const next = ranked.filter(r => !used.has(normalizedKey(r.url)) && !contentCandidates.some(c => normalizedKey(c.url) === normalizedKey(r.url))).slice(0, Math.min(80, Math.max(count * 2, 20)));
-    if (next.length) {
-      logger.add('content-recovery-start', `Fetching ${next.length} additional pages without changing the relevance rule.`);
-      try {
-        const checked = await enrichCandidates(next, plan, {
-          count: Math.min(count, next.length),
-          requireRealContent: true,
-          budgetMs: Math.min(1_900, left(deadline) - 120),
-        });
-        if (checked?.results?.length) enriched.push(...checked.results.filter(isRealSourceContent));
-      } catch {}
-      logger.add('content-recovery-complete', `Additional page-content recovery now has ${enriched.length} real-content sources.`);
-    }
-  }
-
   // Final selection is intentionally soft: all returned sources have real page content;
   // relevance only determines ordering, not a brittle score cutoff.
   const finalPool = [...new Map(enriched.filter(isRealSourceContent).map(r => [normalizedKey(r.url), r])).values()]
     .map(r => ({ ...r, _score: Number(r.relevanceScore || 0) }))
     .sort((a, b) => Number(b.relevanceScore || 0) - Number(a.relevanceScore || 0));
 
-  const chosen = diversifyFinal(finalPool, count);
+  // Requested count controls how many the user asked for, but does NOT truncate the fetched source set.
+  // Return every unique source for which real page content was obtained.
+  const chosen = finalPool;
   let commonCrawlRows = [];
   if (useCc && chosen.length && left(deadline) > 550) {
     const ccDeadline = Date.now() + Math.min(500, left(deadline) - 50);
@@ -842,7 +824,7 @@ async function performSearch(input, started, logger) {
   }
   const ccMap = new Map(commonCrawlRows.filter(x => x?.cc).map(x => [normalizedKey(x.url), x.cc]));
 
-  const final = chosen.slice(0, count).map((r, i) => formatResult({ ...r, commonCrawl: ccMap.get(normalizedKey(r.url)) || null }, i, plan, true));
+  const final = chosen.map((r, i) => formatResult({ ...r, commonCrawl: ccMap.get(normalizedKey(r.url)) || null }, i, plan, true));
   const result = buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested });
   cacheSet(key, result, selectCacheTtl(plan));
   return result;
@@ -888,7 +870,7 @@ function formatResult(r, i, plan, realContent) {
     contentStatus: r.contentStatus || (realContent ? 'full' : 'metadata'),
     contentMethod: r.contentMethod || r.validatedBy || 'algorithm',
     contentLength: content.length,
-    contentConfidence: Number(r.contentConfidence ?? (realContent ? 0.9 : 0)).toFixed(2),
+    contentConfidence: Number(r.contentConfidence ?? (realContent ? 0.9 : 0)),
     contentSourceUrl: r.contentSourceUrl || r.url,
     contentTargetMatched: Boolean(r.contentTargetMatched ?? realContent),
     contentTitleSimilarity: Number(r.contentTitleSimilarity ?? r.contentTitleSimilarity ?? rel.titleCoverage ?? 0).toFixed(3),
@@ -917,6 +899,7 @@ function buildResponse({ query, count, mode, requestedType, plan, preciseQueries
     query,
     requestedResults: count,
     returnedResults: final.length,
+    sourceCountMode: 'all-fetched-real-content',
     mode,
     intent: {
       type: requestedType || plan.type,
@@ -938,7 +921,7 @@ function buildResponse({ query, count, mode, requestedType, plan, preciseQueries
       relevantResults: final.filter(r => r.relevanceScore >= 54).length,
       requestedResults: count,
       realContentOnly: requireRealContent,
-      contentGuarantee: 'Final results use validated source content when requireRealContent=true; snippets are not promoted to pageContent.',
+      contentGuarantee: 'Every returned result contains fetched source content; relevance only ranks results and never removes fetched content.',
     },
     searchPlan: {
       queryVariants: preciseQueries,
@@ -958,10 +941,11 @@ function buildResponse({ query, count, mode, requestedType, plan, preciseQueries
     },
     liveLog: logger.logs,
     results: final,
+    allFetchedSources: final.length,
     warnings: [],
   };
-  if (requireRealContent && final.length < count) result.warnings.push(`Only ${final.length} validated relevant sources completed within the crawler budget; ${count} were requested. No snippet-only sources were substituted.`);
-  if (!final.length) result.warnings.push('No source satisfied the current content/relevance contract. No fabricated page content was emitted.');
+  if (requireRealContent && final.length < count) result.warnings.push(`${final.length} fetched pages produced real content within the crawler budget; ${count} were requested. Unreadable pages were excluded and never replaced with snippets.`);
+  if (!final.length) result.warnings.push('No real page content completed within the crawler budget; search snippets were never promoted to pageContent.');
   if (result.latencyMs > SEARCH_BUDGET_MS) result.warnings.push('The outer platform/runtime may have added latency beyond the crawler work budget.');
   return result;
 }
