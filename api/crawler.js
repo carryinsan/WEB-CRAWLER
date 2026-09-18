@@ -28,8 +28,6 @@
  * - The response begins with valid JSON immediately, not just whitespace.
  * - Heartbeats keep the stream active while live work continues.
  * - Upstream calls are bounded individually.
- * - Discovery and content verification use bounded concurrent fan-out instead of serial retries.
- * - The default fast-path budget is ~9.2s; successful validated results are oversampled so a 40-source request does not collapse to 4 merely because a few pages are slow.
  * - The crawler never attempts to evade provider/site rate limits.
  * - No serverless implementation can honestly guarantee unlimited execution;
  *   Vercel remains the platform authority on maximum execution duration.
@@ -39,19 +37,19 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-1.7.0';
+const VERSION = 'arix-crawler-1.6.0';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 500;
 const MAX_REQUEST_BODY = 64_000;
 
-const SEARCH_TIMEOUT_MS = 1700;
-const PAGE_TIMEOUT_MS = 2400;
-const READER_TIMEOUT_MS = 2600;
-const NEWS_RESOLVE_TIMEOUT_MS = 1200;
-const COMMON_CRAWL_TIMEOUT_MS = 1000;
-const YOUTUBE_TIMEOUT_MS = 3200;
-const PDF_DECOMPRESS_TIMEOUT_MS = 1400;
+const SEARCH_TIMEOUT_MS = 3600;
+const PAGE_TIMEOUT_MS = 5200;
+const READER_TIMEOUT_MS = 6500;
+const NEWS_RESOLVE_TIMEOUT_MS = 2200;
+const COMMON_CRAWL_TIMEOUT_MS = 3000;
+const YOUTUBE_TIMEOUT_MS = 8000;
+const PDF_DECOMPRESS_TIMEOUT_MS = 3500;
 
 const MAX_PAGE_BYTES = 900_000;
 const MAX_SEARCH_BYTES = 700_000;
@@ -59,64 +57,20 @@ const MAX_YOUTUBE_BYTES = 1_800_000;
 const MAX_TEXT_CHARS = 30_000;
 const MAX_TRANSCRIPT_CHARS = 30_000;
 
-const DEFAULT_VERIFY = 40;
-const DEEP_VERIFY = 40;
-const MAX_VERIFY = 40;
-const MAX_ENGINE_REQUESTS = 18;
-const MAX_NEWS_RESOLVES = 6;
-const MAX_PUBLISHER_LOOKUPS = 4;
+const DEFAULT_VERIFY = 10;
+const DEEP_VERIFY = 14;
+const MAX_VERIFY = 14;
+const MAX_ENGINE_REQUESTS = 12;
+const MAX_NEWS_RESOLVES = 10;
+const MAX_PUBLISHER_LOOKUPS = 6;
 const MAX_CC_LOOKUPS = 4;
 
 // Starts below Vercel's documented Edge streaming ceiling and leaves safety margin.
-const STREAM_HEARTBEAT_MS = 1800;
-const SEARCH_WORK_BUDGET_MS = 9_200;
-
-const DISCOVERY_MIN_REMAINING_MS = 4_800;
-const CONTENT_MIN_REMAINING_MS = 2_900;
-const SEARCH_CONCURRENCY = 18;
-const CONTENT_CONCURRENCY = 24;
-const FAST_FALLBACK_LIMIT = 40;
-const SEARCH_CACHE_TTL_MS = 8_000;
-const CONTENT_CACHE_TTL_MS = 120_000;
-const CACHE_MAX_ENTRIES = 80;
-
-const SEARCH_CACHE = new Map();
-const CONTENT_CACHE = new Map();
-
-function cacheGet(cache, key, ttl) {
-  const item = cache.get(key);
-  if (!item) return null;
-  if (Date.now() - item.at > ttl) {
-    cache.delete(key);
-    return null;
-  }
-  return item.value;
-}
-
-function cacheSet(cache, key, value) {
-  cache.set(key, { at: Date.now(), value });
-  while (cache.size > CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value);
-}
-
-async function mapConcurrent(items, limit, worker) {
-  const list = Array.isArray(items) ? items : [];
-  const n = Math.max(1, Math.min(limit, list.length || 1));
-  const out = new Array(list.length);
-  let cursor = 0;
-  const runner = async () => {
-    while (true) {
-      const i = cursor++;
-      if (i >= list.length) return;
-      try { out[i] = await worker(list[i], i); }
-      catch (error) { out[i] = { __error: error?.message || 'WORKER_FAILED' }; }
-    }
-  };
-  await Promise.all(Array.from({ length: n }, runner));
-  return out;
-}
+const STREAM_HEARTBEAT_MS = 4000;
+const SEARCH_WORK_BUDGET_MS = 240_000;
 
 const USER_AGENT =
-  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.7; +https://lexis-ai-chatini.vercel.app/)';
+  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.6; +https://lexis-ai-chatini.vercel.app/)';
 
 const COMMON_CRAWL_INDEXES = [
   'CC-MAIN-2026-34',
@@ -633,34 +587,18 @@ function parseDateFromHtml(html) {
 }
 
 function extractStructuredBody(html) {
-  const jsonLd = parseJsonLd(html);
-  const articleBodies = jsonLd
-    .filter(x => x.kind === 'articleBody' && String(x.value || '').length > 200)
-    .map(x => cleanExtractedText(x.value))
-    .filter(Boolean);
-  if (articleBodies.length) return articleBodies.sort((a, b) => b.length - a.length)[0];
-
-  const semanticCandidates = [];
-  const articles = html.match(/<article\b[^>]*>[\s\S]*?<\/article>/gi) || [];
-  for (const block of articles.slice(0, 6)) {
-    const text = cleanExtractedText(stripTags(block));
-    if (text.length > 200) semanticCandidates.push(text);
-  }
-  if (semanticCandidates.length) return semanticCandidates.sort((a, b) => b.length - a.length)[0];
-
-  const mains = html.match(/<main\b[^>]*>[\s\S]*?<\/main>/gi) || [];
-  for (const block of mains.slice(0, 4)) {
-    const text = cleanExtractedText(stripTags(block));
-    if (text.length > 200) semanticCandidates.push(text);
-  }
-  if (semanticCandidates.length) return semanticCandidates.sort((a, b) => b.length - a.length)[0];
-
-  // Only use the broader paragraph/headline reconstruction when the page has no
-  // identifiable semantic content container. This avoids pulling unrelated site chrome.
-  const textualTags = html.match(/<(?:h1|h2|h3|h4|p|blockquote)\b[^>]*>[\s\S]*?<\/(?:h1|h2|h3|h4|p|blockquote)>/gi) || [];
   const pieces = [];
-  for (const block of textualTags.slice(0, 300)) {
-    const text = cleanExtractedText(stripTags(block));
+  const jsonLd = parseJsonLd(html);
+  for (const item of jsonLd) {
+    if (item.kind === 'articleBody' && item.value.length > 200) pieces.push(item.value);
+  }
+  const semanticBlocks = html.match(/<(?:article|main)\b[^>]*>[\s\S]*?<\/(?:article|main)>/gi) || [];
+  for (const block of semanticBlocks.slice(0, 8)) pieces.push(stripTags(block));
+
+  // Paragraph/headline extraction catches pages whose main container is fragmented.
+  const textualTags = html.match(/<(?:h1|h2|h3|h4|p|li|blockquote)\b[^>]*>[\s\S]*?<\/(?:h1|h2|h3|h4|p|li|blockquote)>/gi) || [];
+  for (const block of textualTags.slice(0, 500)) {
+    const text = stripTags(block);
     if (text.length >= 30) pieces.push(text);
   }
   return pieces.join(' ');
@@ -1246,14 +1184,15 @@ function contentPriorityScore(r, query, intent, dateIntent) {
 }
 
 function selectVerificationCandidates(results, count) {
-  const selected = [];
-  const urls = new Set();
-  for (const r of results) {
+  const ranked = [...results];
+  const selected = [], domains = new Set(), urls = new Set();
+  for (const r of ranked) {
     if (selected.length >= count) break;
-    const key = normalizedKey(r.url);
+    const key = normalizedKey(r.url), domain = hostname(r.url);
     if (!safeHttpUrl(r.url) || urls.has(key)) continue;
-    selected.push(r);
-    urls.add(key);
+    if (!domains.has(domain) || selected.length >= Math.ceil(count * 0.65)) {
+      selected.push(r); domains.add(domain); urls.add(key);
+    }
   }
   return selected;
 }
@@ -1411,84 +1350,52 @@ function readerUrls(url) {
   } catch { return []; }
 }
 
-function parseReaderMetadata(raw) {
-  const text = String(raw || '');
-  const title = (text.match(/^Title:\s*(.+)$/im) || [, ''])[1]?.trim() || '';
-  const sourceUrl = (text.match(/^URL Source:\s*(\S+)$/im) || [, ''])[1]?.trim() || '';
-  return { title, sourceUrl };
-}
-
-function readerMatchesTarget(raw, result, requestedUrl) {
-  const meta = parseReaderMetadata(raw);
-  const targetTitle = String(result?.title || '').trim();
-  const sim = meta.title && targetTitle ? titleSimilarity(targetTitle, meta.title) : 0;
-  const sourceHost = normalizedHost(requestedUrl);
-  const readerHost = normalizedHost(meta.sourceUrl);
-  const hostMatch = Boolean(sourceHost && readerHost && (sourceHost === readerHost || readerHost.endsWith(`.${sourceHost}`) || sourceHost.endsWith(`.${readerHost}`)));
-  const isNewsLike = result?.type === 'news' || result?.type === 'doc' || ARTICLE_PATH_HINT.test(requestedUrl || '');
-  if (isNewsLike && !hostMatch) return { ok: false, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
-  if (targetTitle && sim < 0.28 && !ARTICLE_PATH_HINT.test(requestedUrl || '')) {
-    return { ok: false, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
-  }
-  if (targetTitle && sim < 0.32 && isNewsLike) {
-    return { ok: false, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
-  }
-  return { ok: true, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
-}
-
-async function readerFallback(url, deadline, result = null) {
-  if (!safeHttpUrl(url) || isBlockedContentUrl(url) || remainingMs(deadline) < 850) return null;
-  const urls = readerUrls(url).slice(0, 1);
-  const jobs = urls.map(async proxyUrl => {
+async function readerFallback(url, deadline) {
+  if (!safeHttpUrl(url) || isBlockedContentUrl(url) || remainingMs(deadline) < 1200) return null;
+  for (const proxyUrl of readerUrls(url).slice(0, 2)) {
+    if (remainingMs(deadline) < 1000) break;
     try {
-      const timeout = effectiveTimeout(READER_TIMEOUT_MS, deadline, 500);
-      if (!timeout) return null;
+      const timeout = effectiveTimeout(READER_TIMEOUT_MS, deadline, 700);
+      if (!timeout) break;
       const res = await fetchResponse(proxyUrl, {
         timeout, deadline,
-        headers: { accept: 'text/plain,text/markdown;q=0.95,*/*;q=0.1' },
+        headers: { accept: 'text/plain,text/markdown;q=0.95,*/*;q=0.2', 'x-no-cache': 'true' },
       });
-      if (!res.ok) { try { await res.body?.cancel?.(); } catch {} return null; }
-      const raw = await readBodyText(res, MAX_PAGE_BYTES, deadline);
-      const match = readerMatchesTarget(raw, result, url);
-      if (!match.ok) return null;
-      const text = textFromMarkdown(raw);
-      if (text.length < 250) return null;
-      return {
-        content: text,
-        method: 'jina-reader',
-        sourceUrl: match.sourceUrl || url,
-        title: match.title || null,
-        titleSimilarity: Number(match.titleSimilarity.toFixed(2)),
-      };
-    } catch { return null; }
-  });
-  const rows = await Promise.allSettled(jobs);
-  for (const row of rows) if (row.status === 'fulfilled' && row.value) return row.value;
+      if (!res.ok) { try { await res.body?.cancel?.(); } catch {} continue; }
+      const text = textFromMarkdown(await readBodyText(res, MAX_PAGE_BYTES, deadline));
+      if (text.length >= 250) return { content: text, method: 'jina-reader', sourceUrl: url };
+    } catch {}
+  }
   return null;
 }
 
-async function fetchVariantContent(url, deadline, result = null) {
+async function fetchVariantContent(url, deadline) {
   if (!isPublisherCandidateUrl(url)) return null;
   try {
     const u = new URL(url);
     const candidates = [];
-    if (!/\/amp\/?$/i.test(u.pathname)) candidates.push(new URL(`${u.pathname.replace(/\/$/, '')}/amp${u.search}`, u.origin).href);
+    if (!/\/amp\/?$/i.test(u.pathname)) {
+      candidates.push(new URL(`${u.pathname.replace(/\/$/, '')}/amp${u.search}`, u.origin).href);
+    }
     if (!/[?&](output|amp)=/i.test(u.search)) candidates.push(`${u.href}${u.search ? '&' : '?'}output=1`);
-    const rows = await mapConcurrent(candidates.slice(0, 2), 2, async candidate => {
-      if (remainingMs(deadline) < 850) return null;
+    for (const candidate of candidates) {
+      if (remainingMs(deadline) < 1000) break;
       try {
-        const res = await fetchResponse(candidate, { timeout: 1900, deadline, headers: { accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1' } });
-        if (!res.ok) { try { await res.body?.cancel?.(); } catch {} return null; }
-        const html = await readBodyText(res, 520_000, deadline);
-        const title = parseTitleFromHtml(html) || result?.title || '';
-        const finalUrl = cleanUrl(res.url || candidate, url) || candidate;
+        const res = await fetchResponse(candidate, { timeout: 2800, deadline, headers: { accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.2' } });
+        if (!res.ok) { try { await res.body?.cancel?.(); } catch {} continue; }
+        const html = await readBodyText(res, 700_000, deadline);
         const text = extractVisibleText(html);
-        const assessment = assessHtmlContent(html, text, result || {}, finalUrl, title);
-        if (text.length < 250 || !assessment.acceptable) return null;
-        return { content: text, method: 'alternate-page', title, publishedAt: parseDateFromHtml(html) || null, finalUrl, titleSimilarity: assessment.titleSimilarity };
-      } catch { return null; }
-    });
-    return rows.filter(Boolean).sort((a, b) => b.content.length - a.content.length)[0] || null;
+        if (text.length >= 250) {
+          return {
+            content: text,
+            method: 'alternate-page',
+            title: parseTitleFromHtml(html) || null,
+            publishedAt: parseDateFromHtml(html) || null,
+            finalUrl: cleanUrl(res.url || candidate, url) || candidate,
+          };
+        }
+      } catch {}
+    }
   } catch {}
   return null;
 }
@@ -1720,17 +1627,9 @@ function assessHtmlContent(html, text, result, finalUrl, title) {
   if (pCount >= 5) { score += 2; signals.push('paragraphs'); }
   if (pCount >= 12) { score += 1; signals.push('many-paragraphs'); }
   const sim = titleSimilarity(result.title, title);
-  const originalDepth = pathDepth(result.url);
-  const finalDepth = pathDepth(finalUrl);
-  const targetTitleKnown = Boolean(String(result?.title || '').trim() && String(title || '').trim());
-  const severeTitleMismatch = targetTitleKnown && sim < (result.type === 'news' ? 0.32 : result.type === 'doc' ? 0.22 : 0.18);
-  const suspiciousCanonicalCollapse = originalDepth >= 2 && finalDepth <= 1 && sim < 0.45;
   if (sim >= 0.75) { score += 5; signals.push('title-match'); }
   else if (sim >= 0.45) { score += 3; signals.push('title-partial-match'); }
-  else if (sim >= 0.18) { score += 1; signals.push('title-weak-match'); }
   if (ARTICLE_PATH_HINT.test(finalUrl)) { score += 2; signals.push('article-path'); }
-  if (severeTitleMismatch) { score -= 8; signals.push('target-title-mismatch'); }
-  if (suspiciousCanonicalCollapse) { score -= 8; signals.push('canonical-collapse'); }
   if (bodyText.length >= 1500) { score += 2; signals.push('long-text'); }
   if (bodyText.length >= 5000) { score += 1; signals.push('very-long-text'); }
   if (/google-analytics|googletagmanager|doubleclick|dataLayer\.push|gtag\(/i.test(bodyText.slice(0, 12000))) {
@@ -1739,7 +1638,7 @@ function assessHtmlContent(html, text, result, finalUrl, title) {
   if (/^untitled$|enable javascript|javascript required/i.test(String(title || ''))) score -= 4;
 
   const minimum = result.type === 'news' ? 8 : 5;
-  const acceptable = bodyText.length >= 350 && score >= minimum && !severeTitleMismatch && !suspiciousCanonicalCollapse;
+  const acceptable = bodyText.length >= 350 && score >= minimum;
   return { acceptable, score, signals, titleSimilarity: Number(sim.toFixed(2)) };
 }
 
@@ -1807,6 +1706,15 @@ async function enrichResult(result, query, deadline) {
 
     if (!res.ok) {
       try { await res.body?.cancel?.(); } catch {}
+      if (remainingMs(deadline) > 1700) {
+        const reader = await readerFallback(finalUrl, deadline);
+        if (reader?.content) {
+          return ensureContentFields({
+            ...result, url: finalUrl, domain: hostname(finalUrl), verified: true,
+            verificationMethod: 'jina-reader-fallback', httpStatus: res.status, contentType: 'text/markdown',
+          }, query, { status: 'reader', method: 'jina-reader', content: reader.content, confidence: 0.95 });
+        }
+      }
       return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: false, httpStatus: res.status, contentType }, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent({ ...result, url: finalUrl }, query), confidence: 0.35, error: `HTTP_${res.status}` });
     }
 
@@ -1816,6 +1724,10 @@ async function enrichResult(result, query, deadline) {
     }
 
     if (looksLikeJavaScriptBody(body, contentType) || !contentTypeIsPageLike(contentType, body)) {
+      const reader = remainingMs(deadline) > 1800 ? await readerFallback(finalUrl, deadline) : null;
+      if (reader?.content && !isBlockedContentUrl(reader.sourceUrl || finalUrl)) {
+        return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: true, httpStatus: res.status, contentType, verificationMethod: 'jina-reader-nonpage-fallback' }, query, { status: 'reader', method: 'jina-reader', content: reader.content, confidence: 0.92 });
+      }
       return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: false, httpStatus: res.status, contentType, verificationError: 'NON_ARTICLE_CONTENT' }, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent({ ...result, url: finalUrl }, query), confidence: 0.35, error: 'NON_ARTICLE_CONTENT' });
     }
 
@@ -1832,8 +1744,27 @@ async function enrichResult(result, query, deadline) {
       let confidence = 0.55;
       let assessment = assessHtmlContent(body, content, result, canonicalUrl, title);
 
-      // Deliberately no serial fallback here. Alternate/Jina fallbacks are launched
-      // concurrently in performSearch for only the candidates that actually need them.
+      if (content.length < 800 || !assessment.acceptable) {
+        const alternate = remainingMs(deadline) > 1500 ? await fetchVariantContent(canonicalUrl, deadline) : null;
+        if (alternate?.content && alternate.content.length > content.length) {
+          content = alternate.content;
+          method = alternate.method;
+          status = 'alternate';
+          confidence = 0.9;
+          assessment = { acceptable: true, score: assessment.score + 1, signals: [...assessment.signals, 'alternate-page'], titleSimilarity: assessment.titleSimilarity };
+        }
+      }
+
+      if ((content.length < 800 || !assessment.acceptable) && remainingMs(deadline) > 1500) {
+        const reader = await readerFallback(canonicalUrl, deadline);
+        if (reader?.content && reader.content.length > content.length) {
+          content = reader.content;
+          method = reader.method;
+          status = 'reader';
+          confidence = 0.95;
+          assessment = { acceptable: content.length >= 500, score: Math.max(assessment.score, 8), signals: [...assessment.signals, 'reader'], titleSimilarity: assessment.titleSimilarity };
+        }
+      }
 
       if (content.length >= 350 && assessment.acceptable && !looksLikeJavaScriptBody(content, contentType)) {
         status = status === 'metadata' ? 'full' : status;
@@ -1867,6 +1798,10 @@ async function enrichResult(result, query, deadline) {
       status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent({ ...result, url: finalUrl }, query), confidence: 0.35, error: 'TEXT_CONTENT_NOT_VALIDATED',
     });
   } catch (error) {
+    if (remainingMs(deadline) > 1400) {
+      const reader = await readerFallback(result.url, deadline);
+      if (reader?.content) return ensureContentFields({ ...result, verified: true, verificationMethod: 'jina-reader-fallback' }, query, { status: 'reader', method: 'jina-reader', content: reader.content, confidence: 0.95 });
+    }
     return ensureContentFields({ ...result, verified: false, verificationError: error?.message || 'ENRICH_FAILED' }, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(result, query), confidence: 0.35, error: error?.message || 'ENRICH_FAILED' });
   }
 }
@@ -1904,7 +1839,7 @@ async function aiPlan(query, mode, count, dateIntent, deadline) {
   const text = await callGroq([
     { role: 'system', content: 'You are a web-search query planner. Return JSON only. Never invent URLs. Generate concise, complementary live-web query variants. Respect explicit dates and prefer primary sources.' },
     { role: 'user', content: JSON.stringify({ query, mode, count, dateIntent, output: { intent: 'web|news|video|gov|doc|mixed', queries: ['...'], freshness: 'live|recent|any', mustPreferOfficial: true } }) },
-  ], 500, 1100, deadline);
+  ], 800, 3500, deadline);
   const parsed = extractJson(text);
   if (!parsed) return null;
   return {
@@ -1925,7 +1860,7 @@ async function aiRerank(query, results, mode, dateIntent, deadline) {
   const text = await callGroq([
     { role: 'system', content: 'You are a search reranker. Rank only provided result IDs. Prefer exact intent, requested dates, fresh sources, primary/official sources, direct publisher URLs, and results with real content. Return JSON only.' },
     { role: 'user', content: JSON.stringify({ query, mode, dateIntent, results: payload, output: { order: [0,1], confidence: 0.0 } }) },
-  ], 700, 1400, deadline);
+  ], 1400, 4500, deadline);
   const parsed = extractJson(text);
   if (!parsed || !Array.isArray(parsed.order)) return null;
   return parsed.order.map(Number).filter(Number.isInteger).filter(i => i >= 0 && i < results.length);
@@ -2006,47 +1941,36 @@ async function performSearch(input, started, deadline) {
 
   const baseIntent = queryIntent(query, requestedType || null);
   const dateIntent = parseDateIntent(query);
-  const cacheKey = JSON.stringify({ query, count, mode, requestedType, deep, useAi, verifyRequested, useCc, requireRealContent });
-  const searchCacheTtl = dateIntent.latest ? 2500 : SEARCH_CACHE_TTL_MS;
-  const cached = cacheGet(SEARCH_CACHE, cacheKey, searchCacheTtl);
-  if (cached) return { ...cached, generatedAt: nowIso(), latencyMs: Date.now() - started, cached: true };
-
   const warnings = [];
   const providerStats = {};
   const flags = { partialDueToBudget: false, publisherResolutionAttempted: 0, publisherResolutionSucceeded: 0, verificationPerformed: 0, verificationSucceeded: 0, commonCrawlPerformed: 0 };
 
-  // Fast path: deterministic planning first. AI remains available, but it never blocks core discovery.
+  const shouldAiPlan = useAi === 'true' || (useAi === 'auto' && (deep || count > 10 || baseIntent.wantsNews || baseIntent.wantsGov || baseIntent.wantsDocs || baseIntent.wantsVideo));
   const baseQueries = buildSearchQueries(query, baseIntent, mode, dateIntent);
-  const shouldAiPlan = useAi === 'true';
-  const aiPlanPromise = shouldAiPlan && remainingMs(deadline) > DISCOVERY_MIN_REMAINING_MS
-    ? aiPlan(query, mode, count, dateIntent, deadline)
-    : Promise.resolve(null);
+  const aiPromise = shouldAiPlan && remainingMs(deadline) > 1800 ? aiPlan(query, mode, count, dateIntent, deadline) : Promise.resolve(null);
 
   const reqs = plannedRequests(baseQueries, baseIntent);
-  let totalEngineRequests = reqs.length;
-  const responses = await mapConcurrent(reqs, SEARCH_CONCURRENCY, r => discoverOne(r, deadline));
+  const responses = await Promise.allSettled(reqs.map(r => discoverOne(r, deadline)));
   let discovered = [];
-  for (const item of responses) {
-    if (!item || item.__error) continue;
+  for (const entry of responses) {
+    if (entry.status !== 'fulfilled') continue;
+    const item = entry.value;
     providerStats[item.provider] = providerStats[item.provider] || { ok: 0, failed: 0, results: 0 };
     if (item.ok) providerStats[item.provider].ok++; else providerStats[item.provider].failed++;
     providerStats[item.provider].results += item.results.length;
     discovered.push(...item.results);
   }
 
-  // Optional AI planning only gets one additional parallel discovery wave if there is real budget left.
-  const ai = await Promise.race([
-    aiPlanPromise,
-    sleep(Math.max(0, remainingMs(deadline) - 3400)).then(() => null),
-  ]).catch(() => null);
-  const aiQueries = ai?.queries?.length ? [...new Set(ai.queries)].slice(0, 3) : [];
+  const ai = await aiPromise;
+  const aiQueries = ai?.queries?.length ? [...new Set(ai.queries)].slice(0, 5) : [];
   const plannedQueries = [...new Set([...baseQueries, ...aiQueries])].slice(0, 6);
-  if (aiQueries.length && remainingMs(deadline) > 2600 && discovered.length < Math.max(count * 2, 20)) {
-    const secondReqs = plannedRequests(aiQueries, baseIntent).slice(0, Math.min(6, MAX_ENGINE_REQUESTS - reqs.length));
-    totalEngineRequests += secondReqs.length;
-    const more = await mapConcurrent(secondReqs, SEARCH_CONCURRENCY, r => discoverOne(r, deadline));
-    for (const item of more) {
-      if (!item || item.__error) continue;
+
+  if (aiQueries.length && reqs.length < MAX_ENGINE_REQUESTS && remainingMs(deadline) > 3500) {
+    const second = plannedRequests(aiQueries, baseIntent).slice(0, MAX_ENGINE_REQUESTS - reqs.length);
+    const more = await Promise.allSettled(second.map(r => discoverOne(r, deadline)));
+    for (const entry of more) {
+      if (entry.status !== 'fulfilled') continue;
+      const item = entry.value;
       providerStats[item.provider] = providerStats[item.provider] || { ok: 0, failed: 0, results: 0 };
       if (item.ok) providerStats[item.provider].ok++; else providerStats[item.provider].failed++;
       providerStats[item.provider].results += item.results.length;
@@ -2055,24 +1979,25 @@ async function performSearch(input, started, deadline) {
   }
 
   discovered = dedupeResults(discovered).map(r => ({ ...r, type: inferType(r), domain: hostname(r.url) }));
+
+  // Make every discovered result AI-readable immediately from its actual search evidence.
   for (const r of discovered) {
+    Object.assign(r, ensureContentFields(r, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(r, query), confidence: 0.35 }));
     r._score = scoreResult(r, query, baseIntent, dateIntent) + domainTrust(r.url);
   }
 
-  // Google News: resolve a small number of the strongest wrappers in parallel. Do not let news resolution starve page fetching.
-  const newsCandidates = discovered
-    .filter(r => r.type === 'news' && /^news\.google\.com$/i.test(hostname(r.url)))
-    .sort((a, b) => scoreResult(b, query, baseIntent, dateIntent) - scoreResult(a, query, baseIntent, dateIntent))
-    .slice(0, MAX_NEWS_RESOLVES);
-  if (newsCandidates.length && remainingMs(deadline) > 2600) {
+  // Google News wrapper -> publisher URL. First use redirect/embedded links, then exact-title search.
+  const newsCandidates = discovered.filter(r => r.type === 'news' && /^news\.google\.com$/i.test(hostname(r.url))).slice(0, MAX_NEWS_RESOLVES);
+  if (newsCandidates.length && remainingMs(deadline) > 2800) {
     flags.publisherResolutionAttempted = newsCandidates.length;
-    const resolvedPairs = await mapConcurrent(newsCandidates, Math.min(MAX_NEWS_RESOLVES, 6), async original => {
+    const resolvedPairs = await Promise.all(newsCandidates.map(async original => {
       let current = await resolveNewsWrapper(original, deadline);
-      if (/^news\.google\.com$/i.test(hostname(current.url)) && remainingMs(deadline) > 1250) current = await publisherHomeLookup(current, deadline);
-      if (/^news\.google\.com$/i.test(hostname(current.url)) && remainingMs(deadline) > 950) current = await publisherLookupByTitle(current, deadline);
+      if (/^news\.google\.com$/i.test(hostname(current.url)) && remainingMs(deadline) > 1800) current = await publisherHomeLookup(current, deadline);
+      if (/^news\.google\.com$/i.test(hostname(current.url)) && remainingMs(deadline) > 1400) current = await publisherLookupByTitle(current, deadline);
       return { oldKey: normalizedKey(original.url), result: current };
-    });
-    const byOldKey = new Map(resolvedPairs.filter(Boolean).map(x => [x.oldKey, x.result]));
+    }));
+
+    const byOldKey = new Map(resolvedPairs.map(x => [x.oldKey, x.result]));
     discovered = discovered.map(r => byOldKey.get(normalizedKey(r.url)) || r);
     flags.publisherResolutionSucceeded = discovered.filter(r => r.publisherResolved && !/^news\.google\.com$/i.test(hostname(r.url))).length;
     if (flags.publisherResolutionSucceeded) warnings.push(`Resolved ${flags.publisherResolutionSucceeded} news result(s) to publisher URLs before content extraction.`);
@@ -2083,88 +2008,24 @@ async function performSearch(input, started, deadline) {
   discovered = enforceRequestedType(discovered, requestedType, mode, warnings);
   discovered.sort((a, b) => (b._score || 0) - (a._score || 0));
 
-  // Validate as many results as the caller asks for, not a hard-coded 10/14.
-  const verifyTarget = Math.min(MAX_VERIFY, Math.max(count, count + 8));
-  const verifyCount = verifyRequested ? Math.min(discovered.length, verifyTarget) : 0;
-  if (verifyCount && remainingMs(deadline) > CONTENT_MIN_REMAINING_MS) {
+  const verifyCount = verifyRequested ? Math.min(discovered.length, deep ? DEEP_VERIFY : DEFAULT_VERIFY, MAX_VERIFY) : 0;
+  if (verifyCount && remainingMs(deadline) > 1500) {
     const candidates = selectVerificationCandidates(
       [...discovered].sort((a, b) => contentPriorityScore(b, query, baseIntent, dateIntent) - contentPriorityScore(a, query, baseIntent, dateIntent)),
       verifyCount,
     );
     flags.verificationPerformed = candidates.length;
-
-    const enriched = await mapConcurrent(candidates, CONTENT_CONCURRENCY, async r => {
-      const cache = cacheGet(CONTENT_CACHE, normalizedKey(r.url), CONTENT_CACHE_TTL_MS);
-      if (cache && isRealContentResult(cache)) return { ...r, ...cache };
-      const fresh = await enrichResult(r, query, deadline);
-      if (isRealContentResult(fresh)) cacheSet(CONTENT_CACHE, normalizedKey(r.url), {
-        pageContent: fresh.pageContent,
-        extractedText: fresh.extractedText,
-        contentStatus: fresh.contentStatus,
-        contentMethod: fresh.contentMethod,
-        contentLength: fresh.contentLength,
-        contentConfidence: fresh.contentConfidence,
-        contentSourceUrl: fresh.contentSourceUrl,
-        contentAvailable: true,
-        contentType: fresh.contentType,
-        contentSourceTitle: fresh.title || null,
-        verified: Boolean(fresh.verified),
-        httpStatus: fresh.httpStatus || 200,
-        verificationMethod: fresh.verificationMethod || null,
-        publishedAt: fresh.publishedAt || null,
-      });
-      return fresh;
-    });
-    const byKey = new Map();
-    for (const r of enriched) if (r && !r.__error) byKey.set(normalizedKey(r.url), r);
+    const enriched = await Promise.all(candidates.map(r => enrichResult(r, query, deadline)));
+    const byKey = new Map(enriched.map(r => [normalizedKey(r.url), r]));
     discovered = discovered.map(r => byKey.get(normalizedKey(r.url)) || r);
-    flags.verificationSucceeded = enriched.filter(r => r && !r.__error && r.verified).length;
+    flags.verificationSucceeded = enriched.filter(r => r.verified).length;
     discovered.forEach(r => { r._score = scoreResult(r, query, baseIntent, dateIntent) + (r.verified ? 5 : 0) + domainTrust(r.url); });
     discovered.sort((a, b) => (b._score || 0) - (a._score || 0));
-
-    // One compact fallback wave for candidates that failed direct extraction. This keeps quality high without serial retry chains.
-    const missing = discovered.filter(r => !isRealContentResult(r)).slice(0, FAST_FALLBACK_LIMIT);
-    if (missing.length && remainingMs(deadline) > 1450) {
-      const fallbackRows = await mapConcurrent(missing, Math.min(CONTENT_CONCURRENCY, 18), async r => {
-        const url = r.url;
-        const alternatePromise = fetchVariantContent(url, deadline, r);
-        const readerPromise = readerFallback(url, deadline, r);
-        const rows = await Promise.allSettled([alternatePromise, readerPromise]);
-        const candidates2 = rows.map(x => x.status === 'fulfilled' ? x.value : null).filter(Boolean);
-        const best = candidates2.sort((a, b) => String(b.content || '').length - String(a.content || '').length)[0];
-        if (!best?.content) return r;
-        return {
-          ...(ensureContentFields({
-            ...r,
-            url: best.finalUrl || r.url,
-            domain: hostname(best.finalUrl || r.url),
-            verified: true,
-            verificationMethod: best.method,
-            title: best.title || r.title,
-            publishedAt: best.publishedAt || r.publishedAt || null,
-            contentTitleSimilarity: best.titleSimilarity ?? null,
-          }, query, {
-            status: best.method === 'jina-reader' ? 'reader' : 'alternate',
-            method: best.method,
-            content: best.content,
-            confidence: best.method === 'jina-reader' ? 0.95 : 0.9,
-          })),
-          _originalUrlKey: normalizedKey(r.url),
-        };
-      });
-      const fallbackMap = new Map(fallbackRows.filter(Boolean).map(r => [r._originalUrlKey || normalizedKey(r.url), r]));
-      discovered = discovered.map(r => fallbackMap.get(normalizedKey(r.url)) || r);
-      flags.verificationSucceeded = Math.min(flags.verificationPerformed, discovered.filter(r => r.verified && isRealContentResult(r)).length);
-      discovered.forEach(r => { r._score = scoreResult(r, query, baseIntent, dateIntent) + (r.verified ? 5 : 0) + domainTrust(r.url); });
-      discovered.sort((a, b) => (b._score || 0) - (a._score || 0));
-    }
   }
 
-  // AI reranking is optional and runs only after content is available; it is never allowed to consume the whole request budget.
-  const shouldRerank = useAi === 'true' || (useAi === 'auto' && deep && discovered.length > 12);
-  if (shouldRerank && discovered.length > 1 && remainingMs(deadline) > 1550) {
-    const orderPromise = aiRerank(query, discovered, mode, dateIntent, deadline);
-    const order = await Promise.race([orderPromise, sleep(Math.max(0, remainingMs(deadline) - 700)).then(() => null)]).catch(() => null);
+  const shouldRerank = useAi === 'true' || (useAi === 'auto' && (deep || count > 10 || discovered.length > 15 || Boolean(ai)));
+  if (shouldRerank && discovered.length > 1 && remainingMs(deadline) > 1800) {
+    const order = await aiRerank(query, discovered, mode, dateIntent, deadline);
     if (order?.length) {
       const ordered = [], seen = new Set();
       for (const i of order) { if (!seen.has(i)) { ordered.push(discovered[i]); seen.add(i); } }
@@ -2173,16 +2034,22 @@ async function performSearch(input, started, deadline) {
     }
   }
 
-  if (useCc && discovered.length && remainingMs(deadline) > 1100) {
-    const rows = await mapConcurrent(discovered.slice(0, Math.min(MAX_CC_LOOKUPS, 4)), 4, async r => ({ url: r.url, cc: await commonCrawlLookup(r.url, deadline) }));
-    const map = new Map(rows.filter(Boolean).map(x => [x.url, x.cc]));
-    flags.commonCrawlPerformed = rows.filter(x => x?.cc).length;
+  if (useCc && discovered.length && remainingMs(deadline) > 1600) {
+    const rows = await Promise.all(discovered.slice(0, MAX_CC_LOOKUPS).map(async r => ({ url: r.url, cc: await commonCrawlLookup(r.url, deadline) })));
+    const map = new Map(rows.map(x => [x.url, x.cc]));
+    flags.commonCrawlPerformed = rows.filter(x => x.cc).length;
     discovered.forEach(r => { r.commonCrawl = map.get(r.url) || null; });
-  } else if (useCc) warnings.push('Common Crawl was skipped because live page content was prioritized under the fast latency budget.');
+  } else if (useCc) warnings.push('Common Crawl was skipped or deferred because live page content was prioritized.');
 
-  if (remainingMs(deadline) < 900) {
+  // Final non-null guarantee for every selected result.
+  for (const r of discovered) {
+    if (!r.pageContent || !String(r.pageContent).trim()) Object.assign(r, ensureContentFields(r, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(r, query), confidence: 0.35 }));
+    r.domain = hostname(r.url);
+  }
+
+  if (remainingMs(deadline) < 1200) {
     flags.partialDueToBudget = true;
-    warnings.push('Fast latency budget reached; only validated live content completed before finalization.');
+    warnings.push('Returned the best available live evidence before the crawler safety budget was exhausted.');
   }
 
   discovered = contentOnlySelection(discovered, count, requireRealContent, warnings);
@@ -2214,8 +2081,6 @@ async function performSearch(input, started, deadline) {
     contentLength: Number(r.contentLength || String(r.pageContent || r.extractedText || '').length),
     contentConfidence: Number(r.contentConfidence ?? 0.35),
     contentSourceUrl: r.contentSourceUrl || r.url,
-    contentTargetMatched: Boolean(r.contentTargetMatched ?? isRealContentResult(r)),
-    contentTargetTitleSimilarity: Number(r.contentTitleSimilarity ?? r.titleSimilarity ?? 0),
     contentFormat: 'plain_text',
     contentRole: isRealContentResult(r) ? 'publisher_page_content' : 'search_evidence_fallback',
     contentForAI: isRealContentResult(r) ? `SOURCE_URL: ${r.contentSourceUrl || r.url}\nTITLE: ${truncate(r.title || '', 300)}\nCONTENT_STATUS: ${r.contentStatus}\n\n${truncate(r.pageContent || r.extractedText || '', MAX_TEXT_CHARS)}` : '',
@@ -2228,9 +2093,11 @@ async function performSearch(input, started, deadline) {
     commonCrawl: r.commonCrawl || null,
   }));
 
-  if (requireRealContent && !finalResults.length) warnings.push('No validated live content completed within the fast budget; snippet-only candidates were excluded.');
+  if (requireRealContent && !finalResults.length) {
+    warnings.push('No result was returned because no candidate produced validated live publisher content within the crawler safety budget. Snippet-only evidence was deliberately excluded.');
+  }
 
-  const result = {
+  return {
     ok: true,
     version: VERSION,
     query,
@@ -2249,11 +2116,10 @@ async function performSearch(input, started, deadline) {
     latencyMs: Date.now() - started,
     keylessCoreSearch: true,
     groqUsed: Boolean(ai),
-    cached: false,
     providers: providerStats,
     searchPlan: {
       queryVariants: plannedQueries,
-      engineRequests: totalEngineRequests,
+      engineRequests: reqs.length,
       verificationRequested: verifyRequested,
       verificationPerformed: flags.verificationPerformed,
       verificationSucceeded: flags.verificationSucceeded,
@@ -2263,22 +2129,18 @@ async function performSearch(input, started, deadline) {
       publisherResolutionSucceeded: flags.publisherResolutionSucceeded,
       dateIntent,
       streamed: true,
-      contentGuarantee: requireRealContent ? 'final results contain only validated live publisher/reader/PDF/transcript content; snippet-only candidates are excluded' : 'fallback content allowed because requireRealContent=false',
+      contentGuarantee: requireRealContent ? 'final results contain only validated publisher/reader page content; snippet-only candidates are excluded' : 'fallback content allowed because requireRealContent=false',
       requireRealContent,
-      latencyTargetMs: SEARCH_WORK_BUDGET_MS,
-      concurrency: { search: SEARCH_CONCURRENCY, content: CONTENT_CONCURRENCY },
     },
     results: finalResults,
     warnings: [
-      'Discovery, publisher resolution, and page validation run concurrently under a bounded fast-path budget.',
-      'Validated page content is never replaced with a search snippet when requireRealContent=true.',
-      'Some sites can still block automation, require JavaScript/authentication, or expose media without machine-readable text; those candidates are excluded rather than mislabeled.',
+      'Core discovery is keyless but depends on public web surfaces that may rate-limit or block automated requests.',
+      'No crawler can guarantee full page extraction from every website because some sites block bots, require JavaScript, require authentication, or expose media without machine-readable text.',
+      'Tracking scripts, analytics endpoints, and static assets are rejected as content sources; blocked/unvalidated pages use real search evidence/metadata instead of pretending scripts are article text.',
+      'The response begins as valid JSON and streams heartbeats so the Edge gateway is not left idle during long searches.',
       ...warnings,
     ],
   };
-
-  cacheSet(SEARCH_CACHE, cacheKey, result);
-  return result;
 }
 
 function corsHeaders() {
