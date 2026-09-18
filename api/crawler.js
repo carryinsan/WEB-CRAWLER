@@ -11,8 +11,8 @@
  *
  * FAST PATH
  * - Parallel discovery across independent public search surfaces.
- * - Parallel Tavily discovery/content when configured.
- * - Algorithm content extraction runs concurrently across the relevant pool.
+ * - No paid search dependency; discovery is keyless.
+ * - Algorithm fetches page content first, then performs a light query comparison.
  * - Small bounded recovery waves only for content that failed first-pass extraction.
  * - Short warm caches for repeated queries and recently validated pages.
  *
@@ -35,7 +35,7 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-1.10.0';
+const VERSION = 'arix-crawler-1.10.1';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 700;
@@ -44,16 +44,12 @@ const MAX_REQUEST_BODY = 100_000;
 // The crawler's own wall-clock objective. External sites can still be slow or blocked.
 const SEARCH_BUDGET_MS = 9_500;
 const SEARCH_TIMEOUT_MS = 1_450;
-const TAVILY_TIMEOUT_MS = 2_400;
 const COMMON_CRAWL_TIMEOUT_MS = 650;
 const STREAM_HEARTBEAT_MS = 1_000;
 
-const MAX_ENGINE_REQUESTS = 20;
-const SEARCH_CONCURRENCY = 20;
-const MAX_DISCOVERY_RESULTS = 420;
-const MAX_TAVILY_KEYS = 8;
-const MAX_TAVILY_CALLS = 2;
-const TAVILY_RESULTS_PER_CALL = 20;
+const MAX_ENGINE_REQUESTS = 24;
+const SEARCH_CONCURRENCY = 24;
+const MAX_DISCOVERY_RESULTS = 500;
 const MAX_COMMON_CRAWL = 4;
 const MAX_LIVE_LOG = 80;
 
@@ -92,7 +88,7 @@ const TRUSTED_DOMAINS = [
 ];
 
 const USER_AGENT =
-  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.10; +https://lexis-ai-chatini.vercel.app/)';
+  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.10.1; +https://lexis-ai-chatini.vercel.app/)';
 
 function nowIso() { return new Date().toISOString(); }
 function left(deadline) { return Math.max(0, deadline - Date.now()); }
@@ -111,13 +107,6 @@ function encode(v) { return JSON.stringify(v); }
 function env(name) {
   try { return typeof process !== 'undefined' ? String(process.env?.[name] || '').trim() : ''; }
   catch { return ''; }
-}
-
-function tavilyKeyExists() {
-  for (const name of ['TAVILY_API_KEY', 'TAVILY_API_KEY_1', ...Array.from({ length: MAX_TAVILY_KEYS }, (_, i) => `TAVILY_API_KEY_${i + 2}`)]) {
-    if (env(name)) return true;
-  }
-  return false;
 }
 
 function normalizeHost(url) {
@@ -461,46 +450,47 @@ function freshness(publishedAt) {
 }
 
 function providerRequests(queries, plan, count) {
-  const core = [];
-  const special = [];
-  const explicit = plan.type;
-  const specialNews = explicit === 'news' || plan.flags?.explicitNews;
-  const specialVideo = explicit === 'video' || plan.flags?.explicitVideo;
-  const specialDoc = explicit === 'doc' || plan.flags?.explicitDoc;
-  const specialGov = explicit === 'gov' || plan.flags?.explicitGov;
-  const add = (arr, provider, q, type, url) => arr.push({ provider, query: q, type, url });
-
-  // Core web discovery is kept broad even for typed queries; URL/domain validation later
-  // decides whether a result truly is gov/doc/video/news content.
-  for (const q of queries.slice(0, 4)) {
-    const e = encodeURIComponent(q);
-    add(core, 'bing', q, specialNews ? 'news' : 'web', `https://www.bing.com/search?q=${e}&count=20&setlang=en-IN&cc=in`);
-    add(core, 'google', q, specialNews ? 'news' : 'web', `https://www.google.com/search?q=${e}&num=20&hl=en&gl=in`);
-    add(core, 'duckduckgo', q, specialNews ? 'news' : 'web', `https://html.duckduckgo.com/html/?q=${e}&kl=in-en`);
-    add(core, 'yahoo', q, specialNews ? 'news' : 'web', `https://search.yahoo.com/search?p=${e}`);
-    add(core, 'mojeek', q, specialNews ? 'news' : 'web', `https://www.mojeek.com/search?q=${e}`);
-  }
-
-  if (specialNews) for (const q of queries.slice(0, 4)) special.push({ provider: 'google-news', query: q, type: 'news', url: `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-IN&gl=IN&ceid=IN:en` });
-  if (specialVideo) for (const q of queries.slice(0, 3)) special.push({ provider: 'youtube', query: q, type: 'video', url: `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&hl=en-IN` });
-  if (specialDoc) for (const q of queries.slice(0, 4)) special.push({ provider: 'google-doc', query: q, type: 'doc', url: `https://www.google.com/search?q=${encodeURIComponent(`${q} filetype:pdf`)}&num=20&hl=en&gl=in` });
-  if (specialGov) for (const q of queries.slice(0, 4)) special.push({ provider: 'google-gov', query: q, type: 'gov', url: `https://www.google.com/search?q=${encodeURIComponent(`${q} site:gov.in`)}&num=20&hl=en&gl=in` });
-
-  // Reserve meaningful room for requested modality, rather than filling the request
-  // budget entirely with the five generic engines.
-  const specialQuota = specialNews || specialVideo || specialDoc || specialGov ? Math.min(8, special.length) : 0;
-  const coreQuota = Math.max(0, MAX_ENGINE_REQUESTS - specialQuota);
   const final = [];
   const seen = new Set();
+  const add = (provider, q, type, url) => {
+    if (final.length >= MAX_ENGINE_REQUESTS || seen.has(url)) return;
+    seen.add(url); final.push({ provider, query:q, type, url });
+  };
+  const qs = queries.slice(0, 4);
+  const isSpecial = plan.type === 'news' || plan.type === 'video' || plan.type === 'doc' || plan.type === 'gov';
 
-  for (const r of core.slice(0, coreQuota)) {
-    if (seen.has(r.url)) continue;
-    seen.add(r.url); final.push(r);
+  // Give Bing a few result pages because it is often the only public HTML surface
+  // available from a serverless runtime. Pagination is parallel and still bounded.
+  const e0 = encodeURIComponent(qs[0] || '');
+  for (const first of [0,10,20,30]) add('bing', qs[0], plan.type === 'news' ? 'news' : 'web', `https://www.bing.com/search?q=${e0}&count=10&first=${first}&setlang=en-IN&cc=in`);
+
+  // Other engines receive the precise query variants, providing domain diversity.
+  for (const q of qs) {
+    const e = encodeURIComponent(q);
+    add('google', q, plan.type === 'news' ? 'news' : 'web', `https://www.google.com/search?q=${e}&num=20&hl=en&gl=in`);
+    add('duckduckgo', q, plan.type === 'news' ? 'news' : 'web', `https://html.duckduckgo.com/html/?q=${e}&kl=in-en`);
+    add('yahoo', q, plan.type === 'news' ? 'news' : 'web', `https://search.yahoo.com/search?p=${e}`);
+    add('mojeek', q, plan.type === 'news' ? 'news' : 'web', `https://www.mojeek.com/search?q=${e}`);
   }
-  for (const r of special.slice(0, specialQuota)) {
-    if (final.length >= MAX_ENGINE_REQUESTS || seen.has(r.url)) continue;
-    seen.add(r.url); final.push(r);
+
+  // Requested special surfaces are additive, never a replacement for core web search.
+  if (plan.type === 'news' || plan.flags?.explicitNews) {
+    for (const q of qs.slice(0,2)) add('google-news', q, 'news', `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-IN&gl=IN&ceid=IN:en`);
   }
+  if (plan.type === 'video' || plan.flags?.explicitVideo) {
+    for (const q of qs.slice(0,2)) {
+      add('youtube', q, 'video', `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&hl=en-IN`);
+      add('google-video', q, 'video', `https://www.google.com/search?q=${encodeURIComponent(`site:youtube.com ${q}`)}&num=20&hl=en&gl=in`);
+    }
+  }
+  if (plan.type === 'doc' || plan.flags?.explicitDoc) {
+    for (const q of qs.slice(0,2)) add('google-doc', q, 'doc', `https://www.google.com/search?q=${encodeURIComponent(`${q} filetype:pdf`)}&num=20&hl=en&gl=in`);
+  }
+  if (plan.type === 'gov' || plan.flags?.explicitGov) {
+    for (const q of qs.slice(0,2)) add('google-gov', q, 'gov', `https://www.google.com/search?q=${encodeURIComponent(`${q} site:gov.in`)}&num=20&hl=en&gl=in`);
+  }
+
+  void count; void isSpecial;
   return final.slice(0, MAX_ENGINE_REQUESTS);
 }
 async function discoverOne(req, deadline) {
@@ -509,6 +499,7 @@ async function discoverOne(req, deadline) {
     let results = [];
     if (req.provider === 'bing') results = parseBing(body, req.type);
     else if (req.provider === 'google') results = parseGoogle(body, 'google', req.type);
+    else if (req.provider === 'google-video') results = parseGoogle(body, 'google-video', 'video');
     else if (req.provider === 'duckduckgo') results = parseDuck(body, req.type);
     else if (req.provider === 'yahoo') results = parseYahoo(body, req.type);
     else if (req.provider === 'mojeek') results = parseMojeek(body, req.type);
@@ -545,74 +536,6 @@ function dedupeCandidates(list) {
     }
   }
   return [...map.values()].slice(0, MAX_DISCOVERY_RESULTS);
-}
-
-function normalizeTavilyResult(row) {
-  const url = unwrap(row?.url || '', 'https://tavily.com/');
-  if (!url || blocked(url)) return null;
-  return {
-    title: truncate(row?.title || '', 500),
-    url,
-    snippet: truncate(row?.content || row?.snippet || '', 3000),
-    rawContent: truncate(row?.raw_content || '', 30_000),
-    semanticSearchScore: Number.isFinite(Number(row?.score)) ? Number(row.score) : null,
-    source: 'tavily',
-    type: isDoc(url) ? 'doc' : isVideo(url) ? 'video' : isGov(url) ? 'gov' : 'web',
-  };
-}
-
-async function tavilyCall(query, key, plan, count, deadline, variantIndex) {
-  const timeout = Math.min(TAVILY_TIMEOUT_MS, Math.max(450, left(deadline) - 150));
-  if (!key || timeout < 450) return { ok: false, results: [], error: 'NO_BUDGET' };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-  try {
-    const topic = plan.type === 'news' ? 'news' : 'general';
-    const body = {
-      api_key: key,
-      query,
-      search_depth: variantIndex === 0 ? 'advanced' : 'basic',
-      max_results: Math.min(TAVILY_RESULTS_PER_CALL, Math.max(10, count)),
-      topic,
-      include_answer: false,
-      include_raw_content: 'markdown',
-      include_images: false,
-      include_image_descriptions: false,
-      include_favicon: false,
-      include_usage: false,
-    };
-    const res = await fetch('https://api.tavily.com/search', {
-      method: 'POST',
-      signal: controller.signal,
-      headers: { 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(`TAVILY_HTTP_${res.status}`);
-    const data = await res.json();
-    const results = Array.isArray(data?.results) ? data.results.map(normalizeTavilyResult).filter(Boolean) : [];
-    return { ok: true, results };
-  } catch (error) {
-    return { ok: false, results: [], error: error?.message || 'TAVILY_FAILED' };
-  } finally { clearTimeout(timer); }
-}
-
-async function tavilyDiscovery(plan, queries, count, deadline) {
-  const keys = [];
-  for (const name of ['TAVILY_API_KEY', 'TAVILY_API_KEY_1', ...Array.from({ length: MAX_TAVILY_KEYS - 1 }, (_, i) => `TAVILY_API_KEY_${i + 2}`)]) {
-    const key = env(name);
-    if (key && !keys.includes(key)) keys.push(key);
-  }
-  if (!keys.length || left(deadline) < 900) return { results: [], calls: 0, succeeded: 0 };
-  const jobs = keys.slice(0, MAX_TAVILY_CALLS).map((key, i) => tavilyCall(queries[Math.min(i, queries.length - 1)], key, plan, count, deadline, i));
-  const rows = await Promise.allSettled(jobs);
-  let succeeded = 0;
-  const results = [];
-  for (const row of rows) {
-    if (row.status !== 'fulfilled') continue;
-    if (row.value?.ok) succeeded++;
-    results.push(...(row.value?.results || []));
-  }
-  return { results: dedupeCandidates(results), calls: jobs.length, succeeded };
 }
 
 async function groqRerank(query, results, deadline) {
@@ -806,10 +729,7 @@ async function performSearch(input, started, logger) {
   logger.add('discovery-start', `Launching ${requests.length} parallel discovery requests.`, { queries: preciseQueries.slice(0, 8) });
 
   const discoveryDeadline = Math.min(deadline, started + DISCOVERY_CUTOFF_MS);
-  const [discoveries, tv] = await Promise.all([
-    Promise.allSettled(requests.map(r => discoverOne(r, discoveryDeadline))),
-    tavilyKeyExists() ? tavilyDiscovery(plan, preciseQueries.slice(0, 2), count, discoveryDeadline) : Promise.resolve({ results: [], calls: 0, succeeded: 0 }),
-  ]);
+  const discoveries = await Promise.allSettled(requests.map(r => discoverOne(r, discoveryDeadline)));
 
   const providerStats = {};
   let discovered = [];
@@ -822,10 +742,6 @@ async function performSearch(input, started, logger) {
     else providerStats[item.provider].failed++;
     providerStats[item.provider].results += item.results.length;
     discovered.push(...item.results);
-  }
-  if (tv.results.length) {
-    providerStats.tavily = { ok: tv.succeeded, failed: Math.max(0, tv.calls - tv.succeeded), results: tv.results.length };
-    discovered.push(...tv.results);
   }
   discovered = dedupeCandidates(discovered);
 
@@ -842,27 +758,21 @@ async function performSearch(input, started, logger) {
 
   logger.add('discovery-complete', `Discovery produced ${discovered.length} unique candidates.`, {
     successfulProviders: discoveryOk,
-    tavilyResults: tv.results.length,
+    sourceCandidates: discovered.length,
   });
 
   if (!discovered.length) {
     logger.add('discovery-empty', 'No search candidates were returned by the available public surfaces.');
   }
 
-  // Rank only after all discovery results are merged. Typed candidates are moved to the
-  // front BEFORE the algorithm's internal 180-candidate processing cap, so gov/doc/video/news
-  // queries cannot be crowded out by generic-engine results. This is ordering only; the
-  // algorithm still performs the actual type and relevance checks.
-  const typePriority = r => {
-    if (plan.type === 'gov') return isGov(r.url) ? 5 : 0;
-    if (plan.type === 'doc') return isDoc(r.url) ? 5 : 0;
-    if (plan.type === 'video') return isVideo(r.url) ? 5 : 0;
-    if (plan.type === 'news') return (r.type === 'news' || ARTICLE_PATH.test(String(r.url || ''))) ? 5 : 0;
-    return 0;
-  };
-  const rankingInput = [...discovered].sort((a, b) => typePriority(b) - typePriority(a));
-  const ranked = rankCandidates(rankingInput, plan, { keepWeak: true });
-  logger.add('ranking-complete', `Ranked ${ranked.length} candidates with the precision algorithm.`);
+  // Preserve the complete discovered pool. The decisive relevance comparison happens only AFTER page fetch.
+  const ranked = rankCandidates(discovered, plan, { keepWeak: true });
+  const acquisitionPool = [...discovered].sort((a,b) => {
+    const ap = Number(a?.semanticSearchScore ?? 0), bp = Number(b?.semanticSearchScore ?? 0);
+    if (bp !== ap) return bp - ap;
+    return String(a?.title || '').length - String(b?.title || '').length;
+  });
+  logger.add('ranking-complete', `Prepared ${acquisitionPool.length} candidates for page acquisition; no relevance cutoff is applied before fetch.`);
 
   if (!verifyRequested) {
     const metadataOnly = diversifyFinal(ranked.slice(0, count).map(r => ({
@@ -873,106 +783,56 @@ async function performSearch(input, started, logger) {
       pageContent: '', extractedText: '', contentAvailable: false,
     })), count);
     const final = metadataOnly.map((r, i) => formatResult(r, i, plan, false));
-    const result = buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested, tv });
+    const result = buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested });
     cacheSet(key, result, selectCacheTtl(plan));
     return result;
   }
 
-  // The precision engine gets enough candidates to make 40-source requests resilient.
-  const candidateCap = Math.min(180, Math.max(60, count * 4 + 20));
-  const contentCandidates = ranked.slice(0, candidateCap);
-  logger.add('content-start', `Validating live content for ${contentCandidates.length} top candidates concurrently.`);
+  // Fetch pages first. The checker then performs only a lightweight query comparison.
+  const contentCandidates = acquisitionPool.slice(0, Math.min(acquisitionPool.length, 110));
+  logger.add('content-start', `Fetching real page content for ${contentCandidates.length} candidates concurrently.`);
 
-  const remainingForAlgorithm = Math.max(ALGORITHM_BUDGET_MIN_MS, left(deadline) - 180);
-  const batches = [];
-  if (contentCandidates.length > 90 && remainingForAlgorithm >= 3_600) {
-    const split = Math.ceil(contentCandidates.length / 2);
-    batches.push(contentCandidates.slice(0, split), contentCandidates.slice(split));
-  } else {
-    batches.push(contentCandidates);
-  }
-
-  const perBatchBudget = Math.max(1_350, Math.min(7_000, remainingForAlgorithm));
-  const enrichments = await Promise.allSettled(batches.map(batch => enrichCandidates(batch, plan, {
-    count,
-    requireRealContent: true,
-    budgetMs: perBatchBudget,
-  })));
-
+  const algorithmBudget = Math.max(1_350, Math.min(7_800, left(deadline) - 160));
   let enriched = [];
-  let algorithmReturned = 0;
-  for (const entry of enrichments) {
-    if (entry.status !== 'fulfilled' || !entry.value?.ok) continue;
-    algorithmReturned += Number(entry.value.returnedResults || 0);
-    enriched.push(...(entry.value.results || []));
+  try {
+    const checked = await enrichCandidates(contentCandidates, plan, {
+      count,
+      requireRealContent: true,
+      budgetMs: algorithmBudget,
+    });
+    enriched = Array.isArray(checked?.results) ? checked.results.filter(isRealSourceContent) : [];
+  } catch (error) {
+    logger.add('content-failed', 'The page-content checker failed safely.', { error: error?.message || 'CONTENT_CHECK_FAILED' });
   }
-  logger.add('content-complete', `Validated content returned for ${enriched.length} source records.`, { algorithmReturned });
+  logger.add('content-complete', `Page fetch + query comparison produced ${enriched.length} real-content sources.`, {
+    candidates: contentCandidates.length,
+    returned: enriched.length,
+  });
 
-  // Deduplicate enriched sources and remove any result that lost its real-content invariant.
-  const enrichedMap = new Map();
-  for (const r of enriched) {
-    if (!isRealSourceContent(r)) continue;
-    const key2 = normalizedKey(r.url);
-    if (!key2) continue;
-    if (!enrichedMap.has(key2)) enrichedMap.set(key2, r);
-  }
-  enriched = [...enrichedMap.values()];
-
-  // A second lightweight recovery call is only used when count is still materially short.
-  if (enriched.length < count && left(deadline) > 1_650 && ranked.length > candidateCap) {
-    const nextCandidates = ranked.slice(candidateCap, Math.min(ranked.length, candidateCap + 80));
-    logger.add('recovery-start', `Running a bounded content recovery wave for ${nextCandidates.length} additional candidates.`);
-    try {
-      const recovered = await enrichCandidates(nextCandidates, plan, {
-        count: Math.min(count - enriched.length, 20),
-        requireRealContent: true,
-        budgetMs: Math.min(2_000, left(deadline) - 140),
-      });
-      if (recovered?.results?.length) enriched.push(...recovered.results.filter(isRealSourceContent));
-      logger.add('recovery-complete', `Recovery produced ${recovered?.returnedResults || 0} additional validated sources.`);
-    } catch (error) {
-      logger.add('recovery-failed', 'Recovery wave failed safely.', { error: error?.message || 'RECOVERY_FAILED' });
+  // If the first wave is short, use untouched candidates. This remains the same
+  // lightweight operation: fetch page -> compare page with query.
+  if (enriched.length < count && left(deadline) > 700) {
+    const used = new Set(enriched.map(r => normalizedKey(r.url)));
+    const next = ranked.filter(r => !used.has(normalizedKey(r.url)) && !contentCandidates.some(c => normalizedKey(c.url) === normalizedKey(r.url))).slice(0, Math.min(80, Math.max(count * 2, 20)));
+    if (next.length) {
+      logger.add('content-recovery-start', `Fetching ${next.length} additional pages without changing the relevance rule.`);
+      try {
+        const checked = await enrichCandidates(next, plan, {
+          count: Math.min(count, next.length),
+          requireRealContent: true,
+          budgetMs: Math.min(1_900, left(deadline) - 120),
+        });
+        if (checked?.results?.length) enriched.push(...checked.results.filter(isRealSourceContent));
+      } catch {}
+      logger.add('content-recovery-complete', `Additional page-content recovery now has ${enriched.length} real-content sources.`);
     }
   }
 
-  if (plan.type === 'news' && plan.dateIntent?.kind === 'live') {
-    const dated = enriched.filter(r => r.publishedAt && !Number.isNaN(Date.parse(r.publishedAt)) && (Date.now() - Date.parse(r.publishedAt)) <= 30 * 86400000);
-    if (dated.length >= Math.min(count, 5)) enriched = dated;
-    logger.add('freshness-filter', `Latest-news freshness check kept ${enriched.length} recent validated sources.`);
-  }
-
-  // Re-rank enriched content using the same algorithm metrics; do not let page extraction change topic identity.
-  const contentRanked = enriched.map(r => ({ ...r, _score: Number(r.relevanceScore || 0) }));
-  let finalPool = contentRanked.filter(r => relevanceAcceptable(r, plan));
-
-  // A conservative fallback band prevents unnecessary zero/near-zero results while retaining relevance safeguards.
-  if (finalPool.length < Math.min(count, 8)) {
-    const broader = contentRanked.filter(r => {
-      if (!isRealSourceContent(r)) return false;
-      if (plan.type === 'gov' && !isGov(r.url)) return false;
-      if (plan.type === 'doc' && !isDoc(r.url)) return false;
-      if (plan.type === 'video' && !isVideo(r.url)) return false;
-      if (plan.flags?.wantsHistory && /current-shopping-content-without-history/i.test(JSON.stringify(r.relevance || {}))) return false;
-      const score = Number(r.relevanceScore || 0);
-      return score >= 36;
-    });
-    const merged = new Map([...finalPool, ...broader].map(r => [normalizedKey(r.url), r]));
-    finalPool = [...merged.values()];
-    if (finalPool.length) logger.add('relevance-backfill', `Used the conservative relevance band to avoid unnecessary source-count collapse.`, { eligible: finalPool.length });
-  }
-
-  // Optional very-fast AI rerank. It can reorder, never invent.
-  if (aiRequested === 'true' && finalPool.length > 2 && left(deadline) > 650) {
-    const order = await groqRerank(query, finalPool, deadline);
-    if (order?.length) {
-      const reordered = [];
-      const seen = new Set();
-      for (const i of order) { if (!seen.has(i)) { reordered.push(finalPool[i]); seen.add(i); } }
-      for (let i = 0; i < finalPool.length; i++) if (!seen.has(i)) reordered.push(finalPool[i]);
-      finalPool = reordered;
-      logger.add('ai-rerank-complete', 'Optional AI reranking completed without changing the candidate set.');
-    } else logger.add('ai-rerank-skip', 'AI reranking was unavailable or exceeded its short latency budget.');
-  }
+  // Final selection is intentionally soft: all returned sources have real page content;
+  // relevance only determines ordering, not a brittle score cutoff.
+  const finalPool = [...new Map(enriched.filter(isRealSourceContent).map(r => [normalizedKey(r.url), r])).values()]
+    .map(r => ({ ...r, _score: Number(r.relevanceScore || 0) }))
+    .sort((a, b) => Number(b.relevanceScore || 0) - Number(a.relevanceScore || 0));
 
   const chosen = diversifyFinal(finalPool, count);
   let commonCrawlRows = [];
@@ -983,7 +843,7 @@ async function performSearch(input, started, logger) {
   const ccMap = new Map(commonCrawlRows.filter(x => x?.cc).map(x => [normalizedKey(x.url), x.cc]));
 
   const final = chosen.slice(0, count).map((r, i) => formatResult({ ...r, commonCrawl: ccMap.get(normalizedKey(r.url)) || null }, i, plan, true));
-  const result = buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested, tv });
+  const result = buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested });
   cacheSet(key, result, selectCacheTtl(plan));
   return result;
 }
@@ -1005,7 +865,7 @@ function formatResult(r, i, plan, realContent) {
     title: truncate(r.title || 'Untitled', 300),
     url: r.url,
     domain: normalizeHost(r.url),
-    type: r.type || (isGov(r.url) ? 'gov' : isDoc(r.url) ? 'doc' : isVideo(r.url) ? 'video' : 'web'),
+    type: isGov(r.url) ? 'gov' : isDoc(r.url) ? 'doc' : isVideo(r.url) ? 'video' : (r.type || 'web'),
     source: r.source || 'search',
     snippet: truncate(r.snippet || '', 1200),
     publishedAt: r.publishedAt || null,
@@ -1049,7 +909,7 @@ function formatResult(r, i, plan, realContent) {
   };
 }
 
-function buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested, tv }) {
+function buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested }) {
   const validationCount = final.filter(r => r.contentAvailable).length;
   const result = {
     ok: true,
@@ -1073,7 +933,6 @@ function buildResponse({ query, count, mode, requestedType, plan, preciseQueries
     groqUsed: aiRequested === 'true' && logger.logs.some(x => x.event === 'ai-rerank-complete'),
     cached: false,
     providers: providerStats,
-    tavily: { calls: tv?.calls || 0, succeeded: tv?.succeeded || 0, results: tv?.results?.length || 0 },
     quality: {
       validatedResults: validationCount,
       relevantResults: final.filter(r => r.relevanceScore >= 54).length,
