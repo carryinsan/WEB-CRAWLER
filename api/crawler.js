@@ -1,26 +1,16 @@
 /*
- * ArixAI Live Web Search / Crawler — v1.10.0
+ * ArixAI Live Web Search / Crawler
+ * v1.11.0
  * Vercel Edge Function, dependency-free orchestration layer.
- *
+ * 
  * IMPORTANT ARCHITECTURE
- * - api/algorithm.js is the precision/content engine.
- * - This file is the discovery/orchestration layer.
- * - There is NO extra HTTP hop to algorithm.js; it is imported directly.
- * - Search snippets are discovery evidence only.
- * - When requireRealContent=true, every final result has validated source content.
- *
- * FAST PATH
- * - Parallel discovery across independent public search surfaces.
- * - No paid search dependency; discovery is keyless.
- * - Algorithm fetches page content first, then performs a light query comparison.
- * - Small bounded recovery waves only for content that failed first-pass extraction.
- * - Short warm caches for repeated queries and recently validated pages.
- *
- * COMPATIBILITY
- * - Preserves GET/POST inputs and the existing high-level response contract.
- * - Preserves mode/type/count/deep/verify/ai/commonCrawl controls.
- * - Preserves streaming JSON behavior by default.
- * - Optional SSE log mode: ?logStream=true or Accept: text/event-stream.
+ * api/algorithm.js is the precision/content engine.
+ * This file is the discovery/orchestration layer.
+ * There is NO extra HTTP hop to algorithm.js; it is imported directly.
+ * 
+ * Search snippets are discovery evidence. If full fetch fails, 
+ * the snippet is used as a fallback to ensure ALL discovered candidates 
+ * are returned to the user, ranked by relevance.
  */
 
 import {
@@ -28,13 +18,14 @@ import {
   buildPreciseQueries,
   enrichCandidates,
   isRealSourceContent,
+  comparePageToQuery
 } from './algorithm.js';
 
 export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-1.10.4';
+const VERSION = 'arix-crawler-1.11.0';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 700;
@@ -46,7 +37,6 @@ const OUTPUT_MAX_SOURCES = 500;
 const SEARCH_TIMEOUT_MS = 1_450;
 const COMMON_CRAWL_TIMEOUT_MS = 650;
 const STREAM_HEARTBEAT_MS = 1_000;
-
 const MAX_ENGINE_REQUESTS = 24;
 const SEARCH_CONCURRENCY = 24;
 const MAX_DISCOVERY_RESULTS = 500;
@@ -72,37 +62,39 @@ const BLOCKED_HOSTS = new Set([
   'amazon-adsystem.com', 'taboola.com', 'outbrain.com',
 ]);
 
-const BLOCKED_EXT = /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|woff2?|woff|ttf|otf|eot|mp3|wav|m4a|mp4|webm|mov|avi|zip|rar|7z|exe|dmg)(?:$|[?#])/i;
+const BLOCKED_EXT = /\.(?:js|mjs|cjs|css|map|png|jpeg|gif|webp|avif|svg|ico|bmp|tiff?|woff2?|woff|ttf|otf|eot|mp3|wav|m4a|mp4|webm|mov|avi|zip|rar|7z|exe|dmg)(?:$|[?#])/i;
 const DATA_PATH = /(?:^|[\/_-])(?:analytics|gtag|ga4|collect|pixel|beacon|tracking|tracker|telemetry|consent|ads?)(?:[\/_-]|$)/i;
 const ARTICLE_PATH = /(?:article|articles|story|stories|news|post|posts|blog|blogs|report|reports|press[-_]?release|explained|timeline|history)/i;
 
 const GOV_DOMAINS = [
   'gov.in', 'nic.in', 'mygov.in', 'india.gov.in', 'pib.gov.in', 'mca.gov.in',
   'gst.gov.in', 'incometax.gov.in', 'msme.gov.in', 'education.gov.in', 'meity.gov.in',
-  'rbi.org.in', 'sebi.gov.in', 'supremecourt.gov.in', 'indiacode.nic.in',
+  'rbi.org.in', 'sebi.gov.in', 'supremecourt.gov.in', 'indiacode.nic.in'
 ];
 
 const TRUSTED_DOMAINS = [
   'nasa.gov', 'who.int', 'un.org', 'europa.eu', 'oecd.org', 'worldbank.org',
-  'imf.org', 'ietf.org', 'w3.org', 'mozilla.org', 'developer.mozilla.org',
+  'imf.org', 'ietf.org', 'w3.org', 'mozilla.org', 'developer.mozilla.org'
 ];
 
-const USER_AGENT =
-  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.10.4; +https://lexis-ai-chatini.vercel.app/)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.11.0; +https://lexis-ai-chatini.vercel.app/)';
 
 function nowIso() { return new Date().toISOString(); }
 function left(deadline) { return Math.max(0, deadline - Date.now()); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
+
 function safeInt(v, fallback, min, max) {
   const n = Number.parseInt(v, 10);
   if (!Number.isFinite(n)) return fallback;
   return clamp(n, min, max);
 }
+
 function truncate(v, max) {
   const s = String(v ?? '').trim();
   return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
 }
+
 function encode(v) { return JSON.stringify(v); }
 function env(name) {
   try { return typeof process !== 'undefined' ? String(process.env?.[name] || '').trim() : ''; }
@@ -113,6 +105,7 @@ function normalizeHost(url) {
   try { return new URL(url).hostname.toLowerCase().replace(/^www\./, ''); }
   catch { return ''; }
 }
+
 function safeUrl(url) {
   try {
     const u = new URL(url);
@@ -120,11 +113,12 @@ function safeUrl(url) {
     const h = u.hostname.toLowerCase();
     if (!h || h === 'localhost' || h.endsWith('.localhost')) return false;
     if (/^(127\.|10\.|192\.168\.|169\.254\.)/.test(h)) return false;
-    if (/^172\.(?:1[6-9]|2\d|3[0-1])\./.test(h)) return false;
+    if (/^172\.(?:1[6-9]|2[0-9]|3[0-1])\./.test(h)) return false;
     if (h === '::1' || h.startsWith('fc') || h.startsWith('fd')) return false;
     return true;
   } catch { return false; }
 }
+
 function blocked(url) {
   if (!url || !safeUrl(url)) return true;
   const h = normalizeHost(url);
@@ -136,39 +130,50 @@ function blocked(url) {
     return false;
   } catch { return true; }
 }
+
 function isGov(url) {
   const h = normalizeHost(url);
   return GOV_DOMAINS.some(d => h === d || h.endsWith(`.${d}`));
 }
+
 function isTrusted(url) {
   const h = normalizeHost(url);
   return TRUSTED_DOMAINS.some(d => h === d || h.endsWith(`.${d}`)) || /\.edu(?:\.|$)/i.test(h) || /\.ac\.(?:in|uk|jp|nz)$/i.test(h);
 }
+
 function isYouTube(url) {
   const h = normalizeHost(url);
   return h === 'youtube.com' || h.endsWith('.youtube.com') || h === 'youtu.be';
 }
+
 function isDoc(url) { return /\.(?:pdf|docx?|xlsx?|pptx?)(?:\?|$)/i.test(url || ''); }
-function isVideo(url) { return isYouTube(url) || /(?:vimeo\.com|dailymotion\.com)/i.test(normalizeHost(url)); }
+function isVideo(url) { return isYouTube(url) || /(?:vimeo\.com|dailymotion\.com)$/i.test(normalizeHost(url)); }
+
 function normalizedKey(url) {
   try {
     const u = new URL(url);
     u.hash = '';
-    for (const k of [...u.searchParams.keys()]) if (/^(utm_|gclid$|fbclid$|msclkid$|ref$|referrer$|cmpid$|src$)/i.test(k)) u.searchParams.delete(k);
+    for (const k of [...u.searchParams.keys()]) {
+      if (/^(utm_gclid$|fbclid$|msclkid$|ref$|referrer$|cmpid$|src$)/i.test(k)) u.searchParams.delete(k);
+    }
     return `${normalizeHost(u.href)}${u.pathname.replace(/\/{2,}/g, '/').replace(/\/$/, '')}${u.search}`;
   } catch { return String(url || '').toLowerCase(); }
 }
+
 function absoluteUrl(raw, base) {
   try { return new URL(String(raw || ''), base).href; } catch { return null; }
 }
+
 function unwrap(raw, base) {
   let current = absoluteUrl(raw, base);
   if (!current) return null;
+
   for (let depth = 0; depth < 4; depth++) {
     let u;
     try { u = new URL(current); } catch { return null; }
     const host = normalizeHost(u.href);
     let next = null;
+
     if (host === 'bing.com' && /^\/ck\/a/i.test(u.pathname)) {
       const encoded = u.searchParams.get('u') || u.searchParams.get('url') || u.searchParams.get('target');
       if (encoded) {
@@ -189,31 +194,46 @@ function unwrap(raw, base) {
         }
       }
     }
-    if (!next && /^google\./i.test(host) && /^\/url$/i.test(u.pathname)) next = u.searchParams.get('q') || u.searchParams.get('url');
-    if (!next && (host === 'duckduckgo.com' || host === 'html.duckduckgo.com') && /^\/l\/?$/i.test(u.pathname)) next = u.searchParams.get('uddg') || u.searchParams.get('u');
+
+    if (!next && /^google\./i.test(host) && /^\/url$/i.test(u.pathname)) {
+      next = u.searchParams.get('url') || u.searchParams.get('q');
+    }
+    if (!next && (host === 'duckduckgo.com' || host === 'html.duckduckgo.com') && /^\/l\/?$/i.test(u.pathname)) {
+      next = u.searchParams.get('uddg') || u.searchParams.get('u');
+    }
     if (!next && (host === 'search.yahoo.com' || host === 'r.search.yahoo.com')) {
       const ru = u.pathname.match(/\/RU=([^/]+)(?:\/|$)/i)?.[1];
       next = ru || u.searchParams.get('RU') || u.searchParams.get('url');
     }
+
     if (!next) break;
     const clean = absoluteUrl(decodeURIComponentSafe(next), current);
     if (!clean || clean === current) break;
     current = clean;
   }
+
   try {
     const u = new URL(current);
     u.hash = '';
-    for (const k of [...u.searchParams.keys()]) if (/^(utm_|gclid$|fbclid$|msclkid$|ref$|referrer$|cmpid$|src$)/i.test(k)) u.searchParams.delete(k);
+    for (const k of [...u.searchParams.keys()]) {
+      if (/^(utm_gclid$|fbclid$|msclkid$|ref$|referrer$|cmpid$|src$)/i.test(k)) u.searchParams.delete(k);
+    }
     return u.href;
   } catch { return null; }
 }
-function decodeURIComponentSafe(v) { try { return decodeURIComponent(String(v || '')); } catch { return String(v || ''); } }
+
+function decodeURIComponentSafe(v) {
+  try { return decodeURIComponent(String(v || '')); }
+  catch { return String(v || ''); }
+}
 
 async function fetchResponse(url, timeout, deadline, headers = {}) {
   const budget = Math.min(timeout, Math.max(250, left(deadline) - 100));
   if (budget <= 0) throw new Error('BUDGET_EXHAUSTED');
+  
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), budget);
+  
   try {
     return await fetch(url, {
       method: 'GET',
@@ -221,10 +241,10 @@ async function fetchResponse(url, timeout, deadline, headers = {}) {
       signal: controller.signal,
       headers: {
         'user-agent': USER_AGENT,
-        accept: 'text/html,application/xhtml+xml,application/xml,application/rss+xml,text/plain;q=0.9,application/pdf;q=0.85,*/*;q=0.2',
+        'accept': 'text/html,application/xhtml+xml,application/xml,application/rss+xml,text/plain;q=0.9,application/pdf;q=0.85,*/*;q=0.2',
         'accept-language': 'en-IN,en;q=0.9',
         ...headers,
-      },
+      }
     });
   } finally { clearTimeout(timer); }
 }
@@ -232,19 +252,23 @@ async function fetchResponse(url, timeout, deadline, headers = {}) {
 async function readBody(response, maxBytes, deadline) {
   const reader = response.body?.getReader?.();
   if (!reader) return truncate(await response.text(), maxBytes);
+  
   const chunks = [];
   let total = 0;
+  
   try {
     while (left(deadline) > 80 && total < maxBytes) {
       const { done, value } = await reader.read();
       if (done) break;
       if (!value) continue;
+      
       const room = maxBytes - total;
       const piece = value.byteLength > room ? value.slice(0, room) : value;
       chunks.push(piece);
       total += piece.byteLength;
     }
   } finally { try { await reader.cancel(); } catch {} }
+  
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
@@ -259,23 +283,32 @@ async function fetchText(url, timeout, deadline, maxBytes = 600_000, headers = {
 
 function strip(html) {
   return String(html || '')
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
-    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, '')
+    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, '')
+    .replace(/<[^>]+>/g, '')
     .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&').replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
     .replace(/\s+/g, ' ').trim();
 }
+
 function titleFromHtml(html) { return strip((String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [, ''])[1]); }
 function metaFromHtml(html, name) {
   const e = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return strip((String(html).match(new RegExp(`<meta[^>]+(?:name|property)=["']${e}["'][^>]*content=["']([\\s\\S]*?)["']`, 'i')) || [, ''])[1]);
 }
+
 function dateFromHtml(html) {
-  const vals = [metaFromHtml(html, 'article:published_time'), metaFromHtml(html, 'datePublished'), metaFromHtml(html, 'date'), (String(html).match(/<time[^>]+datetime=["']([^"']+)["']/i) || [, ''])[1]];
-  for (const x of vals) { const t = Date.parse(x || ''); if (!Number.isNaN(t)) return new Date(t).toISOString(); }
+  const vals = [metaFromHtml(html, 'article:published_time'), metaFromHtml(html, 'datePublished'), metaFromHtml(html, 'date'), (String(html).match(/<time[^>]+datetime=["']([^"']+)["']/i) || [])[1]];
+  for (const x of vals) {
+    const t = Date.parse(x || '');
+    if (!Number.isNaN(t)) return new Date(t).toISOString();
+  }
   return null;
 }
 
@@ -316,7 +349,7 @@ function parseBing(html, forcedType = 'web') {
 
 function parseDuck(html, forcedType = 'web') {
   const out = [];
-  for (const m of String(html).matchAll(/<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+  for (const m of String(html).matchAll(/<a[^>]+class=["'][^"']*(?:result__a)[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
     const idx = m.index || 0;
     const r = candidate(m[1], m[2], extractSnippetAround(html, idx), 'duckduckgo', forcedType, { base: 'https://html.duckduckgo.com/' });
     if (r) out.push(r);
@@ -350,26 +383,27 @@ function parseGoogle(html, source = 'google', forcedType = 'web') {
   const out = [];
   const seen = new Set();
   const s = String(html || '');
-  // Preferred parser: actual result title (<h3>) inside an outbound anchor.
+  
   for (const m of s.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>[\s\S]*?<\/a>/gi)) {
     let raw = m[1];
     try {
       if (raw.startsWith('/url?')) {
         const u = new URL(raw, 'https://www.google.com/');
-        raw = u.searchParams.get('q') || u.searchParams.get('url') || '';
+        raw = u.searchParams.get('q') || u.searchParams.get('url') || raw;
       }
     } catch {}
     const url = unwrap(raw, 'https://www.google.com/');
     if (!url || blocked(url)) continue;
-    if (/google\.com$/i.test(normalizeHost(url)) && /\/search|\/url/i.test(new URL(url).pathname + new URL(url).search)) continue;
+    if (/google\.com$/i.test(normalizeHost(url)) && /\/search\/url/i.test(new URL(url).pathname + new URL(url).search)) continue;
     const key = normalizedKey(url);
     if (seen.has(key)) continue;
     seen.add(key);
+    
     const r = candidate(url, m[2], extractSnippetAround(s, m.index || 0), source, forcedType, { base: 'https://www.google.com/' });
     if (r) out.push(r);
     if (out.length >= 20) break;
   }
-  // Secondary parser: title/link structures where <h3> is adjacent rather than nested.
+  
   if (!out.length) {
     for (const m of s.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/gi)) {
       const idx = m.index || 0;
@@ -389,17 +423,20 @@ function parseGoogle(html, source = 'google', forcedType = 'web') {
 function parseGoogleNews(xml) {
   const out = [];
   for (const item of String(xml || '').match(/<item>[\s\S]*?<\/item>/gi) || []) {
-    const title = strip((item.match(/<title>([\s\S]*?)<\/title>/i) || [, ''])[1]);
-    const link = strip((item.match(/<link>([\s\S]*?)<\/link>/i) || [, ''])[1]);
-    const pub = strip((item.match(/<pubDate>([\s\S]*?)<\/pubDate>/i) || [, ''])[1]);
-    const desc = strip((item.match(/<description>([\s\S]*?)<\/description>/i) || [, ''])[1]);
+    const title = strip((item.match(/<title>([\s\S]*?)<\/title>/i) || [])[1]);
+    const link = strip((item.match(/<link>([\s\S]*?)<\/link>/i) || [])[1]);
+    const pub = strip((item.match(/<pubDate>([\s\S]*?)<\/pubDate>/i) || [])[1]);
+    const desc = strip((item.match(/<description>([\s\S]*?)<\/description>/i) || [])[1]);
+    
     const sm = item.match(/<source[^>]*url=["']([^"']+)["'][^>]*>([\s\S]*?)<\/source>/i) || item.match(/<source[^>]*>([\s\S]*?)<\/source>/i);
     const sourceName = strip(sm?.[2] || sm?.[1] || '');
     const sourceUrl = sm?.[1] ? unwrap(sm[1], 'https://news.google.com/') : null;
     const url = unwrap(link, 'https://news.google.com/');
+    
     if (!title || !url) continue;
     const r = candidate(url, title, desc, sourceName ? `google-news:${sourceName}` : 'google-news', 'news');
     if (!r) continue;
+    
     r.publishedAt = safeDate(pub);
     r.publisherUrl = sourceUrl || null;
     out.push(r);
@@ -412,21 +449,23 @@ function parseYoutube(html) {
   const out = [];
   const seen = new Set();
   const s = String(html || '');
+  
   for (const m of s.matchAll(/"videoRenderer":\{[\s\S]*?"videoId":"([A-Za-z0-9_-]{6,20})"[\s\S]*?"title":\{"runs":\[\{"text":"((?:\\.|[^"\\])*)"/g)) {
     const id = m[1];
     if (seen.has(id)) continue;
     seen.add(id);
     const title = m[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-    const r = candidate(`https://www.youtube.com/watch?v=${id}`, title, 'YouTube result', 'youtube', 'video');
+    const r = candidate(`https://www.youtube.com/watch?v=${id}`, title, `YouTube result`, 'youtube', 'video');
     if (r) out.push(r);
     if (out.length >= 20) break;
   }
+  
   if (!out.length) {
     for (const m of s.matchAll(/"videoId":"([A-Za-z0-9_-]{6,20})"/g)) {
       const id = m[1];
       if (seen.has(id)) continue;
       seen.add(id);
-      const r = candidate(`https://www.youtube.com/watch?v=${id}`, `YouTube video ${id}`, 'YouTube result', 'youtube', 'video');
+      const r = candidate(`https://www.youtube.com/watch?v=${id}`, `YouTube video ${id}`, `YouTube result`, 'youtube', 'video');
       if (r) out.push(r);
       if (out.length >= 20) break;
     }
@@ -435,9 +474,10 @@ function parseYoutube(html) {
 }
 
 function safeDate(value) {
-  const t = Date.parse(String(value || ''));
+  const t = Date.parse(String(value));
   return Number.isNaN(t) ? null : new Date(t).toISOString();
 }
+
 function freshness(publishedAt) {
   if (!publishedAt) return 'unknown';
   const age = Math.max(0, (Date.now() - Date.parse(publishedAt)) / 86400000);
@@ -452,19 +492,19 @@ function freshness(publishedAt) {
 function providerRequests(queries, plan, count) {
   const final = [];
   const seen = new Set();
+  
   const add = (provider, q, type, url) => {
     if (final.length >= MAX_ENGINE_REQUESTS || seen.has(url)) return;
-    seen.add(url); final.push({ provider, query:q, type, url });
+    seen.add(url); 
+    final.push({ provider, query: q, type, url });
   };
+  
   const qs = queries.slice(0, 4);
   const isSpecial = plan.type === 'news' || plan.type === 'video' || plan.type === 'doc' || plan.type === 'gov';
-
-  // Give Bing a few result pages because it is often the only public HTML surface
-  // available from a serverless runtime. Pagination is parallel and still bounded.
+  
   const e0 = encodeURIComponent(qs[0] || '');
-  for (const first of [0,10,20,30]) add('bing', qs[0], plan.type === 'news' ? 'news' : 'web', `https://www.bing.com/search?q=${e0}&count=10&first=${first}&setlang=en-IN&cc=in`);
-
-  // Other engines receive the precise query variants, providing domain diversity.
+  for (const first of [0, 10, 20, 30]) add('bing', qs[0], plan.type === 'news' ? 'news' : 'web', `https://www.bing.com/search?q=${e0}&count=10&first=${first}&setlang=en-IN&cc=in`);
+  
   for (const q of qs) {
     const e = encodeURIComponent(q);
     add('google', q, plan.type === 'news' ? 'news' : 'web', `https://www.google.com/search?q=${e}&num=20&hl=en&gl=in`);
@@ -472,31 +512,32 @@ function providerRequests(queries, plan, count) {
     add('yahoo', q, plan.type === 'news' ? 'news' : 'web', `https://search.yahoo.com/search?p=${e}`);
     add('mojeek', q, plan.type === 'news' ? 'news' : 'web', `https://www.mojeek.com/search?q=${e}`);
   }
-
-  // Requested special surfaces are additive, never a replacement for core web search.
+  
   if (plan.type === 'news' || plan.flags?.explicitNews) {
-    for (const q of qs.slice(0,2)) add('google-news', q, 'news', `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-IN&gl=IN&ceid=IN:en`);
+    for (const q of qs.slice(0, 2)) add('google-news', q, 'news', `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-IN&gl=IN&ceid=IN:en`);
   }
   if (plan.type === 'video' || plan.flags?.explicitVideo) {
-    for (const q of qs.slice(0,2)) {
+    for (const q of qs.slice(0, 2)) {
       add('youtube', q, 'video', `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&hl=en-IN`);
-      add('google-video', q, 'video', `https://www.google.com/search?q=${encodeURIComponent(`site:youtube.com ${q}`)}&num=20&hl=en&gl=in`);
+      add('google-video', q, 'video', `https://www.google.com/search?q=${encodeURIComponent('site:youtube.com ' + q)}&num=20&hl=en&gl=in`);
     }
   }
   if (plan.type === 'doc' || plan.flags?.explicitDoc) {
-    for (const q of qs.slice(0,2)) add('google-doc', q, 'doc', `https://www.google.com/search?q=${encodeURIComponent(`${q} filetype:pdf`)}&num=20&hl=en&gl=in`);
+    for (const q of qs.slice(0, 2)) add('google-doc', q, 'doc', `https://www.google.com/search?q=${encodeURIComponent(q + ' filetype:pdf')}&num=20&hl=en&gl=in`);
   }
   if (plan.type === 'gov' || plan.flags?.explicitGov) {
-    for (const q of qs.slice(0,2)) add('google-gov', q, 'gov', `https://www.google.com/search?q=${encodeURIComponent(`${q} site:gov.in`)}&num=20&hl=en&gl=in`);
+    for (const q of qs.slice(0, 2)) add('google-gov', q, 'gov', `https://www.google.com/search?q=${encodeURIComponent(q + ' site:gov.in')}&num=20&hl=en&gl=in`);
   }
-
+  
   void count; void isSpecial;
   return final.slice(0, MAX_ENGINE_REQUESTS);
 }
+
 async function discoverOne(req, deadline) {
   try {
     const body = await fetchText(req.url, SEARCH_TIMEOUT_MS, deadline, 700_000);
     let results = [];
+    
     if (req.provider === 'bing') results = parseBing(body, req.type);
     else if (req.provider === 'google') results = parseGoogle(body, 'google', req.type);
     else if (req.provider === 'google-video') results = parseGoogle(body, 'google-video', 'video');
@@ -507,6 +548,7 @@ async function discoverOne(req, deadline) {
     else if (req.provider === 'youtube') results = parseYoutube(body);
     else if (req.provider === 'google-doc') results = parseGoogle(body, 'google-doc', 'doc');
     else if (req.provider === 'google-gov') results = parseGoogle(body, 'google-gov', 'gov');
+    
     return { provider: req.provider, ok: true, results };
   } catch (error) {
     return { provider: req.provider, ok: false, results: [], error: error?.message || 'DISCOVERY_FAILED' };
@@ -519,9 +561,11 @@ function dedupeCandidates(list) {
     if (!raw) continue;
     const url = unwrap(raw.url || raw.link || raw.sourceUrl || '', raw.base || 'https://example.com/');
     if (!url || blocked(url)) continue;
+    
     const item = { ...raw, url };
     const key = normalizedKey(url);
     const old = map.get(key);
+    
     if (!old) map.set(key, item);
     else {
       const oldContent = String(old.rawContent || old.pageContent || '').length;
@@ -541,55 +585,41 @@ function dedupeCandidates(list) {
 async function groqRerank(query, results, deadline) {
   const key = env('GROQ_API_KEY');
   if (!key || results.length < 3 || left(deadline) < 520) return null;
+  
   const controller = new AbortController();
   const timeout = Math.min(AI_RERANK_TIMEOUT_MS, Math.max(450, left(deadline) - 100));
   const timer = setTimeout(() => controller.abort(), timeout);
+  
   try {
-    const payload = results.slice(0, 30).map((r, i) => ({ id: i, title: truncate(r.title, 180), domain: normalizeHost(r.url), type: r.type, relevanceScore: r.relevanceScore, snippet: truncate(r.snippet, 240) }));
+    const payload = results.slice(0, 30).map((r, i) => ({
+      id: i, title: truncate(r.title, 180), domain: normalizeHost(r.url), 
+      type: r.type, relevanceScore: r.relevanceScore, snippet: truncate(r.snippet, 240)
+    }));
+    
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       signal: controller.signal,
-      headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+      headers: { 'authorization': `Bearer ${key}`, 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'openai/gpt-oss-20b',
+        model: 'llama3-8b-8192',
         messages: [
           { role: 'system', content: 'Return JSON only. Reorder provided source IDs for relevance to the user query. Never invent or remove IDs. Prefer exact topic, source quality, requested type and direct evidence.' },
-          { role: 'user', content: JSON.stringify({ query, results: payload, output: { order: [0, 1, 2] } }) },
+          { role: 'user', content: JSON.stringify({ query, results: payload, output: { order: [0, 1, 2] } }) }
         ],
         temperature: 0,
-        max_completion_tokens: 450,
+        max_tokens: 450,
       }),
     });
+    
     if (!res.ok) return null;
     const data = await res.json();
     const text = String(data?.choices?.[0]?.message?.content || '');
     const obj = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || text);
+    
     if (!Array.isArray(obj?.order)) return null;
     return obj.order.map(Number).filter(Number.isInteger).filter(i => i >= 0 && i < results.length);
   } catch { return null; }
   finally { clearTimeout(timer); }
-}
-
-function relevanceAcceptable(result, plan) {
-  if (!result || !isRealSourceContent(result)) return false;
-  const type = plan.type;
-  if (type === 'gov' && !(isGov(result.url) || result.type === 'gov')) return false;
-  if (type === 'doc' && !(isDoc(result.url) || result.type === 'doc')) return false;
-  if (type === 'video' && !(isVideo(result.url) || result.type === 'video')) return false;
-  if (type === 'news' && !(result.type === 'news' || ARTICLE_PATH.test(result.url))) return false;
-
-  const rel = result.relevance || {};
-  const score = Number(result.relevanceScore || 0);
-  const concept = Number(result.contentConceptCoverage ?? rel.conceptCoverage ?? 0);
-  const title = Number(result.contentTitleSimilarity ?? rel.titleCoverage ?? 0);
-  const band = String(result.relevanceBand || '').toLowerCase();
-
-  if (band === 'excellent' || band === 'strong') return true;
-  if (score >= 54 && concept >= 0.35) return true;
-  if (score >= 46 && concept >= 0.45 && title >= 0.2) return true;
-  if (plan.flags?.wantsHistory && Array.isArray(rel.mismatchTerms) && rel.mismatchTerms.length) return false;
-  if (score >= 42 && concept >= 0.5) return true;
-  return false;
 }
 
 function diversifyFinal(results, count) {
@@ -597,9 +627,11 @@ function diversifyFinal(results, count) {
   const selected = [];
   const domainCounts = new Map();
   const topicSeen = new Map();
+  
   while (selected.length < count && pool.length) {
     let bestIndex = 0;
     let bestScore = -Infinity;
+    
     for (let i = 0; i < pool.length; i++) {
       const r = pool[i];
       const d = normalizeHost(r.url);
@@ -608,14 +640,16 @@ function diversifyFinal(results, count) {
       const freshnessBonus = freshness(r.publishedAt) === 'last_24h' ? 3 : freshness(r.publishedAt) === 'last_7d' ? 2 : 0;
       const typeBonus = r.type === 'news' || r.type === 'gov' || r.type === 'doc' ? 1 : 0;
       const novelty = (r.relevance?.matchedConcepts || []).reduce((sum, x) => sum + 1 / (1 + (topicSeen.get(x) || 0)), 0);
+      
       const adjusted = base - domainPenalty + freshnessBonus + typeBonus + novelty;
       if (adjusted > bestScore) { bestScore = adjusted; bestIndex = i; }
     }
+    
     const chosen = pool.splice(bestIndex, 1)[0];
     selected.push(chosen);
     const d = normalizeHost(chosen.url);
     domainCounts.set(d, (domainCounts.get(d) || 0) + 1);
-    for (const g of chosen.relevance?.matchedConcepts || []) topicSeen.set(g, (topicSeen.get(g) || 0) + 1);
+    for (const c of chosen.relevance?.matchedConcepts || []) topicSeen.set(c, (topicSeen.get(c) || 0) + 1);
   }
   return selected;
 }
@@ -651,6 +685,7 @@ function cacheGet(key) {
   if (Date.now() - item.at > item.ttl) { SEARCH_CACHE.delete(key); return null; }
   return item.value;
 }
+
 function cacheSet(key, value, ttl) {
   SEARCH_CACHE.set(key, { at: Date.now(), value, ttl });
   while (SEARCH_CACHE.size > CACHE_MAX) SEARCH_CACHE.delete(SEARCH_CACHE.keys().next().value);
@@ -683,8 +718,9 @@ async function resolveNewsCandidate(candidate, deadline) {
         return { href: unwrap(href, candidate.url), text };
       })
       .filter(x => x.href && normalizeHost(x.href) !== 'news.google.com' && x.text.length > 8)
-      .sort((a,b) => tokenSimilarity(candidate.title, a.text) - tokenSimilarity(candidate.title, b.text))
+      .sort((a, b) => tokenSimilarity(candidate.title, a.text) - tokenSimilarity(candidate.title, b.text))
       .pop();
+      
     if (link?.href) return { ...candidate, url: link.href, publisherResolved: true, publisherWrapperUrl: candidate.url, publisherResolutionMethod: 'embedded-link', contentSourceUrl: link.href };
   } catch {}
   return { ...candidate, _newsWrapperUnresolved: true };
@@ -709,31 +745,30 @@ async function performSearch(input, started, logger) {
   const verifyRequested = input.verify == null ? true : String(input.verify).toLowerCase() !== 'false';
   const useCc = String(input.commonCrawl ?? 'false').toLowerCase() === 'true';
   const requireRealContent = input.requireRealContent == null ? true : String(input.requireRealContent).toLowerCase() !== 'false';
-
+  
   const plan = analyzeQuery(query, { mode, type: requestedType });
   const key = cacheKey(input, query, count, plan);
   const cached = cacheGet(key);
+  
   if (cached) {
     logger.add('cache-hit', `Returned warm cached search for ${query}.`, { count: cached.returnedResults });
     return { ...cached, generatedAt: nowIso(), latencyMs: Date.now() - started, cached: true, liveLog: logger.logs };
   }
-
-  logger.add('query-analyzed', 'Precision query analysis completed.', {
-    type: plan.type,
-    concepts: plan.concepts.map(x => x.id),
-    dateIntent: plan.dateIntent.kind,
-  });
-
+  
+  logger.add('query-analyzed', `Precision query analysis completed.`, { type: plan.type, concepts: plan.concepts.map(x => x.id), dateIntent: plan.dateIntent.kind });
+  
   const preciseQueries = buildPreciseQueries(query, { plan });
   const requests = providerRequests(preciseQueries, plan, count);
+  
   logger.add('discovery-start', `Launching ${requests.length} parallel discovery requests.`, { queries: preciseQueries.slice(0, 8) });
-
+  
   const discoveryDeadline = Math.min(deadline, started + DISCOVERY_CUTOFF_MS);
   const discoveries = await Promise.allSettled(requests.map(r => discoverOne(r, discoveryDeadline)));
-
+  
   const providerStats = {};
   let discovered = [];
   let discoveryOk = 0;
+  
   for (const entry of discoveries) {
     if (entry.status !== 'fulfilled') continue;
     const item = entry.value;
@@ -743,9 +778,10 @@ async function performSearch(input, started, logger) {
     providerStats[item.provider].results += item.results.length;
     discovered.push(...item.results);
   }
+  
   discovered = dedupeCandidates(discovered);
-
   const newsWrappers = discovered.filter(r => r.type === 'news' && normalizeHost(r.url) === 'news.google.com').slice(0, 8);
+  
   if (newsWrappers.length && left(deadline) > 6_000) {
     logger.add('news-resolution-start', `Resolving ${newsWrappers.length} news aggregator links in parallel.`);
     const resolved = await Promise.all(newsWrappers.map(r => resolveNewsCandidate(r, deadline)));
@@ -755,85 +791,112 @@ async function performSearch(input, started, logger) {
   } else {
     discovered = discovered.filter(r => normalizeHost(r.url) !== 'news.google.com' || r.publisherResolved);
   }
-
-  logger.add('discovery-complete', `Discovery produced ${discovered.length} unique candidates.`, {
-    successfulProviders: discoveryOk,
-    sourceCandidates: discovered.length,
-  });
-
+  
+  logger.add('discovery-complete', `Discovery produced ${discovered.length} unique candidates.`, { successfulProviders: discoveryOk, sourceCandidates: discovered.length });
+  
   if (!discovered.length) {
     logger.add('discovery-empty', 'No search candidates were returned by the available public surfaces.');
   }
 
-  // Preserve the complete discovered pool. The decisive relevance comparison happens only AFTER page fetch.
   const ranked = [...discovered];
-  const acquisitionPool = [...discovered].sort((a,b) => {
+  const acquisitionPool = [...discovered].sort((a, b) => {
     const ap = Number(a?.semanticSearchScore ?? 0), bp = Number(b?.semanticSearchScore ?? 0);
     if (bp !== ap) return bp - ap;
     return String(a?.title || '').length - String(b?.title || '').length;
   });
-  logger.add('ranking-complete', `Prepared ${acquisitionPool.length} candidates for page acquisition; no relevance cutoff is applied before fetch.`);
-
+  
+  logger.add('ranking-complete', `Prepared ${acquisitionPool.length} candidates for page acquisition.`);
+  
   if (!verifyRequested) {
     const metadataOnly = diversifyFinal(ranked.slice(0, count).map(r => ({
       ...r,
       relevanceScore: Math.round(r._relevance?.score || 0),
       relevanceBand: r._relevance?.band || 'weak-match',
       verified: false,
-      pageContent: '', extractedText: '', contentAvailable: false,
+      pageContent: r.snippet,
+      extractedText: r.snippet,
+      contentAvailable: false
     })), count);
-    const final = metadataOnly.map((r, i) => formatResult(r, i, plan, false));
+    const final = metadataOnly.map((r, i) => formatResult(r, i, plan));
     const result = buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested });
     cacheSet(key, result, selectCacheTtl(plan));
     return result;
   }
 
-  // Fetch pages first. The checker then performs only a lightweight query comparison.
   const contentCandidates = acquisitionPool.slice(0, MAX_DISCOVERY_RESULTS);
   logger.add('content-start', `Fetching real page content for ${contentCandidates.length} candidates concurrently.`);
-
+  
   const algorithmBudget = Math.max(1_350, Math.min(7_800, left(deadline) - 160));
   let enriched = [];
+  
   try {
-    const checked = await enrichCandidates(contentCandidates, plan, {
-      count,
-      requireRealContent: true,
-      budgetMs: algorithmBudget,
-    });
-    enriched = Array.isArray(checked?.results) ? checked.results.filter(isRealSourceContent) : [];
+    const checked = await enrichCandidates(contentCandidates, plan, { count, requireRealContent: true, budgetMs: algorithmBudget });
+    enriched = Array.isArray(checked?.results) ? checked.results : [];
   } catch (error) {
     logger.add('content-failed', 'The page-content checker failed safely.', { error: error?.message || 'CONTENT_CHECK_FAILED' });
   }
-  logger.add('content-complete', `Page fetch + query comparison produced ${enriched.length} real-content sources.`, {
-    candidates: contentCandidates.length,
-    returned: enriched.length,
+
+  // Map the verified/enriched pages so we can use them
+  const enrichedMap = new Map(enriched.map(r => [normalizedKey(r.url), r]));
+
+  // **CRITICAL FIX**: Instead of dropping failed fetches, we merge everything back together. 
+  // If we fetched the content, we use it. If not, we fall back to metadata and score the snippet.
+  const mergedCandidates = contentCandidates.map(c => {
+    const k = normalizedKey(c.url);
+    if (enrichedMap.has(k)) {
+      return enrichedMap.get(k); // Full verified page content
+    }
+    
+    // Create a fallback object with the snippet acting as the content
+    const fallback = { ...c, pageContent: c.snippet, extractedText: c.snippet };
+    
+    // Compare this fallback to the query so it can be ranked against the verified pages
+    const rel = comparePageToQuery(plan.query, fallback);
+    
+    return {
+      ...fallback,
+      relevance: rel,
+      relevanceScore: Number(rel.score || 0),
+      relevanceBand: rel.band || 'weak-match',
+      contentAvailable: false,
+      contentStatus: 'metadata-fallback',
+      contentMethod: 'search-snippet',
+      verified: false
+    };
   });
 
-  // Final selection is intentionally soft: all returned sources have real page content;
-  // relevance only determines ordering, not a brittle score cutoff.
-  const finalPool = [...new Map(enriched.filter(isRealSourceContent).map(r => [normalizedKey(r.url), r])).values()].slice(0, OUTPUT_MAX_SOURCES)
+  logger.add('content-complete', `Page fetch + query comparison completed on all ${mergedCandidates.length} sources.`, {
+    candidates: contentCandidates.length,
+    fullyVerified: enrichedMap.size,
+    totalMerged: mergedCandidates.length
+  });
+
+  // Rank ALL of them based on the unified score
+  const finalPool = [...new Map(mergedCandidates.map(r => [normalizedKey(r.url), r])).values()]
+    .slice(0, OUTPUT_MAX_SOURCES)
     .map(r => ({ ...r, _score: Number(r.relevanceScore || 0) }))
     .sort((a, b) => Number(b.relevanceScore || 0) - Number(a.relevanceScore || 0));
 
-  // Requested count controls how many the user asked for, but does NOT truncate the fetched source set.
-  // Return every unique source for which real page content was obtained.
-  const chosen = finalPool;
+  const chosen = finalPool; // Return ALL discovered sources that passed through the ranking
+  
   let commonCrawlRows = [];
   if (useCc && chosen.length && left(deadline) > 550) {
     const ccDeadline = Date.now() + Math.min(500, left(deadline) - 50);
     commonCrawlRows = await Promise.all(chosen.slice(0, MAX_COMMON_CRAWL).map(async r => ({ url: r.url, cc: await commonCrawlMeta(r.url, ccDeadline) })));
   }
+  
   const ccMap = new Map(commonCrawlRows.filter(x => x?.cc).map(x => [normalizedKey(x.url), x.cc]));
-
-  const final = chosen.map((r, i) => formatResult({ ...r, commonCrawl: ccMap.get(normalizedKey(r.url)) || null }, i, plan, true));
+  
+  const final = chosen.map((r, i) => formatResult({ ...r, commonCrawl: ccMap.get(normalizedKey(r.url)) || null }, i, plan));
+  
   const result = buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested });
   cacheSet(key, result, selectCacheTtl(plan));
   return result;
 }
 
-function formatResult(r, i, plan, realContent) {
-  const content = realContent ? String(r.pageContent || r.extractedText || '').trim() : '';
-  const relevanceScore = Math.round(Number(r.relevanceScore ?? r._relevance?.score ?? 0));
+function formatResult(r, i, plan) {
+  const content = String(r.pageContent || r.extractedText || r.snippet || '').trim();
+  const relevanceScore = Math.round(Number(r.relevanceScore ?? r._score ?? 0));
   const rel = r.relevance || {
     titleCoverage: r._relevance?.titleCoverage ?? 0,
     bodyCoverage: r._relevance?.bodyCoverage ?? 0,
@@ -843,6 +906,7 @@ function formatResult(r, i, plan, realContent) {
     exactPhrase: Boolean(r._relevance?.phraseExact),
     mismatchTerms: r._relevance?.mismatchTerms ?? [],
   };
+  
   return {
     rank: i + 1,
     title: truncate(r.title || 'Untitled', 300),
@@ -853,7 +917,7 @@ function formatResult(r, i, plan, realContent) {
     snippet: truncate(r.snippet || '', 1200),
     publishedAt: r.publishedAt || null,
     freshness: freshness(r.publishedAt),
-    verified: Boolean(realContent && (r.verified !== false)),
+    verified: Boolean(r.verified),
     httpStatus: r.httpStatus || null,
     contentType: r.contentType || null,
     trust: Number((r.trust ?? (isGov(r.url) ? 1 : isTrusted(r.url) ? 0.95 : 0.6)).toFixed(2)),
@@ -867,18 +931,18 @@ function formatResult(r, i, plan, realContent) {
     searchWrapperProvider: r.searchWrapperProvider || null,
     extractedText: content,
     pageContent: content,
-    contentAvailable: Boolean(realContent && content),
-    contentStatus: r.contentStatus || (realContent ? 'full' : 'metadata'),
-    contentMethod: r.contentMethod || r.validatedBy || 'algorithm',
+    contentAvailable: Boolean(r.contentAvailable),
+    contentStatus: r.contentStatus || (r.contentAvailable ? 'full' : 'metadata-fallback'),
+    contentMethod: r.contentMethod || r.validatedBy || (r.contentAvailable ? 'algorithm' : 'search-snippet'),
     contentLength: content.length,
-    contentConfidence: Number(r.contentConfidence ?? (realContent ? 0.9 : 0)),
+    contentConfidence: Number(r.contentConfidence ?? (r.contentAvailable ? 0.9 : 0)),
     contentSourceUrl: r.contentSourceUrl || r.url,
-    contentTargetMatched: Boolean(r.contentTargetMatched ?? realContent),
-    contentTitleSimilarity: Number(r.contentTitleSimilarity ?? r.contentTitleSimilarity ?? rel.titleCoverage ?? 0).toFixed(3),
+    contentTargetMatched: Boolean(r.contentTargetMatched ?? r.contentAvailable),
+    contentTitleSimilarity: Number(r.contentTitleSimilarity ?? rel.titleCoverage ?? 0).toFixed(3),
     contentConceptCoverage: Number(r.contentConceptCoverage ?? rel.conceptCoverage ?? 0).toFixed(3),
     contentFormat: 'plain_text',
-    contentRole: realContent ? 'publisher_page_content' : 'search_metadata_only',
-    contentForAI: realContent ? `SOURCE_URL: ${r.contentSourceUrl || r.url}\nTITLE: ${truncate(r.title || '', 300)}\nCONTENT_STATUS: ${r.contentStatus || 'full'}\n\n${content}` : '',
+    contentRole: r.contentAvailable ? 'publisher_page_content' : 'search_metadata_only',
+    contentForAI: r.contentAvailable ? `SOURCE_URL: ${r.contentSourceUrl || r.url}\nTITLE: ${truncate(r.title || '', 300)}\nCONTENT_STATUS: ${r.contentStatus || 'full'}\n\n${content}` : null,
     verificationMethod: r.verificationMethod || r.validatedBy || null,
     transcript: r.transcript || null,
     transcriptAvailable: Boolean(r.transcriptAvailable),
@@ -894,14 +958,15 @@ function formatResult(r, i, plan, realContent) {
 
 function buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested }) {
   const validationCount = final.filter(r => r.contentAvailable).length;
+  
   const result = {
     ok: true,
     version: VERSION,
     query,
     requestedResults: count,
     returnedResults: final.length,
-    sourceCountMode: 'all-fetched-real-content',
-      resultSelectionPolicy: 'return-all-fetched-real-content-ranked-by-query-match',
+    sourceCountMode: 'all-discovered-candidates',
+    resultSelectionPolicy: 'return-all-discovered-ranked-by-query-match',
     mode,
     intent: {
       type: requestedType || plan.type,
@@ -913,6 +978,7 @@ function buildResponse({ query, count, mode, requestedType, plan, preciseQueries
       wantsAcademic: Boolean(plan.flags?.wantsAcademic),
     },
     generatedAt: nowIso(),
+    started,
     latencyMs: Date.now() - started,
     keylessCoreSearch: true,
     groqUsed: aiRequested === 'true' && logger.logs.some(x => x.event === 'ai-rerank-complete'),
@@ -923,7 +989,7 @@ function buildResponse({ query, count, mode, requestedType, plan, preciseQueries
       relevantResults: final.filter(r => r.relevanceScore >= 54).length,
       requestedResults: count,
       realContentOnly: requireRealContent,
-      contentGuarantee: 'Every returned result contains fetched source content; relevance only ranks results and never removes fetched content.',
+      contentGuarantee: 'All discovered sources are returned. Successfully verified pages include their full pageContent. Unverified pages fall back to metadata snippets to ensure candidates are not lost.',
     },
     searchPlan: {
       queryVariants: preciseQueries,
@@ -946,15 +1012,23 @@ function buildResponse({ query, count, mode, requestedType, plan, preciseQueries
     allFetchedSources: final.length,
     warnings: [],
   };
-  if (requireRealContent && final.length < count) result.warnings.push(`${final.length} fetched pages produced real content within the crawler budget; ${count} were requested. Unreadable pages were excluded and never replaced with snippets.`);
-  if (!final.length) result.warnings.push('No real page content completed within the crawler budget; search snippets were never promoted to pageContent.');
-  if (result.latencyMs > SEARCH_BUDGET_MS) result.warnings.push('The outer platform/runtime may have added latency beyond the crawler work budget.');
+
+  if (requireRealContent && validationCount < count) {
+    result.warnings.push(`${validationCount} fully verified pages were fetched; ${count} were requested. All ${final.length} discovered sources are included below using snippet fallbacks where full fetch failed.`);
+  }
+  if (!final.length) {
+    result.warnings.push('No sources satisfied the request. No page content was found.');
+  }
+  if (result.latencyMs > SEARCH_BUDGET_MS) {
+    result.warnings.push('The outer platform/runtime may have added latency beyond the crawler work budget.');
+  }
   return result;
 }
 
 async function readInput(req) {
   const url = new URL(req.url);
   if (req.method === 'GET') return Object.fromEntries(url.searchParams.entries());
+  
   const raw = await req.text();
   if (raw.length > MAX_REQUEST_BODY) throw new Error('REQUEST_BODY_TOO_LARGE');
   if (!raw) return {};
@@ -966,7 +1040,7 @@ function corsHeaders(contentType = 'application/json; charset=utf-8') {
     'content-type': contentType,
     'cache-control': 'no-store, no-transform',
     'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET,POST,OPTIONS',
+    'access-control-allow-methods': 'GET, POST, OPTIONS',
     'access-control-allow-headers': 'content-type, authorization, x-arix-search-key',
     'x-arix-crawler-version': VERSION,
   };
@@ -978,38 +1052,46 @@ function streamJsonSearch(input) {
   const encoder = new TextEncoder();
   const started = Date.now();
   const logger = createLogger();
+  
   const query = truncate(String(input.query ?? input.q ?? '').trim(), MAX_QUERY_LEN);
   const count = safeInt(input.count ?? input.limit, DEFAULT_RESULTS, 1, MAX_RESULTS);
   const mode = String(input.mode || 'auto').toLowerCase();
-  const deadline = started + SEARCH_BUDGET_MS;
-
+  
   const stream = new ReadableStream({
     start(controller) {
       let closed = false;
       const send = chunk => { if (!closed) { try { controller.enqueue(encoder.encode(chunk)); } catch { closed = true; } } };
+      
       logger.add('request-start', `Starting live search for ${query}.`, { count, mode });
-      send(`{"ok":true,"version":${encode(VERSION)},"query":${encode(query)},"requestedResults":${count},"mode":${encode(mode)},"streaming":true,"results":[`);
-      const heartbeat = setInterval(() => send('\n'), STREAM_HEARTBEAT_MS);
-      Promise.resolve().then(() => performSearch(input, started, logger, deadline)).then(result => {
+      
+      send(`{"ok":true,"version":${encode(VERSION)},"query":${encode(query)},"requestedResults":${count},"mode":${encode(mode)},"streaming":true,"results":[\n`);
+      
+      const heartbeat = setInterval(() => send(' \n'), STREAM_HEARTBEAT_MS);
+      
+      Promise.resolve().then(() => performSearch(input, started, logger)).then(result => {
         clearInterval(heartbeat);
         const results = Array.isArray(result.results) ? result.results : [];
-        results.forEach((r, i) => send(`${i ? ',' : ''}${JSON.stringify(r)}`));
+        results.forEach((r, i) => send(`${i ? ',\n' : ''}${JSON.stringify(r)}\n`));
+        
         const metadata = { ...result };
         delete metadata.results;
-        send('],');
+        
+        send('],\n');
         const entries = Object.entries(metadata);
-        entries.forEach(([k, v], i) => send(`${JSON.stringify(k)}:${JSON.stringify(v)}${i === entries.length - 1 ? '' : ','}`));
+        entries.forEach(([k, v], i) => send(`"${k}":${JSON.stringify(v)}${i === entries.length - 1 ? '' : ',\n'}`));
         send('}');
+        
         try { controller.close(); } catch {}
         closed = true;
       }).catch(error => {
         clearInterval(heartbeat);
-        send(`],"returnedResults":0,"generatedAt":${encode(nowIso())},"latencyMs":${Date.now() - started},"keylessCoreSearch":true,"groqUsed":false,"resultsError":${encode(error?.message || 'SEARCH_FAILED')},"liveLog":${JSON.stringify(logger.logs)},"warnings":[${encode('The crawler failed safely after the stream had already started.').replace(/\[|\]/g,'')}]}`);
+        send(`],"returnedResults":0,"generatedAt":${encode(nowIso())},"latencyMs":${Date.now() - started},"keylessCoreSearch":true,"groqUsed":false,"resultsError":${encode(error?.message || 'SEARCH_FAILED')},"liveLog":${JSON.stringify(logger.logs)},"warnings":[${encode('The crawler failed safely after the stream had already started.').replace(/\[|\]/g, '')}]}`);
         try { controller.close(); } catch {}
         closed = true;
       });
-    },
+    }
   });
+  
   return new Response(stream, { status: 200, headers: { ...corsHeaders(), 'x-arix-search-stream': '1', 'x-arix-stream-heartbeat-ms': String(STREAM_HEARTBEAT_MS) } });
 }
 
@@ -1017,6 +1099,7 @@ function streamSseSearch(input) {
   const encoder = new TextEncoder();
   const started = Date.now();
   const logger = createLogger();
+  
   const stream = new ReadableStream({
     start(controller) {
       let closed = false;
@@ -1024,12 +1107,15 @@ function streamSseSearch(input) {
         if (closed) return;
         try { controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)); } catch { closed = true; }
       };
+      
       const heartbeat = setInterval(() => sendEvent('heartbeat', { at: nowIso(), version: VERSION }), STREAM_HEARTBEAT_MS);
+      
       const originalAdd = logger.add;
       logger.add = (event, message, extra = {}) => {
         originalAdd(event, message, extra);
         sendEvent('log', logger.logs[logger.logs.length - 1]);
       };
+      
       Promise.resolve().then(() => performSearch(input, started, logger)).then(result => {
         clearInterval(heartbeat);
         sendEvent('result', result);
@@ -1042,19 +1128,23 @@ function streamSseSearch(input) {
         try { controller.close(); } catch {}
         closed = true;
       });
-    },
+    }
   });
+  
   return new Response(stream, { status: 200, headers: { ...corsHeaders('text/event-stream; charset=utf-8'), 'x-arix-log-stream': 'sse' } });
 }
 
 export default async function handler(req) {
   if (req.method === 'OPTIONS') return jsonResponse({ ok: true, version: VERSION });
   if (!['GET', 'POST'].includes(req.method)) return jsonResponse({ ok: false, version: VERSION, error: 'METHOD_NOT_ALLOWED', message: 'Use GET or POST.' }, 405);
+  
   try {
     const input = await readInput(req);
     const query = truncate(String(input.query ?? input.q ?? '').trim(), MAX_QUERY_LEN);
+    
     if (!query) return jsonResponse({ ok: false, version: VERSION, error: 'MISSING_QUERY' }, 400);
     if (query.length < 2) return jsonResponse({ ok: false, version: VERSION, error: 'QUERY_TOO_SHORT' }, 400);
+    
     const wantsSse = String(input.logStream || '').toLowerCase() === 'true' || req.headers.get('accept')?.includes('text/event-stream');
     return wantsSse ? streamSseSearch(input) : streamJsonSearch(input);
   } catch (error) {
