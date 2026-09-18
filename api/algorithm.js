@@ -1,13 +1,13 @@
 /*
  * ArixAI Algorithm Orchestrator
- * v3.0.0 (Scraper Integration & PDF Rescue Edition)
+ * v3.1.0 (Scraper Integration & Missing Exports Fix)
  * 
  * Purpose: Advanced query planning, semantic relevance scoring, and orchestration. 
  * 
- * Update 3.0.0: 
- * - Fully attaches to the new dedicated `scraper.js` for all HTML/SPA content.
+ * Update 3.1.0: 
+ * - Restored missing `buildPreciseQueries` and `rankCandidates` exports causing 1ms crashes.
+ * - Fully delegates HTML/SPA extraction to the dedicated `scraper.js`.
  * - Handles PDF streams natively with strict AbortController chunking.
- * - Entirely eliminates Tarpit errors by enforcing safe budget boundaries.
  */
 
 import { scrapePage } from './scraper.js';
@@ -16,7 +16,7 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-algorithm-orchestrator-3.0.0';
+const VERSION = 'arix-algorithm-orchestrator-3.1.0';
 const MAX_RESULTS = 40;
 const MAX_QUERY_LEN = 700;
 const MAX_CANDIDATES = 500;
@@ -24,7 +24,7 @@ const MAX_PDF_BYTES = 1_000_000;
 const MIN_REAL_CONTENT = 150;
 
 const DEFAULT_BUDGET_MS = 24_000;
-const CONTENT_CONCURRENCY = 25; // Adjusted to prevent Vercel concurrency throttles
+const CONTENT_CONCURRENCY = 25; 
 const CACHE_TTL_MS = 120_000;
 const CACHE_MAX = 160;
 const CONTENT_CACHE = new Map();
@@ -101,7 +101,6 @@ function unwrapUrl(url) {
     let current = String(url || '').replace(/&amp;/gi, '&');
     const u = new URL(current);
     
-    // Auto-unwrap Bing tracking links
     if (u.hostname.includes('bing.com') && u.pathname.startsWith('/ck/a')) {
       let uParam = u.searchParams.get('u');
       if (uParam) {
@@ -115,7 +114,6 @@ function unwrapUrl(url) {
       }
     }
     
-    // Auto-unwrap Google tracking links
     if (u.hostname.includes('google.') && u.pathname === '/url') {
       const q = u.searchParams.get('q') || u.searchParams.get('url');
       if (q && /^https?:\/\//i.test(q)) return q;
@@ -173,7 +171,7 @@ function normalizedKey(url) { const u = normalizedUrl(url); return u ? `${host(u
 
 function cleanContent(v) {
   let s = String(v || '').replace(/\s+/g, ' ').trim();
-  return truncate(s, 24_000); // 24k fallback
+  return truncate(s, 24_000); 
 }
 
 async function fetchAndReadPdf(url, timeout, deadline, maxBytes = MAX_PDF_BYTES) {
@@ -259,6 +257,19 @@ export function analyzeQuery(query, options = {}) {
   return { query: q, type, requestedType: requested, mode, tokens: p.raw, canonicalTokens: p.canonical, concepts, anchors: unique(anchors), dateIntent: { live, kind: live ? 'live' : 'none' }, flags: { wantsHistory: history, wantsOfficial: official, wantsAcademic: academic, explicitNews: type === 'news', explicitVideo: type === 'video', explicitDoc: type === 'doc', explicitGov: type === 'gov' } };
 }
 
+export function buildPreciseQueries(query, options = {}) {
+  const plan = options.plan || analyzeQuery(query, options); const set = new Set(); const add = x => { x = String(x || '').replace(/"/g, '').trim(); if (x && x.length >= 3 && x.length < 500) set.add(x); };
+  add(plan.query);
+  const important = plan.canonicalTokens.slice(0, 8); if (important.length >= 2) add(`"${important.join(' ')}"`);
+  if (plan.flags.wantsHistory) { add(`${plan.query} history timeline origins evolution`); add(`${plan.query} historical overview milestones`); }
+  if (plan.flags.wantsOfficial) { add(`${plan.query} official source`); if (plan.flags.explicitGov) add(`${plan.query} site:gov.in`); }
+  if (plan.flags.wantsAcademic) { add(`${plan.query} research paper evidence`); }
+  if (plan.flags.explicitNews) { add(`${plan.query} latest news`); add(`${plan.query} recent developments`); }
+  if (plan.flags.explicitVideo) { add(`${plan.query} video YouTube`); }
+  if (plan.flags.explicitDoc) { add(`${plan.query} filetype:pdf`); add(`${plan.query} official PDF`); }
+  return [...set].slice(0, 8);
+}
+
 export function comparePageToQuery(query, page = {}) {
   const plan = analyzeQuery(query, { type: page.type || '' });
   const title = String(page.title || ''); 
@@ -284,6 +295,25 @@ export function comparePageToQuery(query, page = {}) {
   const band = score >= 78 ? 'excellent' : score >= 58 ? 'strong' : score >= 36 ? 'usable' : score > 2 ? 'related' : 'weak';
   
   return { score: Number(clamp(score, 0, 100).toFixed(2)), titleCoverage: Number(titleCoverage.toFixed(3)), bodyCoverage: Number(bodyCoverage.toFixed(3)), conceptCoverage: Number(concept.ratio.toFixed(3)), matchedConcepts: unique(matched), missingConcepts: unique(missing), exactPhrase: phrase, acceptable: score > 0, band };
+}
+
+export function rankCandidates(candidates, queryOrPlan, options = {}) {
+  const plan = typeof queryOrPlan === 'string' ? analyzeQuery(queryOrPlan, options) : (queryOrPlan || analyzeQuery('', options));
+  const list = (Array.isArray(candidates) ? candidates : []).slice(0, MAX_CANDIDATES); const ranked = [];
+  for (const raw of list) {
+    const url = normalizedUrl(raw?.url || raw?.link || raw?.sourceUrl || '');
+    if (!url || blocked(url) || !typeFits({ ...raw, url }, plan)) continue;
+    const c = { ...raw, url, title: truncate(raw?.title || raw?.name || '', 500), snippet: truncate(raw?.snippet || raw?.description, 2500), type: raw?.type || 'web' };
+    const preview = { ...c, pageContent: raw?.pageContent || raw?.extractedText || raw?.rawContent || '' };
+    const rel = comparePageToQuery(plan.query, preview);
+    ranked.push({ ...c, _relevance: rel });
+  }
+  ranked.sort((a, b) => {
+    const d = (b._relevance?.score || 0) - (a._relevance?.score || 0); if (Math.abs(d) > 0.01) return d;
+    const bt = (b.title || '').length - (a.title || '').length; if (bt) return bt;
+    return Number(b.semanticSearchScore || 0) - Number(a.semanticSearchScore || 0);
+  });
+  return ranked;
 }
 
 function typeFits(c, plan) {
@@ -340,10 +370,11 @@ async function processCandidate(candidate, plan, deadline) {
   } else {
       const budgetMs = Math.min(8500, left(deadline) - 100);
       if (budgetMs > 1000) {
+          // Delegating to our new massive api/scraper.js
           const scrapeResult = await scrapePage(unwrapped, budgetMs);
           if (scrapeResult && scrapeResult.success) {
               const text = scrapeResult.content;
-              const rel = comparePageToQuery(plan.query, { ...candidate, title: scrapeResult.title, pageContent: text });
+              const rel = comparePageToQuery(plan.query, { ...candidate, title: scrapeResult.title || candidate.title, pageContent: text });
               out = {
                   ...candidate,
                   url: candidate.url,
@@ -376,7 +407,7 @@ async function processCandidate(candidate, plan, deadline) {
   if (out) {
       contentCacheSet(candidate.url, stripCached(out));
       return out;
-    }
+  }
   return null;
 }
 
@@ -418,10 +449,8 @@ export async function enrichCandidates(candidates, queryOrPlan, options = {}) {
   
   const all = [...dedupe.values()].slice(0, MAX_CANDIDATES);
   
-  // Single pass concurrency. The scraper.js internal engine handles Fallbacks independently!
   let enriched = (await mapConcurrent(all, CONTENT_CONCURRENCY, c => processCandidate(c, plan, deadline))).filter(isRealSourceContent);
 
-  // Fill in Fallback Metadata for absolute assurance of returning *something*
   const finalKeys = new Set(enriched.map(x => normalizedKey(x.url)));
   for (const raw of all) {
       if (!finalKeys.has(normalizedKey(raw.url))) {
@@ -447,7 +476,6 @@ export async function enrichCandidates(candidates, queryOrPlan, options = {}) {
     return { ...x, relevance: rel, relevanceScore: Number(rel?.score || x.relevanceScore || 0), relevanceBand: rel?.band || x.relevanceBand || 'related', contentTargetMatched: x.contentTargetMatched ?? false, contentAvailable: x.contentAvailable ?? true, relevanceAccepted: false };
   });
   
-  // Clean final pass deduplication
   const uniqueMap = new Map();
   for (const x of enriched) {
     const key = normalizedKey(x.url);
