@@ -1,138 +1,84 @@
 /*
- * ArixAI Live Web Search / Crawler
- * Vercel Edge Function — single-file, dependency-free, ESM.
+ * ArixAI Live Web Search / Crawler — v1.10.0
+ * Vercel Edge Function, dependency-free orchestration layer.
  *
- * File: api/crawler.js
+ * IMPORTANT ARCHITECTURE
+ * - api/algorithm.js is the precision/content engine.
+ * - This file is the discovery/orchestration layer.
+ * - There is NO extra HTTP hop to algorithm.js; it is imported directly.
+ * - Search snippets are discovery evidence only.
+ * - When requireRealContent=true, every final result has validated source content.
  *
- * Compatibility:
- * - Preserves the existing GET/POST request contract and response fields.
+ * FAST PATH
+ * - Parallel discovery across independent public search surfaces.
+ * - Parallel Tavily discovery/content when configured.
+ * - Algorithm content extraction runs concurrently across the relevant pool.
+ * - Small bounded recovery waves only for content that failed first-pass extraction.
+ * - Short warm caches for repeated queries and recently validated pages.
+ *
+ * COMPATIBILITY
+ * - Preserves GET/POST inputs and the existing high-level response contract.
  * - Preserves mode/type/count/deep/verify/ai/commonCrawl controls.
- * - Preserves keyless public discovery and optional GROQ_API_KEY usage.
- * - Adds a layered, non-null AI-readable pageContent pipeline.
- *
- * CONTENT PIPELINE
- * 1) Resolve search wrappers to the real publisher URL where possible.
- * 2) Fetch the live publisher page directly.
- * 3) Extract article/main/body text plus JSON-LD metadata.
- * 4) Try a dependency-free AMP/text variant where sensible.
- * 5) Try the public Jina Reader endpoint as a keyless HTML-to-text fallback.
- * 6) For YouTube, retrieve real metadata and captions where available.
- * 7) For PDFs, extract real text when the PDF contains extractable text.
- * 8) Search snippets are kept as discovery evidence only. They are NEVER used
- *    as pageContent for the default final result set. When requireRealContent is
- *    true (the default), only validated live publisher/reader/PDF/transcript
- *    content is returned to the AI; inaccessible sources are excluded rather
- *    than mislabeled as page content.
- *
- * TIME / STREAMING
- * - The response begins with valid JSON immediately, not just whitespace.
- * - Heartbeats keep the stream active while live work continues.
- * - Upstream calls are bounded individually.
- * - Discovery and content verification use bounded concurrent fan-out instead of serial retries.
- * - The default fast-path budget is ~9.5s; successful validated results are oversampled and content-aware discovery can use Tavily raw page content when TAVILY_API_KEY[_N] is configured.
- * - The crawler never attempts to evade provider/site rate limits.
- * - No serverless implementation can honestly guarantee unlimited execution;
- *   Vercel remains the platform authority on maximum execution duration.
+ * - Preserves streaming JSON behavior by default.
+ * - Optional SSE log mode: ?logStream=true or Accept: text/event-stream.
  */
+
+import {
+  analyzeQuery,
+  buildPreciseQueries,
+  rankCandidates,
+  enrichCandidates,
+  isRealSourceContent,
+} from './algorithm.js';
 
 export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-1.9.0';
+const VERSION = 'arix-crawler-1.10.0';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
-const MAX_QUERY_LEN = 500;
-const MAX_REQUEST_BODY = 64_000;
+const MAX_QUERY_LEN = 700;
+const MAX_REQUEST_BODY = 100_000;
 
-const SEARCH_TIMEOUT_MS = 1500;
-const PAGE_TIMEOUT_MS = 2200;
-const READER_TIMEOUT_MS = 2200;
-const NEWS_RESOLVE_TIMEOUT_MS = 900;
-const COMMON_CRAWL_TIMEOUT_MS = 700;
-const YOUTUBE_TIMEOUT_MS = 2600;
-const PDF_DECOMPRESS_TIMEOUT_MS = 1200;
+// The crawler's own wall-clock objective. External sites can still be slow or blocked.
+const SEARCH_BUDGET_MS = 9_500;
+const SEARCH_TIMEOUT_MS = 1_450;
+const TAVILY_TIMEOUT_MS = 2_400;
+const COMMON_CRAWL_TIMEOUT_MS = 650;
+const STREAM_HEARTBEAT_MS = 1_000;
 
-const MAX_PAGE_BYTES = 650_000;
-const MAX_SEARCH_BYTES = 500_000;
-const MAX_YOUTUBE_BYTES = 1_500_000;
-const MAX_TEXT_CHARS = 30_000;
-const MAX_TRANSCRIPT_CHARS = 30_000;
-
-const DEFAULT_VERIFY = 40;
-const DEEP_VERIFY = 40;
-const MAX_VERIFY = 40;
 const MAX_ENGINE_REQUESTS = 20;
-const MAX_NEWS_RESOLVES = 3;
-const MAX_PUBLISHER_LOOKUPS = 3;
-const MAX_CC_LOOKUPS = 2;
-
-// Starts below Vercel's documented Edge streaming ceiling and leaves safety margin.
-const STREAM_HEARTBEAT_MS = 1500;
-const SEARCH_WORK_BUDGET_MS = 9_500;
-
-const DISCOVERY_MIN_REMAINING_MS = 5_000;
-const CONTENT_MIN_REMAINING_MS = 3_300;
 const SEARCH_CONCURRENCY = 20;
-const CONTENT_CONCURRENCY = 30;
-const FAST_FALLBACK_LIMIT = 40;
-const SEARCH_CACHE_TTL_MS = 10_000;
-const CONTENT_CACHE_TTL_MS = 180_000;
-const CACHE_MAX_ENTRIES = 80;
+const MAX_DISCOVERY_RESULTS = 420;
+const MAX_TAVILY_KEYS = 8;
+const MAX_TAVILY_CALLS = 2;
+const TAVILY_RESULTS_PER_CALL = 20;
+const MAX_COMMON_CRAWL = 4;
+const MAX_LIVE_LOG = 80;
 
-const TAVILY_SEARCH_TIMEOUT_MS = 2500;
-const TAVILY_MAX_SEARCH_CALLS = 2;
-const TAVILY_MAX_RESULTS_PER_CALL = 20;
-const TAVILY_KEY_SCAN_MAX = 12;
-const TAVILY_CONTENT_MIN_CHARS = 350;
-const RELEVANCE_MIN_SCORE = 20;
-const RELEVANCE_MIN_TITLE_COVERAGE = 0.16;
-const RELEVANCE_BACKFILL_SCORE = 15;
-const MIN_RESULTS_TARGET = 1;
+const DISCOVERY_CUTOFF_MS = 2_150;
+const ALGORITHM_BUDGET_MIN_MS = 1_350;
+const AI_RERANK_TIMEOUT_MS = 900;
 
+const SEARCH_CACHE_TTL_MS = 8_000;
+const LIVE_SEARCH_CACHE_TTL_MS = 2_500;
+const CACHE_MAX = 100;
 const SEARCH_CACHE = new Map();
-const CONTENT_CACHE = new Map();
 
-function cacheGet(cache, key, ttl) {
-  const item = cache.get(key);
-  if (!item) return null;
-  if (Date.now() - item.at > ttl) {
-    cache.delete(key);
-    return null;
-  }
-  return item.value;
-}
+const COMMON_CRAWL_INDEXES = ['CC-MAIN-2026-34', 'CC-MAIN-2026-30'];
 
-function cacheSet(cache, key, value) {
-  cache.set(key, { at: Date.now(), value });
-  while (cache.size > CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value);
-}
+const BLOCKED_HOSTS = new Set([
+  'google-analytics.com', 'googletagmanager.com', 'doubleclick.net',
+  'googlesyndication.com', 'googleadservices.com', 'gstatic.com',
+  'googleapis.com', 'facebook.net', 'connect.facebook.net',
+  'scorecardresearch.com', 'pixel.wp.com', 'adsrvr.org',
+  'amazon-adsystem.com', 'taboola.com', 'outbrain.com',
+]);
 
-async function mapConcurrent(items, limit, worker) {
-  const list = Array.isArray(items) ? items : [];
-  const n = Math.max(1, Math.min(limit, list.length || 1));
-  const out = new Array(list.length);
-  let cursor = 0;
-  const runner = async () => {
-    while (true) {
-      const i = cursor++;
-      if (i >= list.length) return;
-      try { out[i] = await worker(list[i], i); }
-      catch (error) { out[i] = { __error: error?.message || 'WORKER_FAILED' }; }
-    }
-  };
-  await Promise.all(Array.from({ length: n }, runner));
-  return out;
-}
-
-const USER_AGENT =
-  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.9; +https://lexis-ai-chatini.vercel.app/)';
-
-const COMMON_CRAWL_INDEXES = [
-  'CC-MAIN-2026-34',
-  'CC-MAIN-2026-30',
-  'CC-MAIN-2026-21',
-];
+const BLOCKED_EXT = /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|woff2?|woff|ttf|otf|eot|mp3|wav|m4a|mp4|webm|mov|avi|zip|rar|7z|exe|dmg)(?:$|[?#])/i;
+const DATA_PATH = /(?:^|[\/_-])(?:analytics|gtag|ga4|collect|pixel|beacon|tracking|tracker|telemetry|consent|ads?)(?:[\/_-]|$)/i;
+const ARTICLE_PATH = /(?:article|articles|story|stories|news|post|posts|blog|blogs|report|reports|press[-_]?release|explained|timeline|history)/i;
 
 const GOV_DOMAINS = [
   'gov.in', 'nic.in', 'mygov.in', 'india.gov.in', 'pib.gov.in', 'mca.gov.in',
@@ -140,374 +86,145 @@ const GOV_DOMAINS = [
   'rbi.org.in', 'sebi.gov.in', 'supremecourt.gov.in', 'indiacode.nic.in',
 ];
 
-const TRUSTED_INTERNATIONAL = [
+const TRUSTED_DOMAINS = [
   'nasa.gov', 'who.int', 'un.org', 'europa.eu', 'oecd.org', 'worldbank.org',
   'imf.org', 'ietf.org', 'w3.org', 'mozilla.org', 'developer.mozilla.org',
 ];
 
-const NEWS_QUERY_HINTS = [
-  'news', 'latest', 'today', 'recent', 'breaking', 'update', 'updates',
-  'happened', 'announced', 'announcement', 'this week', 'yesterday',
-];
-
-const VIDEO_QUERY_HINTS = [
-  'video', 'videos', 'watch', 'youtube', 'interview', 'podcast', 'explained', 'tutorial',
-];
-
-const DOC_QUERY_HINTS = [
-  'pdf', 'documentation', 'docs', 'manual', 'report', 'paper', 'research paper',
-  'whitepaper', 'specification', 'spec',
-];
-
-const MONTHS = {
-  january: 0, jan: 0, february: 1, feb: 1, march: 2, mar: 2,
-  april: 3, apr: 3, may: 4, june: 5, jun: 5, july: 6, jul: 6,
-  august: 7, aug: 7, september: 8, sep: 8, sept: 8, october: 9, oct: 9,
-  november: 10, nov: 10, december: 11, dec: 11,
-};
-
-const STOPWORDS = new Set([
-  'the', 'and', 'for', 'with', 'from', 'that', 'this', 'what', 'when', 'where', 'how',
-  'why', 'who', 'which', 'about', 'into', 'near', 'over', 'under', 'latest', 'news',
-  'today', 'recent', 'current', 'update', 'updates', 'during', 'august', 'september',
-  'october', 'january', 'february', 'march', 'april', 'june', 'july', 'november',
-  'december', '2025', '2026', '2027', '2028',
-]);
-
-const HTML_ENTITY_RE = /&(#x?[0-9a-f]+|[a-z][a-z0-9]+);/gi;
-
-function decodeHtml(value = '') {
-  return String(value)
-    .replace(HTML_ENTITY_RE, (_, code) => {
-      const c = code.toLowerCase();
-      const map = {
-        amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', ndash: '–',
-        mdash: '—', hellip: '…', laquo: '«', raquo: '»', rsquo: '’', lsquo: '‘',
-        rdquo: '”', ldquo: '“', bull: '•', middot: '·', copy: '©', reg: '®',
-      };
-      if (map[c] != null) return map[c];
-      if (c.startsWith('#x')) {
-        const n = parseInt(c.slice(2), 16);
-        return Number.isFinite(n) ? String.fromCodePoint(Math.min(0x10ffff, n)) : _;
-      }
-      if (c.startsWith('#')) {
-        const n = parseInt(c.slice(1), 10);
-        return Number.isFinite(n) ? String.fromCodePoint(Math.min(0x10ffff, n)) : _;
-      }
-      return _;
-    })
-    .replace(/\u00a0/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function stripTags(html = '') {
-  return decodeHtml(
-    String(html)
-      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
-      .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, ' ')
-      .replace(/<template\b[^>]*>[\s\S]*?<\/template>/gi, ' ')
-      .replace(/<[^>]+>/g, ' ')
-  );
-}
-
-function truncate(value, max) {
-  const v = String(value || '').trim();
-  return v.length <= max ? v : `${v.slice(0, Math.max(0, max - 1))}…`;
-}
+const USER_AGENT =
+  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.10; +https://lexis-ai-chatini.vercel.app/)';
 
 function nowIso() { return new Date().toISOString(); }
-function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function remainingMs(deadline) { return Math.max(0, deadline - Date.now()); }
-
-function safeInteger(value, fallback, min, max) {
-  const n = Number.parseInt(value, 10);
+function left(deadline) { return Math.max(0, deadline - Date.now()); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
+function safeInt(v, fallback, min, max) {
+  const n = Number.parseInt(v, 10);
   if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, n));
+  return clamp(n, min, max);
+}
+function truncate(v, max) {
+  const s = String(v ?? '').trim();
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+function encode(v) { return JSON.stringify(v); }
+function env(name) {
+  try { return typeof process !== 'undefined' ? String(process.env?.[name] || '').trim() : ''; }
+  catch { return ''; }
 }
 
-function parseCount(value) {
-  return safeInteger(value, DEFAULT_RESULTS, 1, MAX_RESULTS);
-}
-
-function effectiveTimeout(requested, deadline, floor = 250) {
-  const left = remainingMs(deadline);
-  if (left <= floor) return 0;
-  return Math.min(requested, Math.max(floor, left - 150));
-}
-
-function absoluteUrl(raw, base = 'https://example.com/') {
-  try { return new URL(decodeHtml(raw), base).href; } catch { return null; }
-}
-
-function safeDecodeURIComponent(value) {
-  try { return decodeURIComponent(String(value || '')); } catch { return String(value || ''); }
-}
-
-function decodeBase64Url(value) {
-  try {
-    let s = String(value || '').trim();
-    if (!s) return null;
-    s = s.replace(/-/g, '+').replace(/_/g, '/');
-    while (s.length % 4) s += '=';
-    const bin = typeof atob === 'function' ? atob(s) : null;
-    if (!bin) return null;
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-  } catch { return null; }
-}
-
-function looksLikeHttpUrl(value) {
-  return /^https?:\/\//i.test(String(value || '').trim());
-}
-
-function unwrapSearchResultUrl(raw, base) {
-  let current = absoluteUrl(raw, base);
-  if (!current) return null;
-
-  for (let depth = 0; depth < 4; depth++) {
-    let u;
-    try { u = new URL(current); } catch { return null; }
-    const host = u.hostname.toLowerCase().replace(/^www\./, '');
-    const path = u.pathname;
-    let next = null;
-
-    // Bing result click wrapper: /ck/a?...&u=a1<base64-url>.
-    if (host === 'bing.com' && /^\/ck\/a(?:\/|$)/i.test(path)) {
-      const encoded = u.searchParams.get('u') || u.searchParams.get('url') || u.searchParams.get('target');
-      if (encoded) {
-        const candidates = [
-          encoded,
-          encoded.length > 2 ? encoded.slice(2) : '',
-          safeDecodeURIComponent(encoded),
-          encoded.length > 2 ? safeDecodeURIComponent(encoded.slice(2)) : '',
-        ];
-        for (const candidate of candidates) {
-          if (looksLikeHttpUrl(candidate)) { next = candidate; break; }
-          const decoded = decodeBase64Url(candidate);
-          if (looksLikeHttpUrl(decoded)) { next = decoded; break; }
-        }
-      }
-    }
-
-    // Google redirect wrapper: /url?q=... or /url?url=....
-    if (!next && host.startsWith('google.') && /^\/url$/i.test(path)) {
-      next = u.searchParams.get('q') || u.searchParams.get('url') || u.searchParams.get('target');
-      if (next) next = safeDecodeURIComponent(next);
-    }
-
-    // DuckDuckGo redirect wrapper: /l/?uddg=<encoded target>.
-    if (!next && (host === 'duckduckgo.com' || host === 'html.duckduckgo.com') && /^\/l\/?$/i.test(path)) {
-      next = u.searchParams.get('uddg') || u.searchParams.get('u');
-      if (next) next = safeDecodeURIComponent(next);
-    }
-
-    // Yahoo redirect wrapper commonly embeds the target in /RU=<encoded>/RK=...
-    if (!next && (host === 'search.yahoo.com' || host === 'r.search.yahoo.com')) {
-      const ru = path.match(/\/RU=([^/]+)(?:\/|$)/i)?.[1];
-      if (ru) {
-        next = safeDecodeURIComponent(ru);
-      } else {
-        next = u.searchParams.get('RU') || u.searchParams.get('url');
-        if (next) next = safeDecodeURIComponent(next);
-      }
-    }
-
-    if (!next || !looksLikeHttpUrl(next)) break;
-    const normalized = absoluteUrl(next, current);
-    if (!normalized || normalized === current) break;
-    current = normalized;
+function tavilyKeyExists() {
+  for (const name of ['TAVILY_API_KEY', 'TAVILY_API_KEY_1', ...Array.from({ length: MAX_TAVILY_KEYS }, (_, i) => `TAVILY_API_KEY_${i + 2}`)]) {
+    if (env(name)) return true;
   }
-
-  try {
-    const parsed = new URL(current);
-    parsed.hash = '';
-    for (const key of [...parsed.searchParams.keys()]) {
-      if (/^(utm_|gclid$|fbclid$|ref$|referrer$|cmpid$|src$|msclkid$|ntb$)/i.test(key)) {
-        parsed.searchParams.delete(key);
-      }
-    }
-    return parsed.href;
-  } catch { return null; }
-}
-
-function cleanUrl(raw, base) {
-  return unwrapSearchResultUrl(raw, base);
-}
-
-function hostname(url) {
-  try { return new URL(url).hostname.toLowerCase(); } catch { return ''; }
-}
-
-function normalizedHost(url) { return hostname(url).replace(/^www\./, ''); }
-
-function normalizedKey(url) {
-  try {
-    const u = new URL(url);
-    const p = u.pathname.replace(/\/{2,}/g, '/').replace(/\/$/, '');
-    return `${normalizedHost(url)}${p}${u.search}`;
-  } catch { return String(url || '').toLowerCase(); }
-}
-
-const BLOCKED_CONTENT_HOSTS = [
-  'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'googlesyndication.com',
-  'googleadservices.com', 'googleusercontent.com', 'gstatic.com', 'googleapis.com',
-  'facebook.net', 'connect.facebook.net', 'scorecardresearch.com', 'pixel.wp.com',
-  'adsrvr.org', 'amazon-adsystem.com', 'taboola.com', 'outbrain.com',
-];
-
-const BLOCKED_CONTENT_EXTENSIONS = /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|woff2?|ttf|otf|eot|mp3|wav|m4a|mp4|webm|mov|avi|zip|rar|7z|exe|dmg)(?:$|[?#])/i;
-const BLOCKED_DATA_PATH = /(?:^|[\/_-])(analytics|gtag|ga4|collect|pixel|beacon|tracking|tracker|telemetry|consent|ads?)(?:[\/_-]|$)/i;
-const ARTICLE_PATH_HINT = /(?:article|articles|story|stories|news|post|posts|blog|blogs|update|updates|report|reports|press-release|pressrelease|explained|live|202\d[\/.-]\d{1,2}[\/.-]\d{1,2})/i;
-
-function isBlockedContentHost(url) {
-  const h = normalizedHost(url);
-  return BLOCKED_CONTENT_HOSTS.some(d => h === d || h.endsWith(`.${d}`));
-}
-
-function isBlockedContentUrl(url) {
-  if (!url) return true;
-  if (isBlockedContentHost(url)) return true;
-  let u;
-  try { u = new URL(url); } catch { return true; }
-  const pathAndQuery = `${u.pathname}${u.search}`;
-  if (BLOCKED_CONTENT_EXTENSIONS.test(pathAndQuery)) return true;
-  if (BLOCKED_DATA_PATH.test(u.pathname)) return true;
-  if (/(?:[?&](?:collect|measurement|tid|cid|ea|ec|el|t|v|_ga|_gl)=)/i.test(u.search)) return true;
   return false;
 }
 
-function isPublisherCandidateUrl(url, result = null) {
-  if (!safeHttpUrl(url) || isBlockedContentUrl(url)) return false;
-  const h = normalizedHost(url);
-  if (!h || /^(?:news\.)?google\./i.test(h) || /^gstatic\./i.test(h)) return false;
+function normalizeHost(url) {
+  try { return new URL(url).hostname.toLowerCase().replace(/^www\./, ''); }
+  catch { return ''; }
+}
+function safeUrl(url) {
   try {
     const u = new URL(url);
-    if (/\/ck\/a(?:\/|$)/i.test(u.pathname) || /^\/url$/i.test(u.pathname) || /^\/l\/?$/i.test(u.pathname)) return false;
-  } catch { return false; }
-  if (/^(?:www\.)?(bing|search\.yahoo|duckduckgo|mojeek)\./i.test(h)) return false;
-  if (result?.type === 'doc') return isDocUrl(url) && !isBlockedContentUrl(url);
-  if (result?.type === 'video') return isLikelyVideoUrl(url);
-  return true;
-}
-
-function pathDepth(url) {
-  try { return new URL(url).pathname.split('/').filter(Boolean).length; } catch { return 0; }
-}
-
-function sourceHostHint(result) {
-  const source = String(result?.source || '').replace(/^google-news:/i, '').trim().toLowerCase();
-  if (!source) return '';
-  return source.replace(/[^a-z0-9]+/g, ' ').trim();
-}
-
-function publisherHostHint(result) {
-  const candidates = [result?.publisherUrl, result?.publisherHost, result?.publisherDomain].filter(Boolean);
-  for (const raw of candidates) {
-    try {
-      const h = normalizedHost(cleanUrl(String(raw), 'https://example.com/'));
-      if (h && !/^(?:news\.google\.com|google\.|bing\.|search\.yahoo\.|duckduckgo\.|mojeek\.)/i.test(h)) return h;
-    } catch {}
-  }
-  return '';
-}
-
-function candidatePublisherScore(url, result, anchorText = '') {
-  if (!isPublisherCandidateUrl(url, result)) return -Infinity;
-  let score = 0;
-  const u = new URL(url);
-  const path = `${u.pathname}${u.search}`;
-  const sim = titleSimilarity(String(result?.title || ''), String(anchorText || ''));
-  score += Math.min(6, pathDepth(url));
-  if (ARTICLE_PATH_HINT.test(path)) score += 5;
-  if (/^www\./i.test(u.hostname)) score += 0.2;
-
-  const sourceHint = sourceHostHint(result);
-  const publisherHint = publisherHostHint(result);
-  const targetHost = normalizedHost(url);
-  if (publisherHint && (targetHost === publisherHint || targetHost.endsWith(`.${publisherHint}`))) score += 18;
-  if (sourceHint) {
-    const hostWords = targetHost.replace(/\./g, ' ').split(/\s+/).filter(Boolean);
-    const hintWords = sourceHint.split(/\s+/).filter(w => w.length > 2);
-    if (hintWords.some(w => hostWords.includes(w))) score += 8;
-  }
-
-  if (sim >= 0.9) score += 45;
-  else if (sim >= 0.7) score += 30;
-  else if (sim >= 0.5) score += 18;
-  else if (sim >= 0.35) score += 6;
-
-  return score;
-}
-
-function isGovUrl(url) {
-  const h = normalizedHost(url);
-  return GOV_DOMAINS.some(d => h === d || h.endsWith(`.${d}`));
-}
-
-function isTrustedInternational(url) {
-  const h = normalizedHost(url);
-  return TRUSTED_INTERNATIONAL.some(d => h === d || h.endsWith(`.${d}`));
-}
-
-function isYouTube(url) {
-  const h = normalizedHost(url);
-  return h === 'youtube.com' || h.endsWith('.youtube.com') || h === 'youtu.be';
-}
-
-function isLikelyVideoUrl(url) {
-  return isYouTube(url) || normalizedHost(url).includes('vimeo.com') ||
-    /\.(mp4|webm|mov)(\?|$)/i.test(url || '');
-}
-
-function isDocUrl(url) {
-  return /\.(pdf|docx?|xlsx?|pptx?)(\?|$)/i.test(url || '') ||
-    /\b(pdf|docs?|documentation)\b/i.test(url || '');
-}
-
-function domainTrust(url) {
-  const h = normalizedHost(url);
-  if (!h) return 0.2;
-  if (isGovUrl(url)) return 1;
-  if (isTrustedInternational(url)) return 0.95;
-  if (/\.edu(?:\.|$)/i.test(h)) return 0.95;
-  if (/\.ac\.(?:in|uk|jp|nz)$/i.test(h)) return 0.95;
-  if (/wikipedia\.org$/i.test(h)) return 0.8;
-  if (isYouTube(url)) return 0.65;
-  if (h === 'news.google.com') return 0.45;
-  return 0.6;
-}
-
-function inferType(result) {
-  if (result.type) return result.type;
-  if (isGovUrl(result.url)) return 'gov';
-  if (isLikelyVideoUrl(result.url)) return 'video';
-  if (isDocUrl(result.url)) return 'doc';
-  return 'web';
-}
-
-function safeHttpUrl(url) {
-  try {
-    const u = new URL(url);
-    if (!['http:', 'https:'].includes(u.protocol)) return false;
+    if (!/^https?:$/i.test(u.protocol)) return false;
     const h = u.hostname.toLowerCase();
-    if (!h || h === 'localhost' || h.endsWith('.localhost') || h === '0.0.0.0') return false;
+    if (!h || h === 'localhost' || h.endsWith('.localhost')) return false;
     if (/^(127\.|10\.|192\.168\.|169\.254\.)/.test(h)) return false;
-    if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(h)) return false;
+    if (/^172\.(?:1[6-9]|2\d|3[0-1])\./.test(h)) return false;
     if (h === '::1' || h.startsWith('fc') || h.startsWith('fd')) return false;
     return true;
   } catch { return false; }
 }
+function blocked(url) {
+  if (!url || !safeUrl(url)) return true;
+  const h = normalizeHost(url);
+  if ([...BLOCKED_HOSTS].some(d => h === d || h.endsWith(`.${d}`))) return true;
+  try {
+    const u = new URL(url);
+    if (BLOCKED_EXT.test(`${u.pathname}${u.search}`)) return true;
+    if (DATA_PATH.test(u.pathname)) return true;
+    return false;
+  } catch { return true; }
+}
+function isGov(url) {
+  const h = normalizeHost(url);
+  return GOV_DOMAINS.some(d => h === d || h.endsWith(`.${d}`));
+}
+function isTrusted(url) {
+  const h = normalizeHost(url);
+  return TRUSTED_DOMAINS.some(d => h === d || h.endsWith(`.${d}`)) || /\.edu(?:\.|$)/i.test(h) || /\.ac\.(?:in|uk|jp|nz)$/i.test(h);
+}
+function isYouTube(url) {
+  const h = normalizeHost(url);
+  return h === 'youtube.com' || h.endsWith('.youtube.com') || h === 'youtu.be';
+}
+function isDoc(url) { return /\.(?:pdf|docx?|xlsx?|pptx?)(?:\?|$)/i.test(url || ''); }
+function isVideo(url) { return isYouTube(url) || /(?:vimeo\.com|dailymotion\.com)/i.test(normalizeHost(url)); }
+function normalizedKey(url) {
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    for (const k of [...u.searchParams.keys()]) if (/^(utm_|gclid$|fbclid$|msclkid$|ref$|referrer$|cmpid$|src$)/i.test(k)) u.searchParams.delete(k);
+    return `${normalizeHost(u.href)}${u.pathname.replace(/\/{2,}/g, '/').replace(/\/$/, '')}${u.search}`;
+  } catch { return String(url || '').toLowerCase(); }
+}
+function absoluteUrl(raw, base) {
+  try { return new URL(String(raw || ''), base).href; } catch { return null; }
+}
+function unwrap(raw, base) {
+  let current = absoluteUrl(raw, base);
+  if (!current) return null;
+  for (let depth = 0; depth < 4; depth++) {
+    let u;
+    try { u = new URL(current); } catch { return null; }
+    const host = normalizeHost(u.href);
+    let next = null;
+    if (host === 'bing.com' && /^\/ck\/a/i.test(u.pathname)) {
+      const encoded = u.searchParams.get('u') || u.searchParams.get('url') || u.searchParams.get('target');
+      if (encoded) {
+        const opts = [encoded, encoded.replace(/^a1/, '')];
+        for (const opt of opts) {
+          try {
+            if (/^https?:\/\//i.test(decodeURIComponent(opt))) { next = decodeURIComponent(opt); break; }
+          } catch {}
+          try {
+            let s = opt.replace(/-/g, '+').replace(/_/g, '/');
+            while (s.length % 4) s += '=';
+            const bin = atob(s);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const dec = new TextDecoder().decode(bytes);
+            if (/^https?:\/\//i.test(dec)) { next = dec; break; }
+          } catch {}
+        }
+      }
+    }
+    if (!next && /^google\./i.test(host) && /^\/url$/i.test(u.pathname)) next = u.searchParams.get('q') || u.searchParams.get('url');
+    if (!next && (host === 'duckduckgo.com' || host === 'html.duckduckgo.com') && /^\/l\/?$/i.test(u.pathname)) next = u.searchParams.get('uddg') || u.searchParams.get('u');
+    if (!next && (host === 'search.yahoo.com' || host === 'r.search.yahoo.com')) {
+      const ru = u.pathname.match(/\/RU=([^/]+)(?:\/|$)/i)?.[1];
+      next = ru || u.searchParams.get('RU') || u.searchParams.get('url');
+    }
+    if (!next) break;
+    const clean = absoluteUrl(decodeURIComponentSafe(next), current);
+    if (!clean || clean === current) break;
+    current = clean;
+  }
+  try {
+    const u = new URL(current);
+    u.hash = '';
+    for (const k of [...u.searchParams.keys()]) if (/^(utm_|gclid$|fbclid$|msclkid$|ref$|referrer$|cmpid$|src$)/i.test(k)) u.searchParams.delete(k);
+    return u.href;
+  } catch { return null; }
+}
+function decodeURIComponentSafe(v) { try { return decodeURIComponent(String(v || '')); } catch { return String(v || ''); } }
 
-async function fetchResponse(url, { timeout = SEARCH_TIMEOUT_MS, headers = {}, deadline } = {}) {
-  const dl = deadline || Date.now() + timeout;
-  const ms = effectiveTimeout(timeout, dl, 250);
-  if (!ms) throw new Error('BUDGET_EXHAUSTED');
+async function fetchResponse(url, timeout, deadline, headers = {}) {
+  const budget = Math.min(timeout, Math.max(250, left(deadline) - 100));
+  if (budget <= 0) throw new Error('BUDGET_EXHAUSTED');
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
+  const timer = setTimeout(() => controller.abort(), budget);
   try {
     return await fetch(url, {
       method: 'GET',
@@ -515,7 +232,7 @@ async function fetchResponse(url, { timeout = SEARCH_TIMEOUT_MS, headers = {}, d
       signal: controller.signal,
       headers: {
         'user-agent': USER_AGENT,
-        accept: 'text/html,application/xhtml+xml,application/xml,application/pdf,text/plain;q=0.9,*/*;q=0.3',
+        accept: 'text/html,application/xhtml+xml,application/xml,application/rss+xml,text/plain;q=0.9,application/pdf;q=0.85,*/*;q=0.2',
         'accept-language': 'en-IN,en;q=0.9',
         ...headers,
       },
@@ -523,2215 +240,871 @@ async function fetchResponse(url, { timeout = SEARCH_TIMEOUT_MS, headers = {}, d
   } finally { clearTimeout(timer); }
 }
 
-async function readBodyText(response, maxBytes, deadline) {
+async function readBody(response, maxBytes, deadline) {
   const reader = response.body?.getReader?.();
   if (!reader) return truncate(await response.text(), maxBytes);
   const chunks = [];
   let total = 0;
   try {
-    while (true) {
-      if (remainingMs(deadline) < 120) break;
+    while (left(deadline) > 80 && total < maxBytes) {
       const { done, value } = await reader.read();
       if (done) break;
       if (!value) continue;
       const room = maxBytes - total;
-      if (room <= 0) break;
       const piece = value.byteLength > room ? value.slice(0, room) : value;
       chunks.push(piece);
       total += piece.byteLength;
-      if (total >= maxBytes) break;
     }
-  } finally {
-    try { await reader.cancel(); } catch {}
-  }
+  } finally { try { await reader.cancel(); } catch {} }
   const bytes = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) { bytes.set(c, off); off += c.byteLength; }
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
   return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
 }
 
-async function readBodyBytes(response, maxBytes, deadline) {
-  const reader = response.body?.getReader?.();
-  if (!reader) {
-    const ab = await response.arrayBuffer();
-    return new Uint8Array(ab).slice(0, maxBytes);
-  }
-  const chunks = [];
-  let total = 0;
-  try {
-    while (true) {
-      if (remainingMs(deadline) < 120) break;
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      const room = maxBytes - total;
-      if (room <= 0) break;
-      const piece = value.byteLength > room ? value.slice(0, room) : value;
-      chunks.push(piece);
-      total += piece.byteLength;
-      if (total >= maxBytes) break;
-    }
-  } finally {
-    try { await reader.cancel(); } catch {}
-  }
-  const bytes = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) { bytes.set(c, off); off += c.byteLength; }
-  return bytes;
+async function fetchText(url, timeout, deadline, maxBytes = 600_000, headers = {}) {
+  const res = await fetchResponse(url, timeout, deadline, headers);
+  if (!res.ok) throw new Error(`HTTP_${res.status}`);
+  return readBody(res, maxBytes, deadline);
 }
 
-async function fetchText(url, options = {}) {
-  const response = await fetchResponse(url, options);
-  if (!response.ok) throw new Error(`HTTP_${response.status}`);
-  return readBodyText(response, options.maxBytes || MAX_SEARCH_BYTES, options.deadline || Date.now() + (options.timeout || SEARCH_TIMEOUT_MS));
+function strip(html) {
+  return String(html || '')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&').replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ').trim();
 }
-
-function parseTitleFromHtml(html) {
-  return decodeHtml((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [, ''])[1]);
+function titleFromHtml(html) { return strip((String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [, ''])[1]); }
+function metaFromHtml(html, name) {
+  const e = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return strip((String(html).match(new RegExp(`<meta[^>]+(?:name|property)=["']${e}["'][^>]*content=["']([\\s\\S]*?)["']`, 'i')) || [, ''])[1]);
 }
-
-function parseMeta(html, name) {
-  const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const a = new RegExp(`<meta[^>]+(?:name|property)=["']${escaped}["'][^>]*content=["']([\\s\\S]*?)["'][^>]*>`, 'i');
-  const b = new RegExp(`<meta[^>]+content=["']([\\s\\S]*?)["'][^>]+(?:name|property)=["']${escaped}["'][^>]*>`, 'i');
-  return decodeHtml((html.match(a) || html.match(b) || [, ''])[1]);
-}
-
-function parseCanonical(html, baseUrl) {
-  const a = (html.match(/<link[^>]+rel=["'][^"']*canonical[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>/i) || [, ''])[1];
-  const b = (html.match(/<link[^>]+href=["']([^"']+)["'][^>]*rel=["'][^"']*canonical[^"']*["'][^>]*>/i) || [, ''])[1];
-  return cleanUrl(a || b, baseUrl);
-}
-
-function parseJsonLd(html) {
-  const values = [];
-  const blocks = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
-  for (const block of blocks.slice(0, 20)) {
-    const raw = block.replace(/^<[\s\S]*?>/i, '').replace(/<\/script>$/i, '');
-    try {
-      const json = JSON.parse(raw.trim());
-      const visit = value => {
-        if (!value || typeof value !== 'object') return;
-        if (Array.isArray(value)) { value.forEach(visit); return; }
-        if (value.articleBody) values.push({ kind: 'articleBody', value: String(value.articleBody) });
-        if (value.description) values.push({ kind: 'description', value: String(value.description) });
-        if (value.headline) values.push({ kind: 'headline', value: String(value.headline) });
-        if (value.datePublished) values.push({ kind: 'datePublished', value: String(value.datePublished) });
-        if (value.dateModified) values.push({ kind: 'dateModified', value: String(value.dateModified) });
-        Object.values(value).forEach(visit);
-      };
-      visit(json);
-    } catch {}
-  }
-  return values;
-}
-
-function parseDateFromHtml(html) {
-  const jsonLd = parseJsonLd(html);
-  const candidates = [
-    parseMeta(html, 'article:published_time'), parseMeta(html, 'article:modified_time'),
-    parseMeta(html, 'datePublished'), parseMeta(html, 'dateModified'), parseMeta(html, 'pubdate'),
-    parseMeta(html, 'date'), parseMeta(html, 'parsely-pub-date'), parseMeta(html, 'dc.date'),
-    (html.match(/<time[^>]+datetime=["']([^"']+)["'][^>]*>/i) || [, ''])[1],
-    ...jsonLd.filter(x => /date/i.test(x.kind)).map(x => x.value),
-  ].filter(Boolean);
-  for (const c of candidates) {
-    const t = Date.parse(c);
-    if (!Number.isNaN(t)) return new Date(t).toISOString();
-  }
+function dateFromHtml(html) {
+  const vals = [metaFromHtml(html, 'article:published_time'), metaFromHtml(html, 'datePublished'), metaFromHtml(html, 'date'), (String(html).match(/<time[^>]+datetime=["']([^"']+)["']/i) || [, ''])[1]];
+  for (const x of vals) { const t = Date.parse(x || ''); if (!Number.isNaN(t)) return new Date(t).toISOString(); }
   return null;
 }
 
-function extractStructuredBody(html) {
-  const jsonLd = parseJsonLd(html);
-  const articleBodies = jsonLd
-    .filter(x => x.kind === 'articleBody' && String(x.value || '').length > 200)
-    .map(x => cleanExtractedText(x.value))
-    .filter(Boolean);
-  if (articleBodies.length) return articleBodies.sort((a, b) => b.length - a.length)[0];
-
-  const semanticCandidates = [];
-  const articles = html.match(/<article\b[^>]*>[\s\S]*?<\/article>/gi) || [];
-  for (const block of articles.slice(0, 6)) {
-    const text = cleanExtractedText(stripTags(block));
-    if (text.length > 200) semanticCandidates.push(text);
-  }
-  if (semanticCandidates.length) return semanticCandidates.sort((a, b) => b.length - a.length)[0];
-
-  const mains = html.match(/<main\b[^>]*>[\s\S]*?<\/main>/gi) || [];
-  for (const block of mains.slice(0, 4)) {
-    const text = cleanExtractedText(stripTags(block));
-    if (text.length > 200) semanticCandidates.push(text);
-  }
-  if (semanticCandidates.length) return semanticCandidates.sort((a, b) => b.length - a.length)[0];
-
-  // Only use the broader paragraph/headline reconstruction when the page has no
-  // identifiable semantic content container. This avoids pulling unrelated site chrome.
-  const textualTags = html.match(/<(?:h1|h2|h3|h4|p|blockquote)\b[^>]*>[\s\S]*?<\/(?:h1|h2|h3|h4|p|blockquote)>/gi) || [];
-  const pieces = [];
-  for (const block of textualTags.slice(0, 300)) {
-    const text = cleanExtractedText(stripTags(block));
-    if (text.length >= 30) pieces.push(text);
-  }
-  return pieces.join(' ');
+function extractSnippetAround(html, index) {
+  const s = String(html || '');
+  const start = Math.max(0, index - 250);
+  const end = Math.min(s.length, index + 2000);
+  return strip(s.slice(start, end));
 }
 
-function cleanExtractedText(text) {
-  return truncate(
-    String(text || '')
-      .replace(/\[[^\]]{0,80}\]\([^)]{0,500}\)/g, ' ')
-      .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
-      .replace(/\b(function|var|const|let)\s+[^;]{0,220};?/g, ' ')
-      .replace(/(?:skip to content|accept cookies|cookie settings|privacy settings|sign in|log in|subscribe|menu|search this site)\b/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .trim(),
-    MAX_TEXT_CHARS,
-  );
-}
-
-function extractVisibleText(html) {
-  const structured = cleanExtractedText(extractStructuredBody(html));
-  if (structured.length >= 500) return structured;
-  const candidates = [
-    html.match(/<article\b[^>]*>([\s\S]*?)<\/article>/i)?.[1],
-    html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1],
-    html.match(/<body\b[^>]*>([\s\S]*?)<\/body>/i)?.[1],
-    html,
-  ].filter(Boolean);
-  let best = structured;
-  for (const candidate of candidates) {
-    const text = cleanExtractedText(stripTags(String(candidate)));
-    if (text.length > best.length) best = text;
-  }
-  return best;
-}
-
-function extractSnippetFromSearchHtml(html, title = '') {
-  const cleaned = cleanExtractedText(stripTags(html));
-  if (!cleaned) return title ? `Search result for ${title}.` : 'Search result.';
-  return truncate(cleaned, 1200);
-}
-
-function textFromMarkdown(markdown) {
-  return cleanExtractedText(
-    String(markdown || '')
-      .replace(/```[\s\S]*?```/g, ' ')
-      .replace(/\[([^\]]+)\]\((?:https?:\/\/|\/)[^)]*\)/g, '$1')
-      .replace(/<https?:\/\/[^>]+>/g, ' ')
-      .replace(/^#{1,6}\s*/gm, '')
-      .replace(/[*_~`]/g, ' ')
-  );
-}
-
-function extractFallbackContent(result, query) {
-  const title = truncate(result.title || 'Untitled', 500);
-  const snippet = truncate(stripTags(result.snippet || ''), 2500);
-  const pieces = [
-    `Title: ${title}`,
-    `Source: ${result.source || 'web search'}`,
-    `Domain: ${hostname(result.url) || 'unknown'}`,
-    result.publishedAt ? `Published: ${result.publishedAt}` : '',
-    snippet ? `Search snippet: ${snippet}` : '',
-    `Query context: ${query}`,
-  ].filter(Boolean);
-  return pieces.join('\n');
-}
-
-function safeIsoDate(value) {
-  const t = Date.parse(String(value || ''));
-  return Number.isNaN(t) ? null : new Date(t).toISOString();
-}
-
-function freshnessBand(publishedAt) {
-  if (!publishedAt) return 'unknown';
-  const ageH = Math.max(0, (Date.now() - Date.parse(publishedAt)) / 36e5);
-  if (ageH <= 24) return 'last_24h';
-  if (ageH <= 168) return 'last_7d';
-  if (ageH <= 720) return 'last_30d';
-  if (ageH <= 8760) return 'last_year';
-  return 'older';
-}
-
-function extractSearchTerms(query) {
-  return query.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').split(/\s+/)
-    .filter(x => x.length > 2 && !STOPWORDS.has(x));
-}
-
-function queryIntent(query, requestedType) {
-  const q = query.toLowerCase();
-  const hasAny = xs => xs.some(x => q.includes(x));
-  const explicit = String(requestedType || '').toLowerCase();
-  const mixed = explicit === 'mixed' || explicit === 'all';
-  const indiaGovHint = /\b(government|govt|ministry|department|scheme|gst|income tax|mca|rbi|sebi|supreme court|high court|law|laws|legal|act|acts|notification|circular|gazette|policy|policies|regulation|regulations|official)\b/i.test(q);
-
-  if (!mixed && explicit) {
-    return {
-      type: explicit,
-      wantsNews: explicit === 'news',
-      wantsVideo: explicit === 'video',
-      wantsDocs: explicit === 'doc' || explicit === 'docs' || explicit === 'document',
-      wantsGov: explicit === 'gov' || explicit === 'doc' || explicit === 'docs' || explicit === 'document' || indiaGovHint,
-    };
-  }
-
-  // `mixed` is an output/discovery mode, not a request for every modality.
-  // Only lexical evidence in the actual query activates news/video/document/government lanes.
-  const wantsNews = hasAny(NEWS_QUERY_HINTS);
-  const wantsVideo = hasAny(VIDEO_QUERY_HINTS);
-  const wantsDocs = hasAny(DOC_QUERY_HINTS);
-  const wantsGov = indiaGovHint;
-  return {
-    type: mixed ? 'mixed' : (wantsVideo ? 'video' : wantsNews ? 'news' : wantsDocs ? 'doc' : 'web'),
-    wantsNews, wantsVideo, wantsGov, wantsDocs,
+function candidate(url, title, snippet, source, type = 'web', extra = {}) {
+  const clean = unwrap(url, extra.base || 'https://example.com/');
+  if (!clean || blocked(clean)) return null;
+  const result = {
+    title: truncate(strip(title || ''), 500),
+    url: clean,
+    snippet: truncate(strip(snippet || ''), 3000),
+    source,
+    type: ((type === 'gov' && !isGov(clean)) || (type === 'doc' && !isDoc(clean)) || (type === 'video' && !isVideo(clean))) ? 'web' : type,
+    ...extra,
   };
+  delete result.base;
+  if (!result.title || result.title.length < 3) return null;
+  return result;
 }
 
-function parseDateIntent(query) {
-  const q = query.toLowerCase();
-  const now = new Date();
-  const latest = /\b(latest|today|current|recent|breaking|just in|this week|yesterday)\b/i.test(q);
-
-  const monthMatch = q.match(new RegExp(`\\b(${Object.keys(MONTHS).join('|')})\\s+(20\\d{2})\\b`, 'i'));
-  if (monthMatch) {
-    const month = MONTHS[monthMatch[1].toLowerCase()];
-    const year = Number(monthMatch[2]);
-    return {
-      kind: 'explicit-month',
-      start: new Date(Date.UTC(year, month, 1)).toISOString(),
-      end: new Date(Date.UTC(year, month + 1, 1)).toISOString(),
-      label: `${monthMatch[1]} ${year}`,
-      latest,
-    };
-  }
-
-  const yearMatch = q.match(/\b(20\d{2})\b/);
-  if (yearMatch && /\b(latest|news|update|events|during|in)\b/i.test(q)) {
-    const year = Number(yearMatch[1]);
-    return {
-      kind: 'explicit-year',
-      start: new Date(Date.UTC(year, 0, 1)).toISOString(),
-      end: new Date(Date.UTC(year + 1, 0, 1)).toISOString(),
-      label: String(year),
-      latest,
-    };
-  }
-
-  if (/\btoday\b/i.test(q)) {
-    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    return { kind: 'today', start: start.toISOString(), end: now.toISOString(), label: 'today', latest: true };
-  }
-
-  if (/\byesterday\b/i.test(q)) {
-    const end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const start = new Date(end.getTime() - 86400000);
-    return { kind: 'yesterday', start: start.toISOString(), end: end.toISOString(), label: 'yesterday', latest: true };
-  }
-
-  if (/\bthis week\b/i.test(q)) {
-    return { kind: 'recent-window', start: new Date(Date.now() - 7 * 86400000).toISOString(), end: now.toISOString(), label: 'last 7 days', latest: true };
-  }
-
-  if (/\blast\s+30\s+days?\b/i.test(q)) {
-    return { kind: 'recent-window', start: new Date(Date.now() - 30 * 86400000).toISOString(), end: now.toISOString(), label: 'last 30 days', latest: true };
-  }
-
-  if (latest) {
-    return { kind: 'latest', start: new Date(Date.now() - 30 * 86400000).toISOString(), end: now.toISOString(), label: 'recent', latest: true };
-  }
-
-  return { kind: 'none', start: null, end: null, label: 'any', latest: false };
-}
-
-function buildSearchQueries(query, intent, mode, dateIntent) {
-  const queries = [];
-  const add = q => {
-    const v = String(q || '').replace(/\s+/g, ' ').trim();
-    if (v && !queries.includes(v)) queries.push(v);
-  };
-  const gov = intent.wantsGov || mode === 'gov';
-  const docs = intent.wantsDocs || mode === 'doc';
-  const video = intent.wantsVideo || mode === 'video';
-  const news = intent.wantsNews || mode === 'news';
-  const q = String(query || '').trim();
-  const hasSpaces = /\s/.test(q);
-
-  // Exact intent always comes first.
-  add(q);
-  if (hasSpaces && q.length <= 220 && (mode === 'deep' || intent.type === 'mixed')) add(`"${q}"`);
-
-  // Complementary variants increase source coverage without switching topics.
-  if (/\bhistory|historical|timeline|origins?\b/i.test(q)) {
-    add(`${q} timeline`);
-    add(`${q} origins milestones`);
-  } else if (/\b(compare|comparison|vs\.?|versus)\b/i.test(q)) {
-    add(`${q} comparison`);
-  } else if (/\bhow\s+to|tutorial|guide|learn\b/i.test(q)) {
-    add(`${q} guide`);
-  } else if (/\bprice|prices|cost|costs|pricing\b/i.test(q)) {
-    add(`${q} current prices`);
-  } else if (/\bpolicy|policies|law|legal|regulation|scheme|notification|circular\b/i.test(q)) {
-    add(`${q} official source`);
-  } else if (mode === 'deep') {
-    add(`${q} overview`);
-    add(`${q} authoritative sources`);
-  }
-
-  if (gov) {
-    add(`${q} site:gov.in`);
-    add(`${q} site:nic.in`);
-    add(`${q} site:india.gov.in`);
-  }
-  if (docs) {
-    add(`${q} filetype:pdf`);
-    add(`${q} official PDF`);
-  }
-  if (video) {
-    add(`site:youtube.com ${q}`);
-    add(`${q} YouTube`);
-  }
-  if (news) add(`${q} latest news`);
-
-  if (dateIntent.kind === 'explicit-month' || dateIntent.kind === 'explicit-year') {
-    add(`${q} after:${dateIntent.start.slice(0, 10)} before:${dateIntent.end.slice(0, 10)}`);
-  }
-  return queries.slice(0, 8);
-}
-
-function buildEngineUrls(q, intent) {
-  const encoded = encodeURIComponent(q);
-  const isPdfQuery = /filetype:\s*pdf|\bpdf\b|official pdf/i.test(q) || intent.wantsDocs;
-  const isGovQuery = /site:(?:gov\.in|nic\.in|india\.gov\.in|mygov\.in)/i.test(q) || intent.wantsGov;
-  const isVideoQuery = /site:youtube\.com|\byoutube\b/i.test(q) || intent.wantsVideo;
-  const urls = [
-    { provider: 'bing', type: 'web', url: `https://www.bing.com/search?q=${encoded}&count=20&setlang=en-IN&cc=in` },
-    { provider: 'google', type: 'web', url: `https://www.google.com/search?q=${encoded}&num=20&hl=en&gl=in` },
-    { provider: 'duckduckgo', type: 'web', url: `https://html.duckduckgo.com/html/?q=${encoded}&kl=in-en` },
-    { provider: 'yahoo', type: 'web', url: `https://search.yahoo.com/search?p=${encoded}` },
-    { provider: 'mojeek', type: 'web', url: `https://www.mojeek.com/search?q=${encoded}` },
-  ];
-  if (intent.wantsNews || /\blatest news\b/i.test(q)) {
-    urls.push({ provider: 'google-news', type: 'news', url: `https://news.google.com/rss/search?q=${encoded}&hl=en-IN&gl=IN&ceid=IN:en` });
-  }
-  if (isVideoQuery) urls.push({ provider: 'youtube', type: 'video', url: `https://www.youtube.com/results?search_query=${encoded}&hl=en-IN` });
-  if (isGovQuery) {
-    const govQ = `${q} site:gov.in`;
-    urls.push({ provider: 'google-gov', type: 'gov', url: `https://www.google.com/search?q=${encodeURIComponent(govQ)}&num=20&hl=en&gl=in` });
-  }
-  if (isPdfQuery) {
-    const docQ = `${q} filetype:pdf`;
-    urls.push({ provider: 'google-doc', type: 'doc', url: `https://www.google.com/search?q=${encodeURIComponent(docQ)}&num=20&hl=en&gl=in` });
-  }
-  return urls;
-}
-
-function parseBing(html) {
+function parseBing(html, forcedType = 'web') {
   const out = [];
-  const blocks = html.match(/<li[^>]+class=["'][^"']*b_algo[^"']*["'][\s\S]*?<\/li>/gi) || [];
+  const blocks = String(html).match(/<li[^>]+class=["'][^"']*b_algo[^"']*["'][\s\S]*?<\/li>/gi) || [];
   for (const block of blocks) {
     const m = block.match(/<h2[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
     if (!m) continue;
-    const rawSearchUrl = absoluteUrl(m[1], 'https://www.bing.com/');
-    const url = cleanUrl(rawSearchUrl, 'https://www.bing.com/');
-    if (!url || !isPublisherCandidateUrl(url)) continue;
-    const title = stripTags(m[2]).replace(/\s+/g, ' ').trim();
-    if (title.length < 3) continue;
-    const snippet = stripTags((block.match(/<p[^>]*>([\s\S]*?)<\/p>/i) || [, ''])[1]);
-    const wrapperResolved = Boolean(rawSearchUrl && rawSearchUrl !== url);
-    out.push({
-      title, url, snippet, source: 'bing', type: 'web',
-      searchEngineUrl: rawSearchUrl,
-      searchWrapperResolved: wrapperResolved,
-      searchWrapperProvider: wrapperResolved ? 'bing' : null,
-      publisherWrapperUrl: wrapperResolved ? rawSearchUrl : null,
-      publisherResolutionMethod: wrapperResolved ? 'bing-unwrapped' : null,
-      publisherResolved: wrapperResolved,
-    });
+    const r = candidate(m[1], m[2], (block.match(/<p[^>]*>([\s\S]*?)<\/p>/i) || [, ''])[1], 'bing', forcedType, { base: 'https://www.bing.com/' });
+    if (r) { r.searchWrapperResolved = r.url !== absoluteUrl(m[1], 'https://www.bing.com/'); out.push(r); }
   }
   return out.slice(0, 20);
 }
 
-function parseMojeek(html) {
+function parseDuck(html, forcedType = 'web') {
   const out = [];
-  const anchors = [...html.matchAll(/<a[^>]+class=["'](?:ob|title|result)[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)];
-  for (const m of anchors) {
-    const url = cleanUrl(m[1], 'https://www.mojeek.com/');
-    if (!url || !isPublisherCandidateUrl(url) || /mojeek\.com\/search/i.test(url)) continue;
-    out.push({ title: stripTags(m[2]), url, snippet: '', source: 'mojeek', type: 'web' });
-  }
-  return out.slice(0, 20);
-}
-
-function parseYahoo(html) {
-  const out = [];
-  const headings = [...html.matchAll(/<h3[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)];
-  for (const m of headings) {
-    const url = cleanUrl(m[1], 'https://search.yahoo.com/');
-    if (!url || !isPublisherCandidateUrl(url) || /search\.yahoo\.com\/search/i.test(url)) continue;
+  for (const m of String(html).matchAll(/<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
     const idx = m.index || 0;
-    const tail = html.slice(idx, idx + 4500);
-    const snippet = stripTags((tail.match(/<p[^>]*>([\s\S]*?)<\/p>/i) || [, ''])[1]);
-    out.push({ title: stripTags(m[2]), url, snippet, source: 'yahoo', type: 'web' });
+    const r = candidate(m[1], m[2], extractSnippetAround(html, idx), 'duckduckgo', forcedType, { base: 'https://html.duckduckgo.com/' });
+    if (r) out.push(r);
+    if (out.length >= 20) break;
   }
-  return out.slice(0, 20);
+  return out;
 }
 
-function parseGoogleWeb(html, source = 'google', forcedType = 'web') {
+function parseYahoo(html, forcedType = 'web') {
+  const out = [];
+  for (const m of String(html).matchAll(/<h3[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+    const idx = m.index || 0;
+    const r = candidate(m[1], m[2], extractSnippetAround(html, idx), 'yahoo', forcedType, { base: 'https://search.yahoo.com/' });
+    if (r) out.push(r);
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+function parseMojeek(html, forcedType = 'web') {
+  const out = [];
+  for (const m of String(html).matchAll(/<a[^>]+class=["'][^"']*(?:ob|title|result)[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+    const r = candidate(m[1], m[2], '', 'mojeek', forcedType, { base: 'https://www.mojeek.com/' });
+    if (r) out.push(r);
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+function parseGoogle(html, source = 'google', forcedType = 'web') {
   const out = [];
   const seen = new Set();
-
-  const parseAnchor = (rawHref, rawTitle, snippet = '') => {
-    let raw = decodeHtml(rawHref || '');
+  const s = String(html || '');
+  // Preferred parser: actual result title (<h3>) inside an outbound anchor.
+  for (const m of s.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>[\s\S]*?<\/a>/gi)) {
+    let raw = m[1];
     try {
       if (raw.startsWith('/url?')) {
         const u = new URL(raw, 'https://www.google.com/');
         raw = u.searchParams.get('q') || u.searchParams.get('url') || '';
       }
     } catch {}
-    if (!/^https?:\/\//i.test(raw)) return;
-    const url = cleanUrl(raw, 'https://www.google.com/');
-    if (!url || isBlockedContentUrl(url)) return;
-    const host = normalizedHost(url);
-    if (/^google\.(?:com|co\.in)$/i.test(host)) return;
-    if (/^(?:accounts|support|policies|maps|play)\.google\./i.test(host)) return;
-    const title = stripTags(rawTitle || '').replace(/\s+/g, ' ').trim();
-    if (title.length < 8 || seen.has(normalizedKey(url))) return;
-    let type = forcedType;
-    if (forcedType === 'web') {
-      if (isGovUrl(url)) type = 'gov';
-      else if (isDocUrl(url)) type = 'doc';
-      else if (isLikelyVideoUrl(url)) type = 'video';
-    }
-    if (forcedType === 'video' && !isLikelyVideoUrl(url)) return;
-    seen.add(normalizedKey(url));
-    out.push({ title, url, snippet: stripTags(snippet || ''), source, type });
-  };
-
-  // Google's organic result titles are normally inside h3 elements. This is much
-  // safer than treating every page anchor (navigation, footer, related links, etc.) as a result.
-  const headings = [...html.matchAll(/<h3\b[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>\s*<\/h3>/gi)];
-  for (const m of headings) {
-    const idx = m.index || 0;
-    const tail = html.slice(idx, idx + 7000);
-    const snippet = (tail.match(/<(?:div|span)[^>]+(?:class|data-content-feature)=["'][^"']*(?:VwiC3b|IsZvec|aCOpRe)[^"']*["'][^>]*>([\s\S]*?)<\//i)?.[1]) ||
-      (tail.match(/<div[^>]+class=["'][^"']*VwiC3b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i)?.[1]) || '';
-    parseAnchor(m[1], m[2], snippet);
+    const url = unwrap(raw, 'https://www.google.com/');
+    if (!url || blocked(url)) continue;
+    if (/google\.com$/i.test(normalizeHost(url)) && /\/search|\/url/i.test(new URL(url).pathname + new URL(url).search)) continue;
+    const key = normalizedKey(url);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const r = candidate(url, m[2], extractSnippetAround(s, m.index || 0), source, forcedType, { base: 'https://www.google.com/' });
+    if (r) out.push(r);
     if (out.length >= 20) break;
   }
-
+  // Secondary parser: title/link structures where <h3> is adjacent rather than nested.
   if (!out.length) {
-    // Conservative fallback for alternate Google markup: only accept anchors whose
-    // text resembles a result title and are near an h3/div result container.
-    for (const m of html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
-      const title = stripTags(m[2] || '').replace(/\s+/g, ' ').trim();
-      if (title.length < 25 || title.length > 240) continue;
+    for (const m of s.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/gi)) {
       const idx = m.index || 0;
-      const before = html.slice(Math.max(0, idx - 1200), idx);
-      if (!/<h3\b|MjjYud|Gx5Zad|tF2Cxc/i.test(before)) continue;
-      parseAnchor(m[1], title, '');
+      const window = s.slice(Math.max(0, idx - 1200), Math.min(s.length, idx + 1200));
+      const href = window.match(/href=["']([^"']+)["']/i)?.[1];
+      if (!href) continue;
+      const url = unwrap(href, 'https://www.google.com/');
+      if (!url || blocked(url)) continue;
+      const r = candidate(url, m[1], strip(window), source, forcedType, { base: 'https://www.google.com/' });
+      if (r && !seen.has(normalizedKey(r.url))) { seen.add(normalizedKey(r.url)); out.push(r); }
       if (out.length >= 20) break;
     }
   }
-
   return out;
 }
 
-function parseDuckDuckGo(html) {
+function parseGoogleNews(xml) {
   const out = [];
-  const anchors = [...html.matchAll(/<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)];
-  for (const m of anchors) {
-    const url = cleanUrl(m[1], 'https://html.duckduckgo.com/');
-    if (!url || !isPublisherCandidateUrl(url)) continue;
-    const tail = html.slice(m.index || 0, (m.index || 0) + 5000);
-    const snippet = stripTags((tail.match(/class=["'][^"']*result__snippet[^"']*[^>]*>([\s\S]*?)(?:<\/a>|<\/span>|<\/div>)/i) || [, ''])[1]);
-    out.push({ title: stripTags(m[2]), url, snippet, source: 'duckduckgo', type: 'web' });
-  }
-  return out.slice(0, 20);
-}
-
-function parseGoogleNewsRss(xml) {
-  const out = [];
-  const items = xml.match(/<item>[\s\S]*?<\/item>/gi) || [];
-  for (const item of items) {
-    const title = stripTags((item.match(/<title>([\s\S]*?)<\/title>/i) || [, ''])[1]);
-    const link = stripTags((item.match(/<link>([\s\S]*?)<\/link>/i) || [, ''])[1]);
-    const pubDate = stripTags((item.match(/<pubDate>([\s\S]*?)<\/pubDate>/i) || [, ''])[1]);
-    const desc = stripTags((item.match(/<description>([\s\S]*?)<\/description>/i) || [, ''])[1]);
+  for (const item of String(xml || '').match(/<item>[\s\S]*?<\/item>/gi) || []) {
+    const title = strip((item.match(/<title>([\s\S]*?)<\/title>/i) || [, ''])[1]);
+    const link = strip((item.match(/<link>([\s\S]*?)<\/link>/i) || [, ''])[1]);
+    const pub = strip((item.match(/<pubDate>([\s\S]*?)<\/pubDate>/i) || [, ''])[1]);
+    const desc = strip((item.match(/<description>([\s\S]*?)<\/description>/i) || [, ''])[1]);
     const sm = item.match(/<source[^>]*url=["']([^"']+)["'][^>]*>([\s\S]*?)<\/source>/i) || item.match(/<source[^>]*>([\s\S]*?)<\/source>/i);
-    const sourceName = stripTags(sm?.[2] || sm?.[1] || '');
-    const sourceUrl = sm?.[1] ? cleanUrl(sm[1], 'https://news.google.com/') : null;
-    const url = cleanUrl(link, 'https://news.google.com/');
+    const sourceName = strip(sm?.[2] || sm?.[1] || '');
+    const sourceUrl = sm?.[1] ? unwrap(sm[1], 'https://news.google.com/') : null;
+    const url = unwrap(link, 'https://news.google.com/');
     if (!title || !url) continue;
-    out.push({
-      title, url, snippet: desc,
-      publishedAt: safeIsoDate(pubDate),
-      source: sourceName ? `google-news:${sourceName}` : 'google-news',
-      publisherUrl: sourceUrl,
-      type: 'news',
-    });
-  }
-  return out.slice(0, 80);
-}
-
-function findJsonObjectAfterMarker(text, marker, maxDistance = 300_000, maxScan = 1_000_000) {
-  const source = String(text || '');
-  const idx = source.indexOf(marker);
-  if (idx < 0) return null;
-  const start = source.indexOf('{', idx + marker.length);
-  if (start < 0 || start - idx > maxDistance) return null;
-  let depth = 0, inString = false, escaped = false;
-  const end = Math.min(source.length, start + maxScan);
-  for (let i = start; i < end; i++) {
-    const ch = source[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') { inString = true; continue; }
-    if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) {
-        try { return JSON.parse(source.slice(start, i + 1)); } catch { return null; }
-      }
-    }
-  }
-  return null;
-}
-
-function collectYouTubeVideoRenderers(value, out = []) {
-  if (!value || out.length >= 20) return out;
-  if (Array.isArray(value)) { for (const v of value) collectYouTubeVideoRenderers(v, out); return out; }
-  if (typeof value !== 'object') return out;
-  if (value.videoRenderer?.videoId) out.push(value.videoRenderer);
-  for (const key of Object.keys(value)) {
-    if (key === 'videoRenderer') continue;
-    collectYouTubeVideoRenderers(value[key], out);
-    if (out.length >= 20) break;
+    const r = candidate(url, title, desc, sourceName ? `google-news:${sourceName}` : 'google-news', 'news');
+    if (!r) continue;
+    r.publishedAt = safeDate(pub);
+    r.publisherUrl = sourceUrl || null;
+    out.push(r);
+    if (out.length >= 80) break;
   }
   return out;
-}
-
-function youtubeRendererTitle(renderer) {
-  return decodeHtml(
-    renderer?.title?.runs?.map(x => x?.text || '').join('') || renderer?.title?.simpleText || ''
-  ).trim();
 }
 
 function parseYoutube(html) {
   const out = [];
   const seen = new Set();
-  const initialData = findJsonObjectAfterMarker(html, 'ytInitialData');
-  const renderers = collectYouTubeVideoRenderers(initialData, []);
-  for (const renderer of renderers) {
-    const id = renderer?.videoId;
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
-    const snippet = decodeHtml(renderer?.detailedMetadataSnippets?.[0]?.snippetText?.runs?.map(x => x?.text || '').join('') || renderer?.descriptionSnippet?.runs?.map(x => x?.text || '').join('') || 'YouTube video result');
-    out.push({ title: youtubeRendererTitle(renderer) || `YouTube video ${id}`, url: `https://www.youtube.com/watch?v=${id}`, snippet, source: 'youtube', type: 'video' });
-    if (out.length >= 20) break;
-  }
-  if (out.length) return out;
-  for (const m of html.matchAll(/"videoRenderer":\{[\s\S]*?"videoId":"([\w-]{6,20})"[\s\S]*?\}/g)) {
+  const s = String(html || '');
+  for (const m of s.matchAll(/"videoRenderer":\{[\s\S]*?"videoId":"([A-Za-z0-9_-]{6,20})"[\s\S]*?"title":\{"runs":\[\{"text":"((?:\\.|[^"\\])*)"/g)) {
     const id = m[1];
     if (seen.has(id)) continue;
     seen.add(id);
-    const windowText = html.slice(Math.max(0, (m.index || 0) - 200), Math.min(html.length, (m.index || 0) + 7000));
-    const title = decodeHtml((windowText.match(/"title":\{"runs":\[\{"text":"((?:\\.|[^"\\])*)"/i) || [, ''])[1]).replace(/\\"/g, '"');
-    out.push({ title: title || `YouTube video ${id}`, url: `https://www.youtube.com/watch?v=${id}`, snippet: 'YouTube video result', source: 'youtube', type: 'video' });
+    const title = m[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    const r = candidate(`https://www.youtube.com/watch?v=${id}`, title, 'YouTube result', 'youtube', 'video');
+    if (r) out.push(r);
     if (out.length >= 20) break;
   }
   if (!out.length) {
-    for (const m of html.matchAll(/"videoId":"([\w-]{6,20})"/g)) {
+    for (const m of s.matchAll(/"videoId":"([A-Za-z0-9_-]{6,20})"/g)) {
       const id = m[1];
       if (seen.has(id)) continue;
       seen.add(id);
-      out.push({ title: `YouTube video ${id}`, url: `https://www.youtube.com/watch?v=${id}`, snippet: 'YouTube video result', source: 'youtube', type: 'video' });
+      const r = candidate(`https://www.youtube.com/watch?v=${id}`, `YouTube video ${id}`, 'YouTube result', 'youtube', 'video');
+      if (r) out.push(r);
       if (out.length >= 20) break;
     }
   }
   return out;
 }
 
-
-function envValue(name) {
-  try { return typeof process !== 'undefined' ? String(process.env?.[name] || '').trim() : ''; }
-  catch { return ''; }
+function safeDate(value) {
+  const t = Date.parse(String(value || ''));
+  return Number.isNaN(t) ? null : new Date(t).toISOString();
+}
+function freshness(publishedAt) {
+  if (!publishedAt) return 'unknown';
+  const age = Math.max(0, (Date.now() - Date.parse(publishedAt)) / 86400000);
+  if (age <= 1) return 'last_24h';
+  if (age <= 7) return 'last_7d';
+  if (age <= 30) return 'last_30d';
+  if (age <= 90) return 'last_90d';
+  if (age <= 365) return 'last_year';
+  return 'older';
 }
 
-function getTavilyKeys() {
-  const keys = [];
-  const names = ['TAVILY_API_KEY', 'TAVILY_API_KEY_1'];
-  for (let i = 2; i <= TAVILY_KEY_SCAN_MAX; i++) names.push(`TAVILY_API_KEY_${i}`);
-  for (const name of names) {
-    const key = envValue(name);
-    if (key && !keys.includes(key)) keys.push(key);
+function providerRequests(queries, plan, count) {
+  const core = [];
+  const special = [];
+  const explicit = plan.type;
+  const specialNews = explicit === 'news' || plan.flags?.explicitNews;
+  const specialVideo = explicit === 'video' || plan.flags?.explicitVideo;
+  const specialDoc = explicit === 'doc' || plan.flags?.explicitDoc;
+  const specialGov = explicit === 'gov' || plan.flags?.explicitGov;
+  const add = (arr, provider, q, type, url) => arr.push({ provider, query: q, type, url });
+
+  // Core web discovery is kept broad even for typed queries; URL/domain validation later
+  // decides whether a result truly is gov/doc/video/news content.
+  for (const q of queries.slice(0, 4)) {
+    const e = encodeURIComponent(q);
+    add(core, 'bing', q, specialNews ? 'news' : 'web', `https://www.bing.com/search?q=${e}&count=20&setlang=en-IN&cc=in`);
+    add(core, 'google', q, specialNews ? 'news' : 'web', `https://www.google.com/search?q=${e}&num=20&hl=en&gl=in`);
+    add(core, 'duckduckgo', q, specialNews ? 'news' : 'web', `https://html.duckduckgo.com/html/?q=${e}&kl=in-en`);
+    add(core, 'yahoo', q, specialNews ? 'news' : 'web', `https://search.yahoo.com/search?p=${e}`);
+    add(core, 'mojeek', q, specialNews ? 'news' : 'web', `https://www.mojeek.com/search?q=${e}`);
   }
-  return keys;
-}
 
-function tavilyTopic(intent) {
-  if (intent?.wantsNews && !intent?.wantsDocs && !intent?.wantsVideo) return 'news';
-  return 'general';
-}
+  if (specialNews) for (const q of queries.slice(0, 4)) special.push({ provider: 'google-news', query: q, type: 'news', url: `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-IN&gl=IN&ceid=IN:en` });
+  if (specialVideo) for (const q of queries.slice(0, 3)) special.push({ provider: 'youtube', query: q, type: 'video', url: `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&hl=en-IN` });
+  if (specialDoc) for (const q of queries.slice(0, 4)) special.push({ provider: 'google-doc', query: q, type: 'doc', url: `https://www.google.com/search?q=${encodeURIComponent(`${q} filetype:pdf`)}&num=20&hl=en&gl=in` });
+  if (specialGov) for (const q of queries.slice(0, 4)) special.push({ provider: 'google-gov', query: q, type: 'gov', url: `https://www.google.com/search?q=${encodeURIComponent(`${q} site:gov.in`)}&num=20&hl=en&gl=in` });
 
-function tavilyDateParams(dateIntent) {
-  const out = {};
-  if (!dateIntent?.start || !dateIntent?.end) return out;
-  const start = String(dateIntent.start).slice(0, 10);
-  const end = String(dateIntent.end).slice(0, 10);
-  if (/^\d{4}-\d{2}-\d{2}$/.test(start) && /^\d{4}-\d{2}-\d{2}$/.test(end)) {
-    out.start_date = start;
-    out.end_date = end;
+  // Reserve meaningful room for requested modality, rather than filling the request
+  // budget entirely with the five generic engines.
+  const specialQuota = specialNews || specialVideo || specialDoc || specialGov ? Math.min(8, special.length) : 0;
+  const coreQuota = Math.max(0, MAX_ENGINE_REQUESTS - specialQuota);
+  const final = [];
+  const seen = new Set();
+
+  for (const r of core.slice(0, coreQuota)) {
+    if (seen.has(r.url)) continue;
+    seen.add(r.url); final.push(r);
   }
-  return out;
+  for (const r of special.slice(0, specialQuota)) {
+    if (final.length >= MAX_ENGINE_REQUESTS || seen.has(r.url)) continue;
+    seen.add(r.url); final.push(r);
+  }
+  return final.slice(0, MAX_ENGINE_REQUESTS);
+}
+async function discoverOne(req, deadline) {
+  try {
+    const body = await fetchText(req.url, SEARCH_TIMEOUT_MS, deadline, 700_000);
+    let results = [];
+    if (req.provider === 'bing') results = parseBing(body, req.type);
+    else if (req.provider === 'google') results = parseGoogle(body, 'google', req.type);
+    else if (req.provider === 'duckduckgo') results = parseDuck(body, req.type);
+    else if (req.provider === 'yahoo') results = parseYahoo(body, req.type);
+    else if (req.provider === 'mojeek') results = parseMojeek(body, req.type);
+    else if (req.provider === 'google-news') results = parseGoogleNews(body);
+    else if (req.provider === 'youtube') results = parseYoutube(body);
+    else if (req.provider === 'google-doc') results = parseGoogle(body, 'google-doc', 'doc');
+    else if (req.provider === 'google-gov') results = parseGoogle(body, 'google-gov', 'gov');
+    return { provider: req.provider, ok: true, results };
+  } catch (error) {
+    return { provider: req.provider, ok: false, results: [], error: error?.message || 'DISCOVERY_FAILED' };
+  }
 }
 
-function extractMarkdownTitle(raw) {
-  const text = String(raw || '');
-  const heading = text.match(/^#{1,3}\s+(.{3,260})$/m)?.[1]?.trim();
-  if (heading) return heading.replace(/\s+#+\s*$/, '').trim();
-  const titled = text.match(/^Title:\s*(.{3,260})$/im)?.[1]?.trim();
-  return titled || '';
+function dedupeCandidates(list) {
+  const map = new Map();
+  for (const raw of list || []) {
+    if (!raw) continue;
+    const url = unwrap(raw.url || raw.link || raw.sourceUrl || '', raw.base || 'https://example.com/');
+    if (!url || blocked(url)) continue;
+    const item = { ...raw, url };
+    const key = normalizedKey(url);
+    const old = map.get(key);
+    if (!old) map.set(key, item);
+    else {
+      const oldContent = String(old.rawContent || old.pageContent || '').length;
+      const newContent = String(item.rawContent || item.pageContent || '').length;
+      const merged = { ...old, ...item };
+      if (newContent < oldContent) {
+        merged.rawContent = old.rawContent;
+        merged.pageContent = old.pageContent;
+      }
+      if (!merged.snippet && old.snippet) merged.snippet = old.snippet;
+      map.set(key, merged);
+    }
+  }
+  return [...map.values()].slice(0, MAX_DISCOVERY_RESULTS);
 }
 
-async function postJson(url, body, apiKey, timeoutMs, deadline) {
-  const timeout = effectiveTimeout(timeoutMs, deadline, 450);
-  if (!timeout) throw new Error('BUDGET_EXHAUSTED');
+function normalizeTavilyResult(row) {
+  const url = unwrap(row?.url || '', 'https://tavily.com/');
+  if (!url || blocked(url)) return null;
+  return {
+    title: truncate(row?.title || '', 500),
+    url,
+    snippet: truncate(row?.content || row?.snippet || '', 3000),
+    rawContent: truncate(row?.raw_content || '', 30_000),
+    semanticSearchScore: Number.isFinite(Number(row?.score)) ? Number(row.score) : null,
+    source: 'tavily',
+    type: isDoc(url) ? 'doc' : isVideo(url) ? 'video' : isGov(url) ? 'gov' : 'web',
+  };
+}
+
+async function tavilyCall(query, key, plan, count, deadline, variantIndex) {
+  const timeout = Math.min(TAVILY_TIMEOUT_MS, Math.max(450, left(deadline) - 150));
+  if (!key || timeout < 450) return { ok: false, results: [], error: 'NO_BUDGET' };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    const res = await fetch(url, {
+    const topic = plan.type === 'news' ? 'news' : 'general';
+    const body = {
+      api_key: key,
+      query,
+      search_depth: variantIndex === 0 ? 'advanced' : 'basic',
+      max_results: Math.min(TAVILY_RESULTS_PER_CALL, Math.max(10, count)),
+      topic,
+      include_answer: false,
+      include_raw_content: 'markdown',
+      include_images: false,
+      include_image_descriptions: false,
+      include_favicon: false,
+      include_usage: false,
+    };
+    const res = await fetch('https://api.tavily.com/search', {
       method: 'POST',
       signal: controller.signal,
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        'content-type': 'application/json',
-        accept: 'application/json',
-      },
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify(body),
     });
-    const text = await readBodyText(res, 2_200_000, deadline);
-    let data = null;
-    try { data = JSON.parse(text); } catch {}
-    return { res, data, text };
+    if (!res.ok) throw new Error(`TAVILY_HTTP_${res.status}`);
+    const data = await res.json();
+    const results = Array.isArray(data?.results) ? data.results.map(normalizeTavilyResult).filter(Boolean) : [];
+    return { ok: true, results };
+  } catch (error) {
+    return { ok: false, results: [], error: error?.message || 'TAVILY_FAILED' };
   } finally { clearTimeout(timer); }
 }
 
-async function tavilySearchOne(query, intent, dateIntent, maxResults, apiKey, deadline) {
-  if (!apiKey || remainingMs(deadline) < 1300) return null;
-  const body = {
-    query,
-    search_depth: 'fast',
-    chunks_per_source: 3,
-    max_results: Math.min(TAVILY_MAX_RESULTS_PER_CALL, Math.max(5, maxResults)),
-    topic: tavilyTopic(intent),
-    include_answer: false,
-    include_raw_content: 'markdown',
-    include_images: false,
-    include_image_descriptions: false,
-    include_favicon: false,
-    include_usage: false,
-    auto_parameters: false,
-    exact_match: false,
-  };
-  Object.assign(body, tavilyDateParams(dateIntent));
-  if (body.topic === 'general' && /\b(india|indian)\b/i.test(query)) body.country = 'india';
-  try {
-    const { res, data } = await postJson('https://api.tavily.com/search', body, apiKey, TAVILY_SEARCH_TIMEOUT_MS, deadline);
-    if (!res.ok || !data || !Array.isArray(data.results)) return null;
-    return {
-      provider: 'tavily',
-      ok: true,
-      results: data.results.map(item => {
-        const title = decodeHtml(item?.title || '').trim();
-        const url = cleanUrl(item?.url || '', 'https://example.com/');
-        const snippet = decodeHtml(item?.content || '').trim();
-        const raw = String(item?.raw_content || '').trim();
-        const rawText = textFromMarkdown(raw);
-        const rawTitle = extractMarkdownTitle(raw);
-        const titleSim = rawTitle ? titleSimilarity(title, rawTitle) : (title ? 1 : 0);
-        const validRaw = Boolean(url && safeHttpUrl(url) && !isBlockedContentUrl(url) && rawText.length >= TAVILY_CONTENT_MIN_CHARS);
-        const targetThreshold = item?.url && isGovUrl(url) ? 0.25 : 0.25;
-        const targetMatched = validRaw && (!rawTitle || titleSim >= targetThreshold);
-        let r = {
-          title: title || rawTitle || 'Untitled',
-          url,
-          snippet,
-          source: 'tavily',
-          type: inferType({ url, type: null }),
-          searchScore: Number.isFinite(Number(item?.score)) ? Number(item.score) : null,
-          tavilyRawContent: rawText || null,
-          contentTargetMatched: targetMatched,
-          contentTitleSimilarity: Number(titleSim.toFixed(2)),
-          publisherResolved: true,
-          publisherResolutionMethod: 'tavily-direct-result',
-          verificationMethod: validRaw ? 'tavily-raw-content' : null,
-          verified: validRaw,
-          contentType: 'text/markdown',
-        };
-        if (validRaw && targetMatched) {
-          r = ensureContentFields(r, query, {
-            status: 'full',
-            method: 'tavily-raw-content',
-            content: rawText,
-            confidence: 0.97,
-          });
-        } else {
-          r = ensureContentFields(r, query, {
-            status: 'snippet_fallback',
-            method: 'search-snippet',
-            content: extractFallbackContent(r, query),
-            confidence: 0.35,
-          });
-        }
-        return r;
-      }).filter(r => r.url),
-      responseTime: data.response_time || null,
-    };
-  } catch { return null; }
-}
-
-async function runTavilyFastLane(queryVariants, intent, dateIntent, count, deadline) {
-  const keys = getTavilyKeys();
-  if (!keys.length || remainingMs(deadline) < 1600) return null;
-  const queries = [...new Set((queryVariants || []).filter(Boolean))].slice(0, Math.min(TAVILY_MAX_SEARCH_CALLS, keys.length));
-  if (!queries.length) return null;
-  const jobs = queries.map((q, i) => tavilySearchOne(q, intent, dateIntent, Math.max(20, count), keys[i], deadline));
+async function tavilyDiscovery(plan, queries, count, deadline) {
+  const keys = [];
+  for (const name of ['TAVILY_API_KEY', 'TAVILY_API_KEY_1', ...Array.from({ length: MAX_TAVILY_KEYS - 1 }, (_, i) => `TAVILY_API_KEY_${i + 2}`)]) {
+    const key = env(name);
+    if (key && !keys.includes(key)) keys.push(key);
+  }
+  if (!keys.length || left(deadline) < 900) return { results: [], calls: 0, succeeded: 0 };
+  const jobs = keys.slice(0, MAX_TAVILY_CALLS).map((key, i) => tavilyCall(queries[Math.min(i, queries.length - 1)], key, plan, count, deadline, i));
   const rows = await Promise.allSettled(jobs);
-  const good = rows.map(x => x.status === 'fulfilled' ? x.value : null).filter(Boolean);
-  if (!good.length) return null;
-  return {
-    providers: good,
-    results: good.flatMap(x => x.results || []),
-    keysUsed: good.length,
-  };
-}
-
-async function discoverOne(engine, deadline) {
-  try {
-    const body = await fetchText(engine.url, {
-      timeout: engine.provider === 'youtube' ? 7000 : SEARCH_TIMEOUT_MS,
-      maxBytes: engine.provider === 'youtube' ? MAX_YOUTUBE_BYTES : MAX_SEARCH_BYTES,
-      deadline,
-    });
-    let results = [];
-    if (engine.provider === 'bing') results = parseBing(body);
-    else if (engine.provider === 'duckduckgo') results = parseDuckDuckGo(body);
-    else if (engine.provider === 'mojeek') results = parseMojeek(body);
-    else if (engine.provider === 'yahoo') results = parseYahoo(body);
-    else if (engine.provider === 'google') results = parseGoogleWeb(body);
-    else if (engine.provider === 'google-video') results = parseGoogleWeb(body, 'google-video', 'video');
-    else if (engine.provider === 'google-gov') results = parseGoogleWeb(body, 'google-gov', 'gov');
-    else if (engine.provider === 'google-doc') results = parseGoogleWeb(body, 'google-doc', 'doc');
-    else if (engine.provider === 'google-news') results = parseGoogleNewsRss(body);
-    else if (engine.provider === 'youtube') results = parseYoutube(body);
-    return { provider: engine.provider, results, ok: true };
-  } catch (error) {
-    return { provider: engine.provider, results: [], ok: false, error: error?.message || 'FETCH_FAILED' };
-  }
-}
-
-function dedupeResults(results) {
-  const map = new Map();
-  for (const r of results) {
-    if (!r?.url || !safeHttpUrl(r.url) || isBlockedContentUrl(r.url)) continue;
-    const key = normalizedKey(r.url);
-    const existing = map.get(key);
-    if (!existing || (r.verified && !existing.verified) || ((r.snippet || '').length > (existing.snippet || '').length)) {
-      map.set(key, { ...existing, ...r });
-    }
-  }
-  return [...map.values()];
-}
-
-function scoreDate(publishedAt, dateIntent) {
-  if (!publishedAt) return 0;
-  const t = Date.parse(publishedAt);
-  if (Number.isNaN(t)) return 0;
-  if (dateIntent.start && dateIntent.end) {
-    const start = Date.parse(dateIntent.start), end = Date.parse(dateIntent.end);
-    if (t >= start && t < end) return 22;
-    if (dateIntent.kind === 'explicit-month' || dateIntent.kind === 'explicit-year') return -22;
-  }
-  if (dateIntent.latest) {
-    const ageDays = Math.max(0, (Date.now() - t) / 86400000);
-    if (ageDays <= 1) return 14;
-    if (ageDays <= 7) return 11;
-    if (ageDays <= 30) return 7;
-    if (ageDays <= 90) return 1;
-    if (ageDays <= 365) return -6;
-    return -14;
-  }
-  return 0;
-}
-
-function scoreResult(r, query, intent, dateIntent) {
-  const terms = extractSearchTerms(query);
-  const title = String(r.title || '').toLowerCase();
-  const snippet = String(r.snippet || '').toLowerCase();
-  const body = String(r.pageContent || r.extractedText || '').toLowerCase();
-  const url = String(r.url || '').toLowerCase();
-  const normalizedQuery = String(query || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
-  let score = 0;
-  let matched = 0;
-  let snippetMatched = 0;
-  let bodyMatched = 0;
-  for (const t of terms) {
-    if (title.includes(t)) { score += 6; matched++; }
-    if (snippet.includes(t)) { score += 1.8; snippetMatched++; }
-    if (body.includes(t)) { score += 0.55; bodyMatched++; }
-    if (url.includes(t)) score += 0.45;
-  }
-  const titleCoverage = terms.length ? matched / terms.length : 1;
-  const snippetCoverage = terms.length ? snippetMatched / terms.length : 1;
-  const bodyCoverage = terms.length ? bodyMatched / terms.length : 1;
-  if (terms.length) score += Math.min(12, titleCoverage * 12);
-  const shortPhrase = terms.length >= 2 ? terms.slice(0, Math.min(4, terms.length)).join(' ') : '';
-  if (shortPhrase && title.includes(shortPhrase)) score += 12;
-  if (normalizedQuery && normalizedQuery.length >= 8 && title.includes(normalizedQuery)) score += 15;
-  if (terms.length >= 3 && titleCoverage < 0.18 && snippetCoverage < 0.25 && bodyCoverage < 0.20) score -= 12;
-  if (terms.length >= 4 && titleCoverage < 0.34 && snippetCoverage < 0.34 && bodyCoverage < 0.25) score -= 5;
-  if (intent.wantsGov && isGovUrl(r.url)) score += 10;
-  if (intent.wantsNews && r.type === 'news') score += 8;
-  if (intent.wantsVideo && r.type === 'video') score += 8;
-  if (intent.wantsDocs && (r.type === 'doc' || isDocUrl(r.url))) score += 6;
-  if (isTrustedInternational(r.url)) score += 2.5;
-  if (r.verified) score += 4;
-  if (r.contentStatus === 'full' || r.contentStatus === 'reader' || r.contentStatus === 'alternate') score += 3;
-  if (Number.isFinite(Number(r.searchScore))) score += Math.max(0, Math.min(18, Number(r.searchScore) * 18));
-  if (r.publishedAt) score += scoreDate(r.publishedAt, dateIntent);
-  if (/login|signin|advertis|cookie|enable javascript/i.test(`${title} ${snippet}`)) score -= 1.5;
-  if (/^news\.google\.com$/i.test(hostname(r.url))) score -= 10;
-  return score;
-}
-
-function applyDateConstraint(results, dateIntent, count, warnings) {
-  if (!dateIntent.start || !dateIntent.end) return results;
-  const start = Date.parse(dateIntent.start), end = Date.parse(dateIntent.end);
-  const exact = dateIntent.kind === 'explicit-month' || dateIntent.kind === 'explicit-year';
-  const inRange = results.filter(r => {
-    const t = r.publishedAt ? Date.parse(r.publishedAt) : NaN;
-    return !Number.isNaN(t) && t >= start && t < end;
-  });
-  if (exact && inRange.length >= Math.min(4, Math.max(2, Math.ceil(count / 10)))) {
-    warnings.push(`Applied requested date window: ${dateIntent.label}.`);
-    return inRange;
-  }
-  if (exact) warnings.push(`Requested date window ${dateIntent.label} had ${inRange.length} dated result(s); nearby live results were retained as fallback.`);
-  return results;
-}
-
-function enforceRequestedType(results, requestedType, mode, warnings) {
-  const wanted = String(requestedType || (['mixed', 'deep', 'auto'].includes(mode) ? '' : mode) || '').toLowerCase();
-  let type = null;
-  if (wanted === 'gov') type = 'gov';
-  else if (wanted === 'doc' || wanted === 'docs' || wanted === 'document') type = 'doc';
-  else if (wanted === 'video') type = 'video';
-  else if (wanted === 'news') type = 'news';
-  if (!type) return results;
-  const matching = results.filter(r => type === 'gov' ? isGovUrl(r.url) : type === 'doc' ? (r.type === 'doc' || isDocUrl(r.url)) : r.type === type);
-  if (matching.length) return matching;
-  warnings.push(`No ${type} result was discovered; broader live results were retained.`);
-  return results;
-}
-
-function diversifyAndSelect(results, count, intent) {
-  const pool = [...results].sort((a, b) => (b._score || 0) - (a._score || 0));
-  if (pool.length <= count) return pool;
-  const selected = [];
-  const domains = new Map(), types = new Map();
-  const newsOnly = intent.wantsNews && !intent.wantsVideo && !intent.wantsDocs;
-  const newsShare = newsOnly ? 0.72 : 0.52;
-  while (selected.length < count && pool.length) {
-    let bestIndex = 0, bestAdjusted = -Infinity;
-    for (let i = 0; i < pool.length; i++) {
-      const r = pool[i];
-      const d = hostname(r.url), t = r.type || 'web';
-      const dPenalty = Math.min(7, (domains.get(d) || 0) * 2.5);
-      const typeCount = types.get(t) || 0;
-      let typePenalty = Math.min(4, typeCount * 0.7);
-      if (newsOnly && t === 'news' && typeCount < Math.ceil(count * newsShare)) typePenalty *= 0.3;
-      const adjusted = (r._score || 0) - dPenalty - typePenalty;
-      if (adjusted > bestAdjusted) { bestAdjusted = adjusted; bestIndex = i; }
-    }
-    const chosen = pool.splice(bestIndex, 1)[0];
-    selected.push(chosen);
-    const d = hostname(chosen.url), t = chosen.type || 'web';
-    domains.set(d, (domains.get(d) || 0) + 1);
-    types.set(t, (types.get(t) || 0) + 1);
-  }
-  return selected;
-}
-
-function contentPriorityScore(r, query, intent, dateIntent) {
-  let score = Number(r._score || 0);
-  const u = String(r.url || '');
-  if (isBlockedContentUrl(u)) score -= 100;
-  if (isPublisherCandidateUrl(u, r)) score += 4;
-  if (r.publisherResolved) score += 6;
-  if (/^https?:\/\/www\.(bing|google|search\.)\w+/i.test(u)) score -= 30;
-  if (/^news\.google\.com$/i.test(hostname(u))) score -= 35;
-  if (r.contentMethod === 'tavily-raw-content') score += 12;
-  if (r.contentStatus === 'snippet_fallback') score += 2;
-  if (r.contentStatus === 'full' || r.contentStatus === 'reader' || r.contentStatus === 'alternate') score -= 3;
-  const terms = extractSearchTerms(query);
-  const title = String(r.title || '').toLowerCase();
-  const matched = terms.filter(t => title.includes(t)).length;
-  score += Math.min(10, matched * 1.5);
-  if (intent.wantsNews && r.type === 'news') score += 5;
-  score += scoreDate(r.publishedAt, dateIntent);
-  return score;
-}
-
-function selectVerificationCandidates(results, count) {
-  const selected = [];
-  const urls = new Set();
-  for (const r of results) {
-    if (selected.length >= count) break;
-    const key = normalizedKey(r.url);
-    if (!safeHttpUrl(r.url) || urls.has(key)) continue;
-    selected.push(r);
-    urls.add(key);
-  }
-  return selected;
-}
-
-function resolveLinkFromHtml(html, baseUrl, result = null) {
-  const candidates = [];
-  const addCandidate = (raw, anchorText = '', source = '') => {
-    const u = cleanUrl(raw, baseUrl);
-    if (!u || !isPublisherCandidateUrl(u, result)) return;
-    const anchor = cleanExtractedText(stripTags(anchorText || ''));
-    const sim = titleSimilarity(String(result?.title || ''), anchor);
-    // For a news wrapper we want the title-matching article link, not an arbitrary deep link.
-    if (source === 'anchor' && sim < 0.35) return;
-    const score = candidatePublisherScore(u, result, anchor);
-    if (!Number.isFinite(score)) return;
-    candidates.push({ url: u, score, source, sim });
-  };
-
-  const redirectMeta = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']/i)?.[1];
-  if (redirectMeta) addCandidate(redirectMeta, String(result?.title || ''), 'meta-refresh');
-
-  for (const m of html.matchAll(/(?:location\.href|location\.replace|window\.location(?:\.href)?)[\s=]*(?:\(|)["']([^"']+)["']/gi)) {
-    addCandidate(m[1], String(result?.title || ''), 'javascript-redirect');
-  }
-
-  for (const m of html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
-    addCandidate(m[1], m[2], 'anchor');
-  }
-
-  candidates.sort((a, b) => b.score - a.score);
-  const best = candidates[0];
-  if (best && (best.sim >= 0.35 || publisherHostHint(result) && normalizedHost(best.url) === publisherHostHint(result))) return best.url;
-  return null;
-}
-
-async function resolveNewsWrapper(result, deadline) {
-  if (!/^news\.google\.com$/i.test(hostname(result.url))) return result;
-  let wrapper;
-  try { wrapper = new URL(result.url); } catch { return result; }
-  if (!/^\/rss\/articles\//i.test(wrapper.pathname)) return result;
-
-  // First try the real HTTP redirect.
-  if (remainingMs(deadline) > 900) {
-    try {
-      const res = await fetchResponse(result.url, {
-        timeout: NEWS_RESOLVE_TIMEOUT_MS,
-        deadline,
-        headers: { accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1' },
-      });
-      const finalUrl = cleanUrl(res.url || result.url, result.url);
-      if (finalUrl && isPublisherCandidateUrl(finalUrl, result)) {
-        try { await res.body?.cancel?.(); } catch {}
-        return { ...result, publisherWrapperUrl: result.url, url: finalUrl, domain: hostname(finalUrl), publisherResolved: true, publisherResolutionMethod: 'redirect' };
-      }
-      const html = await readBodyText(res, 220_000, deadline).catch(() => '');
-      const embedded = resolveLinkFromHtml(html, result.url, result);
-      if (embedded) return { ...result, publisherWrapperUrl: result.url, url: embedded, domain: hostname(embedded), publisherResolved: true, publisherResolutionMethod: 'wrapper-html' };
-    } catch {}
-  }
-  return result;
-}
-
-async function publisherHomeLookup(result, deadline) {
-  if (!/^news\.google\.com$/i.test(hostname(result.url))) return result;
-  const sourceUrl = cleanUrl(result.publisherUrl, result.url);
-  const host = normalizedHost(sourceUrl);
-  if (!sourceUrl || !host || !isPublisherCandidateUrl(sourceUrl, result) || remainingMs(deadline) < 1700) return result;
-  try {
-    const res = await fetchResponse(sourceUrl, {
-      timeout: 2500, deadline,
-      headers: { accept: 'text/html,application/xhtml+xml;q=0.95,*/*;q=0.2' },
-    });
-    if (!res.ok) { try { await res.body?.cancel?.(); } catch {} return result; }
-    const html = await readBodyText(res, 650_000, deadline);
-    const anchors = [];
-    for (const m of html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
-      const href = cleanUrl(m[1], sourceUrl);
-      const text = cleanExtractedText(stripTags(m[2]));
-      if (!href || !text || !isPublisherCandidateUrl(href, result)) continue;
-      const sim = titleSimilarity(result.title, text);
-      if (sim < 0.55) continue;
-      anchors.push({ href, text, sim, score: sim * 100 + candidatePublisherScore(href, result, text) });
-    }
-    anchors.sort((a, b) => b.score - a.score);
-    const best = anchors[0];
-    if (best) {
-      try { await res.body?.cancel?.(); } catch {}
-      return { ...result, publisherWrapperUrl: result.url, url: best.href, domain: hostname(best.href), publisherUrl: sourceUrl, publisherResolved: true, publisherResolutionMethod: 'publisher-home-title-link' };
-    }
-  } catch {}
-  return result;
-}
-
-async function publisherLookupByTitle(result, deadline) {
-  if (!/^news\.google\.com$/i.test(hostname(result.url))) return result;
-  if (!result.title || remainingMs(deadline) < 1200) return result;
-
-  const title = String(result.title).replace(/["']/g, ' ').replace(/\s+/g, ' ').trim();
-  const source = String(result.source || '').replace(/^google-news:/, '').trim();
-  const publisherHost = publisherHostHint(result);
-  const queries = [];
-  if (publisherHost) queries.push(`"${truncate(title, 220)}" site:${publisherHost}`);
-  if (source) queries.push(`"${truncate(title, 220)}" ${source}`);
-  queries.push(`"${truncate(title, 220)}"`);
-
-  const engineBases = [
-    q => `https://www.bing.com/search?q=${encodeURIComponent(q)}&count=10&setlang=en-IN&cc=in`,
-    q => `https://www.google.com/search?q=${encodeURIComponent(q)}&num=10&hl=en&gl=in`,
-  ];
-
-  for (const q of queries.slice(0, 3)) {
-    for (const makeUrl of engineBases) {
-      if (remainingMs(deadline) < 1000) break;
-      try {
-        const engineUrl = makeUrl(q);
-        const html = await fetchText(engineUrl, { timeout: 2200, maxBytes: 400_000, deadline });
-        const found = engineUrl.includes('bing') ? parseBing(html) : parseGoogleWeb(html);
-        const scored = found.map(r => {
-          if (!isPublisherCandidateUrl(r.url, result)) return null;
-          const sim = titleSimilarity(title, r.title);
-          const host = normalizedHost(r.url);
-          if (sim < 0.5) return null;
-          if (publisherHost && !(host === publisherHost || host.endsWith(`.${publisherHost}`))) return null;
-          return { r, score: sim * 60 + candidatePublisherScore(r.url, result, r.title) };
-        }).filter(Boolean).sort((a, b) => b.score - a.score);
-        const candidate = scored[0]?.r;
-        if (candidate) {
-          return {
-            ...result, publisherWrapperUrl: result.url, url: candidate.url, domain: hostname(candidate.url),
-            publisherResolved: true, publisherResolutionMethod: publisherHost ? 'targeted-title-search' : 'title-search',
-            publisherSearchSource: candidate.source,
-          };
-        }
-      } catch {}
-    }
-  }
-  return result;
-}
-
-function readerUrl(url) {
-  return `https://r.jina.ai/http://${new URL(url).host}${new URL(url).pathname}${new URL(url).search}`;
-}
-
-function readerUrls(url) {
-  try {
-    const u = new URL(url);
-    const raw = u.href;
-    const noHash = `${u.origin}${u.pathname}${u.search}`;
-    return [
-      `https://r.jina.ai/http://${u.host}${u.pathname}${u.search}`,
-      `https://r.jina.ai/https://${u.host}${u.pathname}${u.search}`,
-      `https://r.jina.ai/${raw}`,
-      `https://r.jina.ai/${noHash}`,
-    ].filter((v, i, a) => a.indexOf(v) === i);
-  } catch { return []; }
-}
-
-function parseReaderMetadata(raw) {
-  const text = String(raw || '');
-  const title = (text.match(/^Title:\s*(.+)$/im) || [, ''])[1]?.trim() || '';
-  const sourceUrl = (text.match(/^URL Source:\s*(\S+)$/im) || [, ''])[1]?.trim() || '';
-  return { title, sourceUrl };
-}
-
-function readerMatchesTarget(raw, result, requestedUrl) {
-  const meta = parseReaderMetadata(raw);
-  const targetTitle = String(result?.title || '').trim();
-  const sim = meta.title && targetTitle ? titleSimilarity(targetTitle, meta.title) : 0;
-  const sourceHost = normalizedHost(requestedUrl);
-  const readerHost = normalizedHost(meta.sourceUrl);
-  const hostMatch = Boolean(sourceHost && readerHost && (sourceHost === readerHost || readerHost.endsWith(`.${sourceHost}`) || sourceHost.endsWith(`.${readerHost}`)));
-  const isNewsLike = result?.type === 'news' || result?.type === 'doc' || ARTICLE_PATH_HINT.test(requestedUrl || '');
-  const rawText = String(raw || '').slice(0, 7000);
-  const tokenEvidence = queryConcepts(targetTitle || '').filter(c => textHasConcept(rawText, c)).length;
-  const titleKnown = Boolean(targetTitle && meta.title);
-
-  if (isNewsLike && meta.sourceUrl && !hostMatch) return { ok: false, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
-  if (titleKnown && sim < (isNewsLike ? 0.32 : 0.22) && tokenEvidence === 0) {
-    return { ok: false, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
-  }
-  if (isNewsLike && titleKnown && sim < 0.28 && tokenEvidence < 1) {
-    return { ok: false, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
-  }
-  return { ok: true, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
-}
-
-async function readerFallback(url, deadline, result = null) {
-  if (!safeHttpUrl(url) || isBlockedContentUrl(url) || remainingMs(deadline) < 800) return null;
-  const urls = readerUrls(url).slice(0, 2);
-  for (const proxyUrl of urls) {
-    if (remainingMs(deadline) < 650) break;
-    try {
-      const timeout = effectiveTimeout(READER_TIMEOUT_MS, deadline, 500);
-      if (!timeout) break;
-      const res = await fetchResponse(proxyUrl, {
-        timeout, deadline,
-        headers: { accept: 'text/plain,text/markdown;q=0.95,*/*;q=0.1' },
-      });
-      if (!res.ok) { try { await res.body?.cancel?.(); } catch {} continue; }
-      const raw = await readBodyText(res, Math.min(MAX_PAGE_BYTES, 500_000), deadline);
-      const match = readerMatchesTarget(raw, result, url);
-      if (!match.ok) continue;
-      const text = textFromMarkdown(raw);
-      if (text.length < 250) continue;
-      return {
-        content: text,
-        method: 'jina-reader',
-        sourceUrl: match.sourceUrl || url,
-        title: match.title || null,
-        titleSimilarity: Number(match.titleSimilarity.toFixed(2)),
-      };
-    } catch {}
-  }
-  return null;
-}
-
-async function fetchVariantContent(url, deadline, result = null) {
-  if (!isPublisherCandidateUrl(url)) return null;
-  try {
-    const u = new URL(url);
-    const candidates = [];
-    if (!/\/amp\/?$/i.test(u.pathname)) candidates.push(new URL(`${u.pathname.replace(/\/$/, '')}/amp${u.search}`, u.origin).href);
-    if (!/[?&](output|amp)=/i.test(u.search)) candidates.push(`${u.href}${u.search ? '&' : '?'}output=1`);
-    const rows = await mapConcurrent(candidates.slice(0, 2), 2, async candidate => {
-      if (remainingMs(deadline) < 850) return null;
-      try {
-        const res = await fetchResponse(candidate, { timeout: 1900, deadline, headers: { accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1' } });
-        if (!res.ok) { try { await res.body?.cancel?.(); } catch {} return null; }
-        const html = await readBodyText(res, 520_000, deadline);
-        const title = parseTitleFromHtml(html) || result?.title || '';
-        const finalUrl = cleanUrl(res.url || candidate, url) || candidate;
-        const text = extractVisibleText(html);
-        const assessment = assessHtmlContent(html, text, result || {}, finalUrl, title);
-        if (text.length < 250 || !assessment.acceptable) return null;
-        return { content: text, method: 'alternate-page', title, publishedAt: parseDateFromHtml(html) || null, finalUrl, titleSimilarity: assessment.titleSimilarity };
-      } catch { return null; }
-    });
-    return rows.filter(Boolean).sort((a, b) => b.content.length - a.content.length)[0] || null;
-  } catch {}
-  return null;
-}
-
-function bytesToLatin1(bytes) {
-  let out = '';
-  const step = 8192;
-  for (let i = 0; i < bytes.length; i += step) out += String.fromCharCode(...bytes.subarray(i, Math.min(bytes.length, i + step)));
-  return out;
-}
-
-function decodePdfLiteral(raw) {
-  let s = String(raw || '');
-  s = s.replace(/\\([nrtbf\\()])/g, (_, c) => ({ n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', '\\': '\\', '(': '(', ')': ')' })[c] || c);
-  s = s.replace(/\\([0-7]{1,3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)));
-  return s;
-}
-
-function decodePdfHex(raw) {
-  const hex = String(raw || '').replace(/[^0-9a-f]/gi, '');
-  if (!hex) return '';
-  const even = hex.length % 2 ? `${hex}0` : hex;
-  const bytes = new Uint8Array(even.length / 2);
-  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(even.slice(i * 2, i * 2 + 2), 16);
-  try {
-    if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes.slice(2));
-  } catch {}
-  return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-}
-
-function extractPdfStrings(stream) {
-  const out = [];
-  let i = 0;
-  while (i < stream.length) {
-    if (stream[i] === '(') {
-      let depth = 1, j = i + 1, escaped = false;
-      for (; j < stream.length; j++) {
-        const ch = stream[j];
-        if (escaped) { escaped = false; continue; }
-        if (ch === '\\') { escaped = true; continue; }
-        if (ch === '(') depth++;
-        else if (ch === ')') { depth--; if (depth === 0) break; }
-      }
-      if (j < stream.length) {
-        const text = decodePdfLiteral(stream.slice(i + 1, j));
-        if (text.trim()) out.push(text);
-        i = j + 1; continue;
-      }
-    }
-    if (stream[i] === '<' && stream[i + 1] !== '<') {
-      const j = stream.indexOf('>', i + 1);
-      if (j > i) {
-        const text = decodePdfHex(stream.slice(i + 1, j));
-        if (text.trim()) out.push(text);
-        i = j + 1; continue;
-      }
-    }
-    i++;
-  }
-  return out.join(' ');
-}
-
-async function inflateDeflate(bytes, deadline) {
-  if (typeof DecompressionStream === 'undefined' || remainingMs(deadline) < 600) return null;
-  const controller = new AbortController();
-  const timeout = effectiveTimeout(PDF_DECOMPRESS_TIMEOUT_MS, deadline, 500);
-  if (!timeout) return null;
-  const timer = setTimeout(() => controller.abort(), timeout);
-  try {
-    const ds = new DecompressionStream('deflate');
-    const writer = ds.writable.getWriter();
-    await writer.write(bytes); await writer.close();
-    const ab = await new Response(ds.readable).arrayBuffer();
-    if (controller.signal.aborted) return null;
-    return new Uint8Array(ab);
-  } catch { return null; }
-  finally { clearTimeout(timer); }
-}
-
-async function extractPdfText(bytes, deadline) {
-  const raw = bytesToLatin1(bytes);
+  let succeeded = 0;
   const results = [];
-  const re = /<<(?:[\s\S]{0,7000}?)>>\s*stream\r?\n([\s\S]*?)\r?\nendstream/g;
-  let m;
-  while ((m = re.exec(raw)) && results.length < 100) {
-    if (remainingMs(deadline) < 700) break;
-    const dict = m[0].slice(0, Math.max(0, m[0].indexOf('stream')));
-    const payloadStart = m.index + m[0].indexOf(m[1]);
-    const payloadEnd = payloadStart + m[1].length;
-    const source = bytes.slice(payloadStart, payloadEnd);
-    if (/\/FlateDecode/i.test(dict)) {
-      const inflated = await inflateDeflate(source, deadline);
-      if (inflated) results.push(bytesToLatin1(inflated));
-    } else results.push(m[1]);
+  for (const row of rows) {
+    if (row.status !== 'fulfilled') continue;
+    if (row.value?.ok) succeeded++;
+    results.push(...(row.value?.results || []));
   }
-  return truncate(cleanExtractedText(results.map(extractPdfStrings).join(' ')), MAX_TEXT_CHARS);
+  return { results: dedupeCandidates(results), calls: jobs.length, succeeded };
 }
 
-function extractPlayerResponse(html) {
-  return findJsonObjectAfterMarker(html, 'ytInitialPlayerResponse') || findJsonObjectAfterMarker(html, 'PLAYER_RESPONSE');
-}
-
-function chooseCaptionTrack(tracks) {
-  if (!Array.isArray(tracks) || !tracks.length) return null;
-  return tracks.find(t => /^en(?:-|$)/i.test(t?.languageCode || '')) || tracks.find(t => /^en/i.test(t?.languageCode || '')) || tracks[0];
-}
-
-function captionXmlToText(xml) {
-  const rows = [];
-  for (const m of String(xml || '').matchAll(/<text\b[^>]*>([\s\S]*?)<\/text>/gi)) {
-    const text = decodeHtml(m[1]).replace(/\s+/g, ' ').trim();
-    if (text) rows.push(text);
-  }
-  return truncate(rows.join(' '), MAX_TRANSCRIPT_CHARS);
-}
-
-async function youtubePlayer(videoId, deadline) {
-  const url = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=en&gl=IN`;
-  const html = await fetchText(url, { timeout: YOUTUBE_TIMEOUT_MS, maxBytes: MAX_YOUTUBE_BYTES, deadline });
-  const player = extractPlayerResponse(html);
-  if (player) return { player, html };
-  const apiKey = (html.match(/"INNERTUBE_API_KEY":"([^"]+)"/) || [, ''])[1];
-  if (!apiKey || remainingMs(deadline) < 900) return { player: null, html };
-  const timeout = effectiveTimeout(YOUTUBE_TIMEOUT_MS, deadline, 700);
-  if (!timeout) return { player: null, html };
+async function groqRerank(query, results, deadline) {
+  const key = env('GROQ_API_KEY');
+  if (!key || results.length < 3 || left(deadline) < 520) return null;
   const controller = new AbortController();
+  const timeout = Math.min(AI_RERANK_TIMEOUT_MS, Math.max(450, left(deadline) - 100));
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    const res = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${encodeURIComponent(apiKey)}`, {
-      method: 'POST', signal: controller.signal,
-      headers: { 'content-type': 'application/json', 'user-agent': USER_AGENT },
-      body: JSON.stringify({ context: { client: { clientName: 'WEB', clientVersion: (html.match(/"INNERTUBE_CLIENT_VERSION":"([^"]+)"/) || [, '2.20260915.01.00'])[1], hl: 'en', gl: 'IN' } }, videoId }),
-    });
-    if (!res.ok) return { player: null, html };
-    return { player: await res.json(), html };
-  } catch { return { player: null, html }; }
-  finally { clearTimeout(timer); }
-}
-
-async function enrichYouTubeResult(result, query, deadline) {
-  const videoId = String(result.url || '').match(/(?:v=|youtu\.be\/|shorts\/)([A-Za-z0-9_-]{6,20})/i)?.[1];
-  if (!videoId) return ensureContentFields(result, query, { status: 'snippet_fallback', method: 'search-snippet' });
-  try {
-    const { player } = await youtubePlayer(videoId, deadline);
-    const details = player?.videoDetails || {};
-    const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-    const track = chooseCaptionTrack(tracks);
-    let transcript = null;
-    if (track?.baseUrl && remainingMs(deadline) > 900) {
-      try {
-        const res = await fetchResponse(track.baseUrl, { timeout: 4500, deadline, headers: { accept: 'text/xml,application/xml,text/plain;q=0.9,*/*;q=0.2' } });
-        if (res.ok) transcript = captionXmlToText(await readBodyText(res, 900_000, deadline));
-      } catch {}
-    }
-    const description = decodeHtml(details.shortDescription || result.snippet || '').trim();
-    const title = decodeHtml(details.title || result.title || '').trim() || result.title;
-    const content = transcript ? `YouTube transcript:\n${transcript}` : (description || extractFallbackContent(result, query));
-    return ensureContentFields({
-      ...result,
-      title: truncate(title, 300),
-      snippet: truncate(description || transcript || result.snippet || '', 1200),
-      verified: Boolean(player),
-      httpStatus: player ? 200 : null,
-      contentType: player ? 'application/json' : null,
-      transcript: transcript || null,
-      transcriptAvailable: Boolean(transcript),
-      transcriptLanguage: track?.languageCode || null,
-    }, query, {
-      status: transcript ? 'full' : player ? 'metadata' : 'snippet_fallback',
-      method: transcript ? 'youtube-captions' : player ? 'youtube-metadata' : 'search-snippet',
-      content,
-      confidence: transcript ? 0.98 : player ? 0.7 : 0.35,
-    });
-  } catch (error) {
-    return ensureContentFields(result, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(result, query), confidence: 0.35, error: error?.message || 'YOUTUBE_ENRICH_FAILED' });
-  }
-}
-
-function ensureContentFields(result, query, info = {}) {
-  const existing = cleanExtractedText(info.content || result.pageContent || result.extractedText || '');
-  const fallback = existing || extractFallbackContent(result, query);
-  const status = info.status || (existing ? 'full' : 'synthetic_metadata');
-  const method = info.method || (existing ? 'existing-content' : 'metadata-fallback');
-  return {
-    ...result,
-    pageContent: truncate(fallback, MAX_TEXT_CHARS),
-    extractedText: truncate(fallback, MAX_TEXT_CHARS),
-    contentStatus: status,
-    contentMethod: method,
-    contentLength: fallback.length,
-    contentConfidence: Number(Math.max(0, Math.min(1, info.confidence ?? (status === 'full' ? 1 : status === 'reader' ? 0.95 : status === 'alternate' ? 0.9 : status === 'metadata' ? 0.7 : 0.35))).toFixed(2)),
-    contentSourceUrl: result.url,
-    contentAvailable: fallback.length > 0,
-    contentError: info.error || result.contentError || null,
-  };
-}
-
-
-function titleSimilarity(a, b) {
-  const aa = new Set(extractSearchTerms(String(a || '')));
-  const bb = new Set(extractSearchTerms(String(b || '')));
-  if (!aa.size || !bb.size) return 0;
-  let hits = 0;
-  for (const token of aa) if (bb.has(token)) hits++;
-  return hits / Math.max(aa.size, bb.size);
-}
-
-function looksLikeJavaScriptBody(body, contentType) {
-  const ct = String(contentType || '').toLowerCase();
-  if (/javascript|ecmascript/.test(ct)) return true;
-  const sample = String(body || '').slice(0, 6000).trim();
-  if (!sample) return false;
-  if (/^(?:!function|function\s+|\(function|window\.|document\.|(?:var|let|const)\s+[A-Za-z_$]|[A-Za-z_$][\w$]*\s*=\s*function)/i.test(sample)) return true;
-  if (/(?:google-analytics|googletagmanager|gtag\(|google_tag_manager|doubleclick|dataLayer\.push|window\.__)/i.test(sample)) return true;
-  return false;
-}
-
-function assessHtmlContent(html, text, result, finalUrl, title) {
-  const bodyText = String(text || '').trim();
-  const lowerHtml = String(html || '').toLowerCase();
-  let score = 0;
-  const signals = [];
-  if (/<article\b/i.test(html)) { score += 5; signals.push('article'); }
-  if (/<main\b/i.test(html)) { score += 3; signals.push('main'); }
-  if (/<h1\b/i.test(html)) { score += 2; signals.push('h1'); }
-  if (/<time\b/i.test(html) || /datepublished|datepublished/i.test(html)) { score += 1; signals.push('date'); }
-  if (/application\/ld\+json/i.test(lowerHtml) && /articlebody|newsarticle|article/i.test(lowerHtml)) { score += 4; signals.push('jsonld-article'); }
-  const pCount = (html.match(/<p\b/gi) || []).length;
-  if (pCount >= 5) { score += 2; signals.push('paragraphs'); }
-  if (pCount >= 12) { score += 1; signals.push('many-paragraphs'); }
-  const sim = titleSimilarity(result.title, title);
-  const originalDepth = pathDepth(result.url);
-  const finalDepth = pathDepth(finalUrl);
-  const targetTitleKnown = Boolean(String(result?.title || '').trim() && String(title || '').trim());
-  const severeTitleMismatch = targetTitleKnown && sim < (result.type === 'news' ? 0.32 : result.type === 'doc' ? 0.22 : 0.18);
-  const suspiciousCanonicalCollapse = originalDepth >= 2 && finalDepth <= 1 && sim < 0.45;
-  if (sim >= 0.75) { score += 5; signals.push('title-match'); }
-  else if (sim >= 0.45) { score += 3; signals.push('title-partial-match'); }
-  else if (sim >= 0.18) { score += 1; signals.push('title-weak-match'); }
-  if (ARTICLE_PATH_HINT.test(finalUrl)) { score += 2; signals.push('article-path'); }
-  if (severeTitleMismatch) { score -= 8; signals.push('target-title-mismatch'); }
-  if (suspiciousCanonicalCollapse) { score -= 8; signals.push('canonical-collapse'); }
-  if (bodyText.length >= 1500) { score += 2; signals.push('long-text'); }
-  if (bodyText.length >= 5000) { score += 1; signals.push('very-long-text'); }
-  if (/google-analytics|googletagmanager|doubleclick|dataLayer\.push|gtag\(/i.test(bodyText.slice(0, 12000))) {
-    score -= 20; signals.push('tracking-code');
-  }
-  if (/^untitled$|enable javascript|javascript required/i.test(String(title || ''))) score -= 4;
-
-  const minimum = result.type === 'news' ? 8 : 5;
-  const acceptable = bodyText.length >= 350 && score >= minimum && !severeTitleMismatch && !suspiciousCanonicalCollapse;
-  return { acceptable, score, signals, titleSimilarity: Number(sim.toFixed(2)) };
-}
-
-function contentTypeIsPageLike(contentType, body) {
-  const ct = String(contentType || '').toLowerCase();
-  if (/javascript|ecmascript|json|xml|css|image\/|font\//i.test(ct)) return false;
-  return /text\/html|application\/xhtml/i.test(ct) || /<html\b/i.test(String(body || ''));
-}
-
-async function enrichResult(result, query, deadline) {
-  if (result.type === 'video' && isYouTube(result.url)) return enrichYouTubeResult(result, query, deadline);
-  if (!safeHttpUrl(result.url)) return ensureContentFields({ ...result, verified: false, verificationError: 'UNSAFE_URL' }, query);
-
-  if (isBlockedContentUrl(result.url)) {
-    return ensureContentFields({ ...result, verified: false, verificationError: 'BLOCKED_NON_CONTENT_URL' }, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(result, query), confidence: 0.35, error: 'BLOCKED_NON_CONTENT_URL' });
-  }
-
-  const fallbackBase = ensureContentFields(result, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(result, query), confidence: 0.35 });
-  try {
-    if (remainingMs(deadline) < 650) return fallbackBase;
-
-    const res = await fetchResponse(result.url, {
-      timeout: PAGE_TIMEOUT_MS,
-      deadline,
-      headers: {
-        accept: 'text/html,application/xhtml+xml;q=0.95,application/pdf;q=0.9,text/plain;q=0.9,application/json;q=0.8,*/*;q=0.2',
-        'cache-control': 'no-cache', pragma: 'no-cache',
-      },
-    });
-
-    const finalUrl = cleanUrl(res.url || result.url, result.url) || result.url;
-    const contentType = res.headers.get('content-type') || '';
-
-    if (!isPublisherCandidateUrl(finalUrl, result)) {
-      try { await res.body?.cancel?.(); } catch {}
-      if (result.publisherWrapperUrl && !result._publisherRetry && remainingMs(deadline) > 2200) {
-        const retryBase = { ...result, url: result.publisherWrapperUrl, _publisherRetry: true };
-        const retry = await publisherLookupByTitle(retryBase, deadline);
-        if (retry?.url && retry.url !== result.publisherWrapperUrl && isPublisherCandidateUrl(retry.url, result)) {
-          return enrichResult(retry, query, deadline);
-        }
-      }
-      return ensureContentFields({ ...result, verified: false, verificationError: 'NON_CONTENT_FINAL_URL', httpStatus: res.status, contentType }, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(result, query), confidence: 0.35, error: 'NON_CONTENT_FINAL_URL' });
-    }
-
-    if (/application\/pdf/i.test(contentType) || /\.pdf(?:\?|$)/i.test(finalUrl)) {
-      const bytes = await readBodyBytes(res, MAX_PAGE_BYTES, deadline);
-      let pdfText = '';
-      try { pdfText = await extractPdfText(bytes, deadline); } catch {}
-      if (!pdfText && remainingMs(deadline) > 1500) {
-        const reader = await readerFallback(finalUrl, deadline, result);
-        if (reader?.content) pdfText = reader.content;
-      }
-      return ensureContentFields({
-        ...result, url: finalUrl, domain: hostname(finalUrl), verified: res.ok,
-        httpStatus: res.status, contentType: contentType || 'application/pdf',
-        verificationMethod: pdfText ? 'direct-pdf-text' : 'direct-pdf-no-text',
-      }, query, {
-        status: pdfText ? 'full' : 'metadata',
-        method: pdfText ? 'direct-pdf-text' : 'pdf-metadata',
-        content: pdfText || extractFallbackContent({ ...result, url: finalUrl }, query),
-        confidence: pdfText ? 0.96 : 0.45,
-      });
-    }
-
-    if (!res.ok) {
-      try { await res.body?.cancel?.(); } catch {}
-      return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: false, httpStatus: res.status, contentType }, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent({ ...result, url: finalUrl }, query), confidence: 0.35, error: `HTTP_${res.status}` });
-    }
-
-    const body = await readBodyText(res, MAX_PAGE_BYTES, deadline);
-    if (result.type === 'news' && /^news\.google\.com$/i.test(hostname(finalUrl))) {
-      return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: false, httpStatus: res.status, contentType, verificationError: 'PUBLISHER_URL_NOT_RESOLVED' }, query);
-    }
-
-    if (looksLikeJavaScriptBody(body, contentType) || !contentTypeIsPageLike(contentType, body)) {
-      return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: false, httpStatus: res.status, contentType, verificationError: 'NON_ARTICLE_CONTENT' }, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent({ ...result, url: finalUrl }, query), confidence: 0.35, error: 'NON_ARTICLE_CONTENT' });
-    }
-
-    const htmlLike = contentTypeIsPageLike(contentType, body);
-    if (htmlLike) {
-      const canonical = parseCanonical(body, finalUrl);
-      const canonicalUrl = canonical && isPublisherCandidateUrl(canonical, result) ? canonical : finalUrl;
-      const title = parseTitleFromHtml(body) || result.title;
-      const description = parseMeta(body, 'description') || parseMeta(body, 'og:description') || result.snippet;
-      const publishedAt = parseDateFromHtml(body) || result.publishedAt || null;
-      let content = extractVisibleText(body);
-      let method = 'direct-html';
-      let status = 'metadata';
-      let confidence = 0.55;
-      let assessment = assessHtmlContent(body, content, result, canonicalUrl, title);
-
-      // Deliberately no serial fallback here. Alternate/Jina fallbacks are launched
-      // concurrently in performSearch for only the candidates that actually need them.
-
-      if (content.length >= 350 && assessment.acceptable && !looksLikeJavaScriptBody(content, contentType)) {
-        status = status === 'metadata' ? 'full' : status;
-        if (status === 'full') confidence = 0.9;
-        return ensureContentFields({
-          ...result, url: canonicalUrl, domain: hostname(canonicalUrl), title: truncate(title, 300),
-          snippet: truncate(description || result.snippet, 1200), publishedAt, verified: true,
-          httpStatus: res.status, contentType, verificationMethod: method,
-          contentSignals: assessment.signals, contentQualityScore: assessment.score,
-          titleSimilarity: assessment.titleSimilarity,
-          contentTitleSimilarity: assessment.titleSimilarity,
-          contentTargetMatched: true,
-        }, query, { status, method, content, confidence });
-      }
-
-      const fallback = `${description ? `Description: ${description}\n` : ''}${extractFallbackContent({ ...result, title, snippet: description || result.snippet, url: canonicalUrl, publishedAt }, query)}`;
-      return ensureContentFields({
-        ...result, url: canonicalUrl, domain: hostname(canonicalUrl), title: truncate(title, 300),
-        snippet: truncate(description || result.snippet, 1200), publishedAt, verified: true,
-        httpStatus: res.status, contentType, verificationMethod: 'search-snippet',
-        contentSignals: assessment.signals, contentQualityScore: assessment.score,
-        titleSimilarity: assessment.titleSimilarity,
-      }, query, { status: 'snippet_fallback', method: 'search-snippet', content: fallback, confidence: 0.35, error: 'ARTICLE_CONTENT_NOT_VALIDATED' });
-    }
-
-    const plain = cleanExtractedText(body);
-    const plainTitleSimilarity = titleSimilarity(result.title, plain.slice(0, 1200));
-    const plainQueryEvidence = extractSearchTerms(query).some(t => plain.toLowerCase().includes(t));
-    const plainTargetMatched = result.type === 'news' || result.type === 'doc' ? plainQueryEvidence : true;
-    if (plain.length >= 250 && plainTargetMatched && !looksLikeJavaScriptBody(plain, contentType) && !isBlockedContentUrl(finalUrl)) {
-      return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: true, httpStatus: res.status, contentType, verificationMethod: 'direct-text', contentTargetMatched: true, contentTitleSimilarity: plainTitleSimilarity }, query, {
-        status: 'full', method: 'direct-text', content: plain, confidence: 0.82,
-      });
-    }
-    return ensureContentFields({ ...result, url: finalUrl, domain: hostname(finalUrl), verified: false, httpStatus: res.status, contentType, verificationError: 'TEXT_CONTENT_NOT_VALIDATED' }, query, {
-      status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent({ ...result, url: finalUrl }, query), confidence: 0.35, error: 'TEXT_CONTENT_NOT_VALIDATED',
-    });
-  } catch (error) {
-    return ensureContentFields({ ...result, verified: false, verificationError: error?.message || 'ENRICH_FAILED' }, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(result, query), confidence: 0.35, error: error?.message || 'ENRICH_FAILED' });
-  }
-}
-
-function extractJson(text) {
-  if (!text) return null;
-  try { return JSON.parse(text); } catch {}
-  const m = String(text).match(/\{[\s\S]*\}/);
-  if (!m) return null;
-  try { return JSON.parse(m[0]); } catch { return null; }
-}
-
-async function callGroq(messages, maxTokens, timeoutMs, deadline) {
-  const key = typeof process !== 'undefined' ? process.env?.GROQ_API_KEY : undefined;
-  if (!key) return null;
-  const timeout = effectiveTimeout(timeoutMs, deadline, 600);
-  if (!timeout) return null;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-  try {
+    const payload = results.slice(0, 30).map((r, i) => ({ id: i, title: truncate(r.title, 180), domain: normalizeHost(r.url), type: r.type, relevanceScore: r.relevanceScore, snippet: truncate(r.snippet, 240) }));
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST', signal: controller.signal,
+      method: 'POST',
+      signal: controller.signal,
       headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'openai/gpt-oss-20b', messages, temperature: 0.1, max_completion_tokens: maxTokens }),
+      body: JSON.stringify({
+        model: 'openai/gpt-oss-20b',
+        messages: [
+          { role: 'system', content: 'Return JSON only. Reorder provided source IDs for relevance to the user query. Never invent or remove IDs. Prefer exact topic, source quality, requested type and direct evidence.' },
+          { role: 'user', content: JSON.stringify({ query, results: payload, output: { order: [0, 1, 2] } }) },
+        ],
+        temperature: 0,
+        max_completion_tokens: 450,
+      }),
     });
     if (!res.ok) return null;
     const data = await res.json();
-    return data?.choices?.[0]?.message?.content || null;
+    const text = String(data?.choices?.[0]?.message?.content || '');
+    const obj = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || text);
+    if (!Array.isArray(obj?.order)) return null;
+    return obj.order.map(Number).filter(Number.isInteger).filter(i => i >= 0 && i < results.length);
   } catch { return null; }
   finally { clearTimeout(timer); }
 }
 
-async function aiPlan(query, mode, count, dateIntent, deadline) {
-  if (remainingMs(deadline) < 1500) return null;
-  const text = await callGroq([
-    { role: 'system', content: 'You are a web-search query planner. Return JSON only. Never invent URLs. Generate concise, complementary live-web query variants. Respect explicit dates and prefer primary sources.' },
-    { role: 'user', content: JSON.stringify({ query, mode, count, dateIntent, output: { intent: 'web|news|video|gov|doc|mixed', queries: ['...'], freshness: 'live|recent|any', mustPreferOfficial: true } }) },
-  ], 500, 1100, deadline);
-  const parsed = extractJson(text);
-  if (!parsed) return null;
-  return {
-    intent: parsed.intent || 'web',
-    queries: Array.isArray(parsed.queries) ? parsed.queries.filter(Boolean).slice(0, 5) : [],
-    freshness: ['live', 'recent', 'any'].includes(parsed.freshness) ? parsed.freshness : 'any',
-    mustPreferOfficial: Boolean(parsed.mustPreferOfficial),
-  };
-}
+function relevanceAcceptable(result, plan) {
+  if (!result || !isRealSourceContent(result)) return false;
+  const type = plan.type;
+  if (type === 'gov' && !(isGov(result.url) || result.type === 'gov')) return false;
+  if (type === 'doc' && !(isDoc(result.url) || result.type === 'doc')) return false;
+  if (type === 'video' && !(isVideo(result.url) || result.type === 'video')) return false;
+  if (type === 'news' && !(result.type === 'news' || ARTICLE_PATH.test(result.url))) return false;
 
-async function aiRerank(query, results, mode, dateIntent, deadline) {
-  if (results.length < 2 || remainingMs(deadline) < 1800) return null;
-  const payload = results.slice(0, 24).map((r, i) => ({
-    id: i, title: truncate(r.title, 220), url: r.url, domain: hostname(r.url), type: r.type,
-    snippet: truncate(r.snippet, 500), pageContentPreview: truncate(r.pageContent || r.extractedText || '', 2200),
-    publishedAt: r.publishedAt || null, contentStatus: r.contentStatus || null, verified: Boolean(r.verified), trust: r.trust || domainTrust(r.url),
-  }));
-  const text = await callGroq([
-    { role: 'system', content: 'You are a search reranker. Rank only provided result IDs. Prefer exact intent, requested dates, fresh sources, primary/official sources, direct publisher URLs, and results with real content. Return JSON only.' },
-    { role: 'user', content: JSON.stringify({ query, mode, dateIntent, results: payload, output: { order: [0,1], confidence: 0.0 } }) },
-  ], 700, 1400, deadline);
-  const parsed = extractJson(text);
-  if (!parsed || !Array.isArray(parsed.order)) return null;
-  return parsed.order.map(Number).filter(Number.isInteger).filter(i => i >= 0 && i < results.length);
-}
+  const rel = result.relevance || {};
+  const score = Number(result.relevanceScore || 0);
+  const concept = Number(result.contentConceptCoverage ?? rel.conceptCoverage ?? 0);
+  const title = Number(result.contentTitleSimilarity ?? rel.titleCoverage ?? 0);
+  const band = String(result.relevanceBand || '').toLowerCase();
 
-function isRealContentResult(result) {
-  const status = String(result?.contentStatus || '').toLowerCase();
-  const method = String(result?.contentMethod || '').toLowerCase();
-  const content = String(result?.pageContent || result?.extractedText || '').trim();
-  if (!content) return false;
-  if (!['full', 'reader', 'alternate'].includes(status)) return false;
-  if (method === 'search-snippet' || method === 'metadata-fallback') return false;
-  if (isBlockedContentUrl(result?.url)) return false;
-  if (/javascript|ecmascript|json|xml|css|image\//i.test(String(result?.contentType || ''))) return false;
-  if (looksLikeJavaScriptBody(content, result?.contentType || '')) return false;
-  if (result?.contentTargetMatched === false) return false;
-  if ((result?.type === 'news' || result?.type === 'doc') && Number.isFinite(Number(result?.contentTitleSimilarity)) && Number(result.contentTitleSimilarity) < 0.22) return false;
-  return content.length >= 250;
-}
-
-const QUERY_SYNONYMS = {
-  car: ['car', 'cars', 'automobile', 'automobiles', 'vehicle', 'vehicles', 'automotive'],
-  history: ['history', 'historical', 'origins', 'origin', 'evolution', 'timeline'],
-  price: ['price', 'prices', 'cost', 'costs', 'pricing', 'fee', 'fees'],
-  law: ['law', 'laws', 'legal', 'act', 'acts', 'regulation', 'regulations'],
-  policy: ['policy', 'policies', 'scheme', 'schemes', 'programme', 'program', 'initiative', 'initiatives'],
-  company: ['company', 'companies', 'firm', 'firms', 'corporation', 'corporations'],
-  founder: ['founder', 'founded', 'cofounder', 'co-founder', 'founding'],
-  education: ['education', 'school', 'schools', 'college', 'colleges', 'university', 'universities'],
-  population: ['population', 'populations', 'people', 'residents'],
-};
-
-function queryConcepts(query) {
-  const terms = extractSearchTerms(query);
-  const used = new Set();
-  const concepts = [];
-  for (const term of terms) {
-    if (used.has(term)) continue;
-    const key = Object.keys(QUERY_SYNONYMS).find(k => QUERY_SYNONYMS[k].includes(term));
-    const tokens = key ? QUERY_SYNONYMS[key] : [term];
-    concepts.push({ key: key || term, tokens });
-    tokens.forEach(t => used.add(t));
-  }
-  return concepts;
-}
-
-function textHasConcept(text, concept) {
-  const lower = String(text || '').toLowerCase();
-  return concept.tokens.some(t => lower.includes(t));
-}
-
-function queryRelevanceMetrics(result, query) {
-  const concepts = queryConcepts(query);
-  if (!concepts.length) return { conceptCoverage: 1, titleCoverage: 1, snippetCoverage: 1, bodyCoverage: 1, anchorMatched: true, strong: true, score: 100 };
-  const title = String(result.title || '');
-  const snippet = String(result.snippet || '');
-  const body = String(result.pageContent || result.extractedText || '').slice(0, 14000);
-  const titleHits = concepts.filter(c => textHasConcept(title, c)).length;
-  const snippetHits = concepts.filter(c => textHasConcept(snippet, c)).length;
-  const bodyHits = concepts.filter(c => textHasConcept(body, c)).length;
-  const conceptCoverage = bodyHits / concepts.length;
-  const titleCoverage = titleHits / concepts.length;
-  const snippetCoverage = snippetHits / concepts.length;
-  const queryLower = String(query).toLowerCase();
-  const anchorConcepts = concepts.filter(c => /^(history|price|law|policy|company|founder|education|population)$/i.test(c.key));
-  const anchorMatched = anchorConcepts.every(c => textHasConcept(`${title} ${snippet} ${body}`, c));
-  const exactPhrase = title.toLowerCase().includes(queryLower) || snippet.toLowerCase().includes(queryLower);
-  const searchScore = Number(result.searchScore);
-  let score = conceptCoverage * 45 + titleCoverage * 30 + snippetCoverage * 10;
-  if (exactPhrase) score += 14;
-  if (titleCoverage >= 0.5) score += 8;
-  if (Number.isFinite(searchScore)) score += Math.max(0, Math.min(12, searchScore * 12));
-  if (anchorMatched) score += 6; else if (anchorConcepts.length) score -= 15;
-  const minimumCoverage = concepts.length <= 2 ? 1 : concepts.length <= 4 ? 0.67 : 0.60;
-  const strong = anchorMatched && conceptCoverage >= minimumCoverage && (titleCoverage >= 0.25 || snippetCoverage >= 0.25);
-  return {
-    conceptCoverage: Number(conceptCoverage.toFixed(2)),
-    titleCoverage: Number(titleCoverage.toFixed(2)),
-    snippetCoverage: Number(snippetCoverage.toFixed(2)),
-    bodyCoverage: Number(conceptCoverage.toFixed(2)),
-    anchorMatched,
-    strong,
-    exactPhrase,
-    score: Number(score.toFixed(1)),
-  };
-}
-
-function relevanceGate(result, query, intent) {
-  const metrics = queryRelevanceMetrics(result, query);
-  result._relevance = metrics;
-  if (metrics.strong) return true;
-  const searchScore = Number(result.searchScore);
-  if (Number.isFinite(searchScore) && searchScore >= 0.60 && metrics.conceptCoverage >= 0.50 && metrics.anchorMatched) return true;
-  if (Number(result._score || 0) >= RELEVANCE_MIN_SCORE && metrics.conceptCoverage >= 0.50 && metrics.anchorMatched) return true;
+  if (band === 'excellent' || band === 'strong') return true;
+  if (score >= 54 && concept >= 0.35) return true;
+  if (score >= 46 && concept >= 0.45 && title >= 0.2) return true;
+  if (plan.flags?.wantsHistory && Array.isArray(rel.mismatchTerms) && rel.mismatchTerms.length) return false;
+  if (score >= 42 && concept >= 0.5) return true;
   return false;
 }
 
-function contentOnlySelection(results, count, requireRealContent, warnings, query, intent) {
-  const real = results.filter(isRealContentResult);
-  const ranked = real.map(r => {
-    const metrics = queryRelevanceMetrics(r, query);
-    r._relevance = metrics;
-    r._score = Number(r._score || 0) + metrics.score * 0.65;
-    return r;
-  }).sort((a, b) => (b._score || 0) - (a._score || 0));
-  if (!requireRealContent) return diversifyAndSelect(ranked.length ? ranked : results, count, intent);
-
-  const strong = ranked.filter(r => relevanceGate(r, query, intent));
-  const concepts = queryConcepts(query);
-  const backfillCoverage = concepts.length <= 2 ? 0.75 : concepts.length <= 4 ? 0.60 : 0.55;
-  const usable = strong.length >= Math.min(count, 4)
-    ? strong
-    : ranked.filter(r => {
-        const m = r._relevance || queryRelevanceMetrics(r, query);
-        return m.anchorMatched && m.conceptCoverage >= backfillCoverage && m.score >= RELEVANCE_BACKFILL_SCORE;
-      });
-  const pool = usable;
-  if (pool.length < count) warnings.push(`Only ${pool.length} validated result(s) met the relevance/content contract; ${count} were requested. Weak or unrelated candidates were excluded.`);
-  return diversifyAndSelect(pool, count, intent);
+function diversifyFinal(results, count) {
+  const pool = [...results].sort((a, b) => Number(b.relevanceScore || 0) - Number(a.relevanceScore || 0));
+  const selected = [];
+  const domainCounts = new Map();
+  const topicSeen = new Map();
+  while (selected.length < count && pool.length) {
+    let bestIndex = 0;
+    let bestScore = -Infinity;
+    for (let i = 0; i < pool.length; i++) {
+      const r = pool[i];
+      const d = normalizeHost(r.url);
+      const base = Number(r.relevanceScore || 0);
+      const domainPenalty = Math.min(8, (domainCounts.get(d) || 0) * 2.2);
+      const freshnessBonus = freshness(r.publishedAt) === 'last_24h' ? 3 : freshness(r.publishedAt) === 'last_7d' ? 2 : 0;
+      const typeBonus = r.type === 'news' || r.type === 'gov' || r.type === 'doc' ? 1 : 0;
+      const novelty = (r.relevance?.matchedConcepts || []).reduce((sum, x) => sum + 1 / (1 + (topicSeen.get(x) || 0)), 0);
+      const adjusted = base - domainPenalty + freshnessBonus + typeBonus + novelty;
+      if (adjusted > bestScore) { bestScore = adjusted; bestIndex = i; }
+    }
+    const chosen = pool.splice(bestIndex, 1)[0];
+    selected.push(chosen);
+    const d = normalizeHost(chosen.url);
+    domainCounts.set(d, (domainCounts.get(d) || 0) + 1);
+    for (const g of chosen.relevance?.matchedConcepts || []) topicSeen.set(g, (topicSeen.get(g) || 0) + 1);
+  }
+  return selected;
 }
 
-async function commonCrawlLookup(url, deadline) {
-  if (!safeHttpUrl(url) || remainingMs(deadline) < 800) return null;
+async function commonCrawlMeta(url, deadline) {
+  if (!safeUrl(url) || left(deadline) < 350) return null;
   const encoded = encodeURIComponent(url);
   for (const index of COMMON_CRAWL_INDEXES) {
-    if (remainingMs(deadline) < 700) break;
+    if (left(deadline) < 300) break;
     try {
-      const body = await fetchText(`https://index.commoncrawl.org/${index}-index?url=${encoded}&output=json&filter=status:200&limit=3`, {
-        timeout: COMMON_CRAWL_TIMEOUT_MS, maxBytes: 80_000, deadline, headers: { accept: 'application/json,text/plain;q=0.8,*/*;q=0.1' },
-      });
-      const rows = body.trim().split('\n').filter(Boolean).map(x => { try { return JSON.parse(x); } catch { return null; } }).filter(Boolean);
-      if (rows.length) return { index, capturedAt: rows[0].timestamp || null, digest: rows[0].digest || null, status: rows[0].status || null, records: rows.slice(0, 3) };
+      const body = await fetchText(`https://index.commoncrawl.org/${index}-index?url=${encoded}&output=json&filter=status:200&limit=1`, COMMON_CRAWL_TIMEOUT_MS, deadline, 40_000, { accept: 'application/json,text/plain;q=0.8' });
+      const row = body.split('\n').map(x => { try { return JSON.parse(x); } catch { return null; } }).find(Boolean);
+      if (row) return { index, timestamp: row.timestamp || null, digest: row.digest || null };
     } catch {}
   }
   return null;
 }
 
-function plannedRequests(queries, intent) {
-  const rows = queries.map((q, qi) => ({
-    qi,
-    requests: buildEngineUrls(q, intent).map(engine => ({ ...engine, __queryIndex: qi })),
-  }));
-  const coreProviders = ['bing', 'google', 'duckduckgo', 'yahoo', 'mojeek'];
-  const out = [];
-
-  // Every complementary query gets broad provider coverage before any provider
-  // is repeated. This prevents one engine from monopolising the candidate pool.
-  for (const row of rows) {
-    for (const provider of coreProviders) {
-      if (out.length >= MAX_ENGINE_REQUESTS) break;
-      const req = row.requests.find(x => x.provider === provider);
-      if (req) out.push(req);
-    }
-    if (out.length >= MAX_ENGINE_REQUESTS) break;
-  }
-
-  // Add specialized surfaces only when the query actually requests them.
-  if (out.length < MAX_ENGINE_REQUESTS) {
-    for (const row of rows.slice(0, 4)) {
-      for (const req of row.requests) {
-        if (out.length >= MAX_ENGINE_REQUESTS) break;
-        if (coreProviders.includes(req.provider)) continue;
-        if (!out.some(x => x.url === req.url)) out.push(req);
-      }
-      if (out.length >= MAX_ENGINE_REQUESTS) break;
-    }
-  }
-  return out.slice(0, MAX_ENGINE_REQUESTS);
+function createLogger() {
+  const logs = [];
+  const add = (event, message, extra = {}) => {
+    const item = { at: nowIso(), event, message, ...extra };
+    logs.push(item);
+    if (logs.length > MAX_LIVE_LOG) logs.shift();
+    try { console.log(`[ArixAI ${event}] ${message}`); } catch {}
+  };
+  return { logs, add };
 }
 
-async function performSearch(input, started, deadline) {
+function cacheGet(key) {
+  const item = SEARCH_CACHE.get(key);
+  if (!item) return null;
+  if (Date.now() - item.at > item.ttl) { SEARCH_CACHE.delete(key); return null; }
+  return item.value;
+}
+function cacheSet(key, value, ttl) {
+  SEARCH_CACHE.set(key, { at: Date.now(), value, ttl });
+  while (SEARCH_CACHE.size > CACHE_MAX) SEARCH_CACHE.delete(SEARCH_CACHE.keys().next().value);
+}
+
+function cacheKey(input, query, count, plan) {
+  return JSON.stringify({
+    q: query, c: count, mode: String(input.mode || 'auto').toLowerCase(), type: plan.type,
+    deep: String(input.deep || '').toLowerCase(), verify: String(input.verify ?? true).toLowerCase(),
+    requireRealContent: String(input.requireRealContent ?? true).toLowerCase(),
+  });
+}
+
+function selectCacheTtl(plan) { return plan.dateIntent?.kind === 'live' ? LIVE_SEARCH_CACHE_TTL_MS : SEARCH_CACHE_TTL_MS; }
+
+async function resolveNewsCandidate(candidate, deadline) {
+  if (normalizeHost(candidate.url) !== 'news.google.com') return candidate;
+  try {
+    const res = await fetchResponse(candidate.url, 1000, deadline, { accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1' });
+    const finalUrl = unwrap(res.url || candidate.url, candidate.url);
+    if (finalUrl && normalizeHost(finalUrl) !== 'news.google.com' && safeUrl(finalUrl) && !blocked(finalUrl)) {
+      try { await res.body?.cancel?.(); } catch {}
+      return { ...candidate, url: finalUrl, publisherResolved: true, publisherWrapperUrl: candidate.url, publisherResolutionMethod: 'redirect', contentSourceUrl: finalUrl };
+    }
+    const raw = await readBody(res, 220_000, deadline).catch(() => '');
+    const link = raw.match(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)
+      ?.map(x => {
+        const href = x.match(/href=["']([^"']+)["']/i)?.[1];
+        const text = strip(x.replace(/<[^>]+>/g, ' '));
+        return { href: unwrap(href, candidate.url), text };
+      })
+      .filter(x => x.href && normalizeHost(x.href) !== 'news.google.com' && x.text.length > 8)
+      .sort((a,b) => tokenSimilarity(candidate.title, a.text) - tokenSimilarity(candidate.title, b.text))
+      .pop();
+    if (link?.href) return { ...candidate, url: link.href, publisherResolved: true, publisherWrapperUrl: candidate.url, publisherResolutionMethod: 'embedded-link', contentSourceUrl: link.href };
+  } catch {}
+  return { ...candidate, _newsWrapperUnresolved: true };
+}
+
+function tokenSimilarity(a, b) {
+  const aa = new Set(String(a || '').toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(x => x.length > 2));
+  const bb = new Set(String(b || '').toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(x => x.length > 2));
+  if (!aa.size || !bb.size) return 0;
+  let hit = 0; for (const x of aa) if (bb.has(x)) hit++;
+  return hit / Math.max(aa.size, bb.size);
+}
+
+async function performSearch(input, started, logger) {
+  const deadline = started + SEARCH_BUDGET_MS;
   const query = truncate(String(input.query ?? input.q ?? '').trim(), MAX_QUERY_LEN);
-  const count = parseCount(input.count ?? input.limit ?? DEFAULT_RESULTS);
+  const count = safeInt(input.count ?? input.limit, DEFAULT_RESULTS, 1, MAX_RESULTS);
   const mode = String(input.mode || 'auto').toLowerCase();
   const requestedType = String(input.type || '').toLowerCase();
   const deep = String(input.deep ?? 'false').toLowerCase() === 'true';
-  const useAi = String(input.ai ?? input.useAi ?? 'auto').toLowerCase();
+  const aiRequested = String(input.ai ?? input.useAi ?? 'auto').toLowerCase();
   const verifyRequested = input.verify == null ? true : String(input.verify).toLowerCase() !== 'false';
-  const useCc = input.commonCrawl == null ? false : String(input.commonCrawl).toLowerCase() === 'true';
+  const useCc = String(input.commonCrawl ?? 'false').toLowerCase() === 'true';
   const requireRealContent = input.requireRealContent == null ? true : String(input.requireRealContent).toLowerCase() !== 'false';
 
-  const baseIntent = queryIntent(query, requestedType || null);
-  const dateIntent = parseDateIntent(query);
-  const cacheKey = JSON.stringify({ query, count, mode, requestedType, deep, useAi, verifyRequested, useCc, requireRealContent });
-  const searchCacheTtl = dateIntent.latest ? 2500 : SEARCH_CACHE_TTL_MS;
-  const cached = cacheGet(SEARCH_CACHE, cacheKey, searchCacheTtl);
-  if (cached) return { ...cached, generatedAt: nowIso(), latencyMs: Date.now() - started, cached: true };
+  const plan = analyzeQuery(query, { mode, type: requestedType });
+  const key = cacheKey(input, query, count, plan);
+  const cached = cacheGet(key);
+  if (cached) {
+    logger.add('cache-hit', `Returned warm cached search for ${query}.`, { count: cached.returnedResults });
+    return { ...cached, generatedAt: nowIso(), latencyMs: Date.now() - started, cached: true, liveLog: logger.logs };
+  }
 
-  const warnings = [];
+  logger.add('query-analyzed', 'Precision query analysis completed.', {
+    type: plan.type,
+    concepts: plan.concepts.map(x => x.id),
+    dateIntent: plan.dateIntent.kind,
+  });
+
+  const preciseQueries = buildPreciseQueries(query, { plan });
+  const requests = providerRequests(preciseQueries, plan, count);
+  logger.add('discovery-start', `Launching ${requests.length} parallel discovery requests.`, { queries: preciseQueries.slice(0, 8) });
+
+  const discoveryDeadline = Math.min(deadline, started + DISCOVERY_CUTOFF_MS);
+  const [discoveries, tv] = await Promise.all([
+    Promise.allSettled(requests.map(r => discoverOne(r, discoveryDeadline))),
+    tavilyKeyExists() ? tavilyDiscovery(plan, preciseQueries.slice(0, 2), count, discoveryDeadline) : Promise.resolve({ results: [], calls: 0, succeeded: 0 }),
+  ]);
+
   const providerStats = {};
-  const flags = { partialDueToBudget: false, publisherResolutionAttempted: 0, publisherResolutionSucceeded: 0, verificationPerformed: 0, verificationSucceeded: 0, commonCrawlPerformed: 0 };
-
-  // Fast path: deterministic planning first. AI remains available, but it never blocks core discovery.
-  const baseQueries = buildSearchQueries(query, baseIntent, mode, dateIntent);
-  const shouldAiPlan = useAi === 'true';
-  const aiPlanPromise = shouldAiPlan && remainingMs(deadline) > DISCOVERY_MIN_REMAINING_MS
-    ? aiPlan(query, mode, count, dateIntent, deadline)
-    : Promise.resolve(null);
-
-  // Accelerated content-aware discovery lane. When TAVILY_API_KEY[_N] exists,
-  // Tavily Search can return cleaned source content with the search result itself.
-  // It runs in parallel with the existing keyless engines and never becomes a dependency.
-  const tavilyPromise = remainingMs(deadline) > DISCOVERY_MIN_REMAINING_MS
-    ? runTavilyFastLane(baseQueries.slice(0, 2), baseIntent, dateIntent, count, deadline)
-    : Promise.resolve(null);
-
-  const reqs = plannedRequests(baseQueries, baseIntent);
-  let totalEngineRequests = reqs.length;
-  const responses = await mapConcurrent(reqs, SEARCH_CONCURRENCY, r => discoverOne(r, deadline));
   let discovered = [];
-  for (const item of responses) {
-    if (!item || item.__error) continue;
+  let discoveryOk = 0;
+  for (const entry of discoveries) {
+    if (entry.status !== 'fulfilled') continue;
+    const item = entry.value;
     providerStats[item.provider] = providerStats[item.provider] || { ok: 0, failed: 0, results: 0 };
-    if (item.ok) providerStats[item.provider].ok++; else providerStats[item.provider].failed++;
+    if (item.ok) { providerStats[item.provider].ok++; discoveryOk++; }
+    else providerStats[item.provider].failed++;
     providerStats[item.provider].results += item.results.length;
     discovered.push(...item.results);
   }
+  if (tv.results.length) {
+    providerStats.tavily = { ok: tv.succeeded, failed: Math.max(0, tv.calls - tv.succeeded), results: tv.results.length };
+    discovered.push(...tv.results);
+  }
+  discovered = dedupeCandidates(discovered);
 
-  // Optional AI planning only gets one additional parallel discovery wave if there is real budget left.
-  const [ai, tavily] = await Promise.all([
-    Promise.race([
-      aiPlanPromise,
-      sleep(Math.max(0, remainingMs(deadline) - 3400)).then(() => null),
-    ]).catch(() => null),
-    tavilyPromise.catch(() => null),
-  ]);
-  const aiQueries = ai?.queries?.length ? [...new Set(ai.queries)].slice(0, 3) : [];
-  const plannedQueries = [...new Set([...baseQueries, ...aiQueries])].slice(0, 6);
-  if (tavily?.results?.length) {
-    discovered.push(...tavily.results);
-    providerStats.tavily = { ok: tavily.providers?.length || 1, failed: 0, results: tavily.results.length, keysUsed: tavily.keysUsed || 1 };
+  const newsWrappers = discovered.filter(r => r.type === 'news' && normalizeHost(r.url) === 'news.google.com').slice(0, 8);
+  if (newsWrappers.length && left(deadline) > 6_000) {
+    logger.add('news-resolution-start', `Resolving ${newsWrappers.length} news aggregator links in parallel.`);
+    const resolved = await Promise.all(newsWrappers.map(r => resolveNewsCandidate(r, deadline)));
+    const by = new Map(resolved.map(r => [normalizedKey(r.publisherWrapperUrl || r.url), r]));
+    discovered = discovered.map(r => by.get(normalizedKey(r.url)) || r).filter(r => !r._newsWrapperUnresolved);
+    logger.add('news-resolution-complete', `News resolution left ${discovered.filter(r => r.type === 'news').length} usable news candidates.`);
+  } else {
+    discovered = discovered.filter(r => normalizeHost(r.url) !== 'news.google.com' || r.publisherResolved);
   }
 
-  if (aiQueries.length && remainingMs(deadline) > 2600 && discovered.length < Math.max(count * 2, 20)) {
-    const secondReqs = plannedRequests(aiQueries, baseIntent).slice(0, Math.min(6, MAX_ENGINE_REQUESTS - reqs.length));
-    totalEngineRequests += secondReqs.length;
-    const more = await mapConcurrent(secondReqs, SEARCH_CONCURRENCY, r => discoverOne(r, deadline));
-    for (const item of more) {
-      if (!item || item.__error) continue;
-      providerStats[item.provider] = providerStats[item.provider] || { ok: 0, failed: 0, results: 0 };
-      if (item.ok) providerStats[item.provider].ok++; else providerStats[item.provider].failed++;
-      providerStats[item.provider].results += item.results.length;
-      discovered.push(...item.results);
-    }
+  logger.add('discovery-complete', `Discovery produced ${discovered.length} unique candidates.`, {
+    successfulProviders: discoveryOk,
+    tavilyResults: tv.results.length,
+  });
+
+  if (!discovered.length) {
+    logger.add('discovery-empty', 'No search candidates were returned by the available public surfaces.');
   }
 
-  discovered = dedupeResults(discovered).map(r => ({ ...r, type: inferType(r), domain: hostname(r.url) }));
-  for (const r of discovered) {
-    r._score = scoreResult(r, query, baseIntent, dateIntent) + domainTrust(r.url);
+  // Rank only after all discovery results are merged. Typed candidates are moved to the
+  // front BEFORE the algorithm's internal 180-candidate processing cap, so gov/doc/video/news
+  // queries cannot be crowded out by generic-engine results. This is ordering only; the
+  // algorithm still performs the actual type and relevance checks.
+  const typePriority = r => {
+    if (plan.type === 'gov') return isGov(r.url) ? 5 : 0;
+    if (plan.type === 'doc') return isDoc(r.url) ? 5 : 0;
+    if (plan.type === 'video') return isVideo(r.url) ? 5 : 0;
+    if (plan.type === 'news') return (r.type === 'news' || ARTICLE_PATH.test(String(r.url || ''))) ? 5 : 0;
+    return 0;
+  };
+  const rankingInput = [...discovered].sort((a, b) => typePriority(b) - typePriority(a));
+  const ranked = rankCandidates(rankingInput, plan, { keepWeak: true });
+  logger.add('ranking-complete', `Ranked ${ranked.length} candidates with the precision algorithm.`);
+
+  if (!verifyRequested) {
+    const metadataOnly = diversifyFinal(ranked.slice(0, count).map(r => ({
+      ...r,
+      relevanceScore: Math.round(r._relevance?.score || 0),
+      relevanceBand: r._relevance?.band || 'weak-match',
+      verified: false,
+      pageContent: '', extractedText: '', contentAvailable: false,
+    })), count);
+    const final = metadataOnly.map((r, i) => formatResult(r, i, plan, false));
+    const result = buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested, tv });
+    cacheSet(key, result, selectCacheTtl(plan));
+    return result;
   }
 
-  // Google News wrappers get only the cheap redirect/embedded-link pass here.
-  // Expensive homepage/title lookups are intentionally excluded from the critical path;
-  // Tavily and the ordinary search engines already provide direct publisher URLs.
-  const newsCandidates = discovered
-    .filter(r => r.type === 'news' && /^news\.google\.com$/i.test(hostname(r.url)))
-    .sort((a, b) => scoreResult(b, query, baseIntent, dateIntent) - scoreResult(a, query, baseIntent, dateIntent))
-    .slice(0, MAX_NEWS_RESOLVES);
-  if (newsCandidates.length && remainingMs(deadline) > 2200) {
-    flags.publisherResolutionAttempted = newsCandidates.length;
-    const resolvedPairs = await mapConcurrent(newsCandidates, Math.min(MAX_NEWS_RESOLVES, 6), async original => {
-      return await resolveNewsWrapper(original, deadline);
-    });
-    const byOldKey = new Map();
-    for (let i = 0; i < newsCandidates.length; i++) {
-      const resolved = resolvedPairs[i];
-      if (resolved && resolved.url && resolved.url !== newsCandidates[i].url) {
-        byOldKey.set(normalizedKey(newsCandidates[i].url), resolved);
-      }
-    }
-    discovered = discovered.map(r => byOldKey.get(normalizedKey(r.url)) || r);
-    flags.publisherResolutionSucceeded = [...byOldKey.values()].filter(r => r.publisherResolved).length;
-    if (flags.publisherResolutionSucceeded) warnings.push(`Resolved ${flags.publisherResolutionSucceeded} news result(s) to publisher URLs before content extraction.`);
+  // The precision engine gets enough candidates to make 40-source requests resilient.
+  const candidateCap = Math.min(180, Math.max(60, count * 4 + 20));
+  const contentCandidates = ranked.slice(0, candidateCap);
+  logger.add('content-start', `Validating live content for ${contentCandidates.length} top candidates concurrently.`);
+
+  const remainingForAlgorithm = Math.max(ALGORITHM_BUDGET_MIN_MS, left(deadline) - 180);
+  const batches = [];
+  if (contentCandidates.length > 90 && remainingForAlgorithm >= 3_600) {
+    const split = Math.ceil(contentCandidates.length / 2);
+    batches.push(contentCandidates.slice(0, split), contentCandidates.slice(split));
+  } else {
+    batches.push(contentCandidates);
   }
 
-  for (const r of discovered) r._score = scoreResult(r, query, baseIntent, dateIntent) + domainTrust(r.url);
-  discovered = applyDateConstraint(discovered, dateIntent, count, warnings);
-  discovered = enforceRequestedType(discovered, requestedType, mode, warnings);
-  discovered.sort((a, b) => (b._score || 0) - (a._score || 0));
+  const perBatchBudget = Math.max(1_350, Math.min(7_000, remainingForAlgorithm));
+  const enrichments = await Promise.allSettled(batches.map(batch => enrichCandidates(batch, plan, {
+    count,
+    requireRealContent: true,
+    budgetMs: perBatchBudget,
+  })));
 
-  // Validate only results that still need page content. Results already carrying
-  // validated live content (for example Tavily raw page content or a warm cache hit)
-  // are never redundantly refetched.
-  const existingRealContent = discovered.filter(isRealContentResult).length;
-  const verifyTarget = Math.min(MAX_VERIFY, Math.max(0, count + 8 - existingRealContent));
-  const verifyPool = discovered.filter(r => !isRealContentResult(r));
-  const verifyCount = verifyRequested ? Math.min(verifyPool.length, verifyTarget) : 0;
-  if (verifyCount && remainingMs(deadline) > CONTENT_MIN_REMAINING_MS) {
-    const candidates = selectVerificationCandidates(
-      [...verifyPool].sort((a, b) => contentPriorityScore(b, query, baseIntent, dateIntent) - contentPriorityScore(a, query, baseIntent, dateIntent)),
-      verifyCount,
-    );
-    flags.verificationPerformed = candidates.length;
+  let enriched = [];
+  let algorithmReturned = 0;
+  for (const entry of enrichments) {
+    if (entry.status !== 'fulfilled' || !entry.value?.ok) continue;
+    algorithmReturned += Number(entry.value.returnedResults || 0);
+    enriched.push(...(entry.value.results || []));
+  }
+  logger.add('content-complete', `Validated content returned for ${enriched.length} source records.`, { algorithmReturned });
 
-    const enriched = await mapConcurrent(candidates, CONTENT_CONCURRENCY, async r => {
-      const cache = cacheGet(CONTENT_CACHE, normalizedKey(r.url), CONTENT_CACHE_TTL_MS);
-      if (cache && isRealContentResult(cache)) return { ...r, ...cache };
-      const fresh = await enrichResult(r, query, deadline);
-      if (isRealContentResult(fresh)) cacheSet(CONTENT_CACHE, normalizedKey(r.url), {
-        pageContent: fresh.pageContent,
-        extractedText: fresh.extractedText,
-        contentStatus: fresh.contentStatus,
-        contentMethod: fresh.contentMethod,
-        contentLength: fresh.contentLength,
-        contentConfidence: fresh.contentConfidence,
-        contentSourceUrl: fresh.contentSourceUrl,
-        contentAvailable: true,
-        contentType: fresh.contentType,
-        contentSourceTitle: fresh.title || null,
-        verified: Boolean(fresh.verified),
-        httpStatus: fresh.httpStatus || 200,
-        verificationMethod: fresh.verificationMethod || null,
-        publishedAt: fresh.publishedAt || null,
+  // Deduplicate enriched sources and remove any result that lost its real-content invariant.
+  const enrichedMap = new Map();
+  for (const r of enriched) {
+    if (!isRealSourceContent(r)) continue;
+    const key2 = normalizedKey(r.url);
+    if (!key2) continue;
+    if (!enrichedMap.has(key2)) enrichedMap.set(key2, r);
+  }
+  enriched = [...enrichedMap.values()];
+
+  // A second lightweight recovery call is only used when count is still materially short.
+  if (enriched.length < count && left(deadline) > 1_650 && ranked.length > candidateCap) {
+    const nextCandidates = ranked.slice(candidateCap, Math.min(ranked.length, candidateCap + 80));
+    logger.add('recovery-start', `Running a bounded content recovery wave for ${nextCandidates.length} additional candidates.`);
+    try {
+      const recovered = await enrichCandidates(nextCandidates, plan, {
+        count: Math.min(count - enriched.length, 20),
+        requireRealContent: true,
+        budgetMs: Math.min(2_000, left(deadline) - 140),
       });
-      return fresh;
-    });
-    const byKey = new Map();
-    for (const r of enriched) if (r && !r.__error) byKey.set(normalizedKey(r.url), r);
-    discovered = discovered.map(r => byKey.get(normalizedKey(r.url)) || r);
-    flags.verificationSucceeded = enriched.filter(r => r && !r.__error && r.verified).length;
-    discovered.forEach(r => { r._score = scoreResult(r, query, baseIntent, dateIntent) + (r.verified ? 5 : 0) + domainTrust(r.url); });
-    discovered.sort((a, b) => (b._score || 0) - (a._score || 0));
-
-    // One compact fallback wave for candidates that failed direct extraction. This keeps quality high without serial retry chains.
-    const missing = discovered.filter(r => !isRealContentResult(r)).slice(0, FAST_FALLBACK_LIMIT);
-    if (missing.length && remainingMs(deadline) > 1100) {
-      const fallbackRows = await mapConcurrent(missing, Math.min(CONTENT_CONCURRENCY, 18), async r => {
-        const url = r.url;
-        const alternatePromise = fetchVariantContent(url, deadline, r);
-        const readerPromise = readerFallback(url, deadline, r);
-        const rows = await Promise.allSettled([alternatePromise, readerPromise]);
-        const candidates2 = rows.map(x => x.status === 'fulfilled' ? x.value : null).filter(Boolean);
-        const best = candidates2.sort((a, b) => String(b.content || '').length - String(a.content || '').length)[0];
-        if (!best?.content) return r;
-        return {
-          ...(ensureContentFields({
-            ...r,
-            url: best.finalUrl || r.url,
-            domain: hostname(best.finalUrl || r.url),
-            verified: true,
-            verificationMethod: best.method,
-            title: best.title || r.title,
-            publishedAt: best.publishedAt || r.publishedAt || null,
-            contentTitleSimilarity: best.titleSimilarity ?? null,
-          }, query, {
-            status: best.method === 'jina-reader' ? 'reader' : 'alternate',
-            method: best.method,
-            content: best.content,
-            confidence: best.method === 'jina-reader' ? 0.95 : 0.9,
-          })),
-          _originalUrlKey: normalizedKey(r.url),
-        };
-      });
-      const fallbackMap = new Map(fallbackRows.filter(Boolean).map(r => [r._originalUrlKey || normalizedKey(r.url), r]));
-      discovered = discovered.map(r => fallbackMap.get(normalizedKey(r.url)) || r);
-      flags.verificationSucceeded = Math.min(flags.verificationPerformed, discovered.filter(r => r.verified && isRealContentResult(r)).length);
-      discovered.forEach(r => { r._score = scoreResult(r, query, baseIntent, dateIntent) + (r.verified ? 5 : 0) + domainTrust(r.url); });
-      discovered.sort((a, b) => (b._score || 0) - (a._score || 0));
+      if (recovered?.results?.length) enriched.push(...recovered.results.filter(isRealSourceContent));
+      logger.add('recovery-complete', `Recovery produced ${recovered?.returnedResults || 0} additional validated sources.`);
+    } catch (error) {
+      logger.add('recovery-failed', 'Recovery wave failed safely.', { error: error?.message || 'RECOVERY_FAILED' });
     }
   }
 
-  // AI reranking is optional and runs only after content is available; it is never allowed to consume the whole request budget.
-  const shouldRerank = useAi === 'true' && discovered.length > 4;
-  if (shouldRerank && discovered.length > 1 && remainingMs(deadline) > 1200) {
-    const orderPromise = aiRerank(query, discovered, mode, dateIntent, deadline);
-    const order = await Promise.race([orderPromise, sleep(Math.max(0, remainingMs(deadline) - 700)).then(() => null)]).catch(() => null);
+  if (plan.type === 'news' && plan.dateIntent?.kind === 'live') {
+    const dated = enriched.filter(r => r.publishedAt && !Number.isNaN(Date.parse(r.publishedAt)) && (Date.now() - Date.parse(r.publishedAt)) <= 30 * 86400000);
+    if (dated.length >= Math.min(count, 5)) enriched = dated;
+    logger.add('freshness-filter', `Latest-news freshness check kept ${enriched.length} recent validated sources.`);
+  }
+
+  // Re-rank enriched content using the same algorithm metrics; do not let page extraction change topic identity.
+  const contentRanked = enriched.map(r => ({ ...r, _score: Number(r.relevanceScore || 0) }));
+  let finalPool = contentRanked.filter(r => relevanceAcceptable(r, plan));
+
+  // A conservative fallback band prevents unnecessary zero/near-zero results while retaining relevance safeguards.
+  if (finalPool.length < Math.min(count, 8)) {
+    const broader = contentRanked.filter(r => {
+      if (!isRealSourceContent(r)) return false;
+      if (plan.type === 'gov' && !isGov(r.url)) return false;
+      if (plan.type === 'doc' && !isDoc(r.url)) return false;
+      if (plan.type === 'video' && !isVideo(r.url)) return false;
+      if (plan.flags?.wantsHistory && /current-shopping-content-without-history/i.test(JSON.stringify(r.relevance || {}))) return false;
+      const score = Number(r.relevanceScore || 0);
+      return score >= 36;
+    });
+    const merged = new Map([...finalPool, ...broader].map(r => [normalizedKey(r.url), r]));
+    finalPool = [...merged.values()];
+    if (finalPool.length) logger.add('relevance-backfill', `Used the conservative relevance band to avoid unnecessary source-count collapse.`, { eligible: finalPool.length });
+  }
+
+  // Optional very-fast AI rerank. It can reorder, never invent.
+  if (aiRequested === 'true' && finalPool.length > 2 && left(deadline) > 650) {
+    const order = await groqRerank(query, finalPool, deadline);
     if (order?.length) {
-      const ordered = [], seen = new Set();
-      for (const i of order) { if (!seen.has(i)) { ordered.push(discovered[i]); seen.add(i); } }
-      for (let i = 0; i < discovered.length; i++) if (!seen.has(i)) ordered.push(discovered[i]);
-      discovered = ordered;
-    }
+      const reordered = [];
+      const seen = new Set();
+      for (const i of order) { if (!seen.has(i)) { reordered.push(finalPool[i]); seen.add(i); } }
+      for (let i = 0; i < finalPool.length; i++) if (!seen.has(i)) reordered.push(finalPool[i]);
+      finalPool = reordered;
+      logger.add('ai-rerank-complete', 'Optional AI reranking completed without changing the candidate set.');
+    } else logger.add('ai-rerank-skip', 'AI reranking was unavailable or exceeded its short latency budget.');
   }
 
-  if (useCc && discovered.length && remainingMs(deadline) > 1100) {
-    const rows = await mapConcurrent(discovered.slice(0, Math.min(MAX_CC_LOOKUPS, 4)), 4, async r => ({ url: r.url, cc: await commonCrawlLookup(r.url, deadline) }));
-    const map = new Map(rows.filter(Boolean).map(x => [x.url, x.cc]));
-    flags.commonCrawlPerformed = rows.filter(x => x?.cc).length;
-    discovered.forEach(r => { r.commonCrawl = map.get(r.url) || null; });
-  } else if (useCc) warnings.push('Common Crawl was skipped because live page content was prioritized under the fast latency budget.');
-
-  if (remainingMs(deadline) < 900) {
-    flags.partialDueToBudget = true;
-    warnings.push('Fast latency budget reached; only validated live content completed before finalization.');
+  const chosen = diversifyFinal(finalPool, count);
+  let commonCrawlRows = [];
+  if (useCc && chosen.length && left(deadline) > 550) {
+    const ccDeadline = Date.now() + Math.min(500, left(deadline) - 50);
+    commonCrawlRows = await Promise.all(chosen.slice(0, MAX_COMMON_CRAWL).map(async r => ({ url: r.url, cc: await commonCrawlMeta(r.url, ccDeadline) })));
   }
+  const ccMap = new Map(commonCrawlRows.filter(x => x?.cc).map(x => [normalizedKey(x.url), x.cc]));
 
-  discovered = contentOnlySelection(discovered, count, requireRealContent, warnings, query, baseIntent);
-  const finalResults = discovered.slice(0, count).map((r, i) => ({
+  const final = chosen.slice(0, count).map((r, i) => formatResult({ ...r, commonCrawl: ccMap.get(normalizedKey(r.url)) || null }, i, plan, true));
+  const result = buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested, tv });
+  cacheSet(key, result, selectCacheTtl(plan));
+  return result;
+}
+
+function formatResult(r, i, plan, realContent) {
+  const content = realContent ? String(r.pageContent || r.extractedText || '').trim() : '';
+  const relevanceScore = Math.round(Number(r.relevanceScore ?? r._relevance?.score ?? 0));
+  const rel = r.relevance || {
+    titleCoverage: r._relevance?.titleCoverage ?? 0,
+    bodyCoverage: r._relevance?.bodyCoverage ?? 0,
+    conceptCoverage: r._relevance?.conceptCoverage ?? 0,
+    matchedConcepts: r._relevance?.hits ?? [],
+    missingConcepts: r._relevance?.missing ?? [],
+    exactPhrase: Boolean(r._relevance?.phraseExact),
+    mismatchTerms: r._relevance?.mismatchTerms ?? [],
+  };
+  return {
     rank: i + 1,
     title: truncate(r.title || 'Untitled', 300),
     url: r.url,
-    domain: r.domain || hostname(r.url),
-    type: r.type,
-    source: r.source,
+    domain: normalizeHost(r.url),
+    type: r.type || (isGov(r.url) ? 'gov' : isDoc(r.url) ? 'doc' : isVideo(r.url) ? 'video' : 'web'),
+    source: r.source || 'search',
     snippet: truncate(r.snippet || '', 1200),
     publishedAt: r.publishedAt || null,
-    freshness: freshnessBand(r.publishedAt),
-    verified: Boolean(r.verified),
+    freshness: freshness(r.publishedAt),
+    verified: Boolean(realContent && (r.verified !== false)),
     httpStatus: r.httpStatus || null,
     contentType: r.contentType || null,
-    trust: Number((r.trust || domainTrust(r.url)).toFixed(2)),
-    relevanceScore: Math.max(0, Math.min(100, Math.round(50 + (r._score || 0) * 2))),
-    semanticSearchScore: Number.isFinite(Number(r.searchScore)) ? Number(Number(r.searchScore).toFixed(4)) : null,
-    relevanceMetrics: r._relevance || queryRelevanceMetrics(r, query),
+    trust: Number((r.trust ?? (isGov(r.url) ? 1 : isTrusted(r.url) ? 0.95 : 0.6)).toFixed(2)),
+    relevanceScore: relevanceScore,
+    relevanceBand: r.relevanceBand || r._relevance?.band || (relevanceScore >= 75 ? 'excellent' : relevanceScore >= 58 ? 'strong' : relevanceScore >= 42 ? 'usable' : 'weak-match'),
+    relevance: rel,
     publisherResolved: Boolean(r.publisherResolved),
     publisherWrapperUrl: r.publisherWrapperUrl || null,
     publisherResolutionMethod: r.publisherResolutionMethod || null,
     searchWrapperResolved: Boolean(r.searchWrapperResolved),
     searchWrapperProvider: r.searchWrapperProvider || null,
-    extractedText: truncate(r.extractedText || r.pageContent || '', MAX_TEXT_CHARS),
-    pageContent: truncate(r.pageContent || r.extractedText || '', MAX_TEXT_CHARS),
-    contentAvailable: isRealContentResult(r),
-    contentStatus: r.contentStatus || 'snippet_fallback',
-    contentMethod: r.contentMethod || 'search-snippet',
-    contentLength: Number(r.contentLength || String(r.pageContent || r.extractedText || '').length),
-    contentConfidence: Number(r.contentConfidence ?? 0.35),
+    extractedText: content,
+    pageContent: content,
+    contentAvailable: Boolean(realContent && content),
+    contentStatus: r.contentStatus || (realContent ? 'full' : 'metadata'),
+    contentMethod: r.contentMethod || r.validatedBy || 'algorithm',
+    contentLength: content.length,
+    contentConfidence: Number(r.contentConfidence ?? (realContent ? 0.9 : 0)).toFixed(2),
     contentSourceUrl: r.contentSourceUrl || r.url,
-    contentTargetMatched: Boolean(r.contentTargetMatched ?? isRealContentResult(r)),
-    contentTargetTitleSimilarity: Number(r.contentTitleSimilarity ?? r.titleSimilarity ?? 0),
+    contentTargetMatched: Boolean(r.contentTargetMatched ?? realContent),
+    contentTitleSimilarity: Number(r.contentTitleSimilarity ?? r.contentTitleSimilarity ?? rel.titleCoverage ?? 0).toFixed(3),
+    contentConceptCoverage: Number(r.contentConceptCoverage ?? rel.conceptCoverage ?? 0).toFixed(3),
     contentFormat: 'plain_text',
-    contentRole: isRealContentResult(r) ? 'publisher_page_content' : 'search_evidence_fallback',
-    contentForAI: isRealContentResult(r) ? `SOURCE_URL: ${r.contentSourceUrl || r.url}\nTITLE: ${truncate(r.title || '', 300)}\nCONTENT_STATUS: ${r.contentStatus}\n\n${truncate(r.pageContent || r.extractedText || '', MAX_TEXT_CHARS)}` : '',
-    contentError: r.contentError || null,
-    contentTruncated: String(r.pageContent || r.extractedText || '').length >= MAX_TEXT_CHARS,
-    verificationMethod: r.verificationMethod || null,
+    contentRole: realContent ? 'publisher_page_content' : 'search_metadata_only',
+    contentForAI: realContent ? `SOURCE_URL: ${r.contentSourceUrl || r.url}\nTITLE: ${truncate(r.title || '', 300)}\nCONTENT_STATUS: ${r.contentStatus || 'full'}\n\n${content}` : '',
+    verificationMethod: r.verificationMethod || r.validatedBy || null,
     transcript: r.transcript || null,
     transcriptAvailable: Boolean(r.transcriptAvailable),
     transcriptLanguage: r.transcriptLanguage || null,
     commonCrawl: r.commonCrawl || null,
-  }));
+    queryMatch: {
+      planType: plan.type,
+      dateIntent: plan.dateIntent?.kind || 'none',
+      concepts: plan.concepts.map(x => x.id),
+    },
+  };
+}
 
-  if (requireRealContent && !finalResults.length) warnings.push('No result satisfied both requirements: validated live content and query relevance. No snippet-only content was substituted.');
-
+function buildResponse({ query, count, mode, requestedType, plan, preciseQueries, providerStats, final, logger, started, verifyRequested, requireRealContent, useCc, deep, aiRequested, tv }) {
+  const validationCount = final.filter(r => r.contentAvailable).length;
   const result = {
     ok: true,
     version: VERSION,
     query,
     requestedResults: count,
-    returnedResults: finalResults.length,
+    returnedResults: final.length,
     mode,
     intent: {
-      ...baseIntent,
-      type: requestedType || baseIntent.type,
-      wantsNews: baseIntent.wantsNews || ai?.intent === 'news',
-      wantsVideo: baseIntent.wantsVideo || ai?.intent === 'video',
-      wantsGov: baseIntent.wantsGov || ai?.intent === 'gov' || mode === 'gov',
-      wantsDocs: baseIntent.wantsDocs || ai?.intent === 'doc' || mode === 'doc',
+      type: requestedType || plan.type,
+      wantsNews: plan.type === 'news' || Boolean(plan.flags?.explicitNews),
+      wantsVideo: plan.type === 'video' || Boolean(plan.flags?.explicitVideo),
+      wantsGov: plan.type === 'gov' || Boolean(plan.flags?.explicitGov) || Boolean(plan.flags?.wantsOfficial && plan.flags?.explicitGov),
+      wantsDocs: plan.type === 'doc' || Boolean(plan.flags?.explicitDoc),
+      wantsHistory: Boolean(plan.flags?.wantsHistory),
+      wantsAcademic: Boolean(plan.flags?.wantsAcademic),
     },
     generatedAt: nowIso(),
     latencyMs: Date.now() - started,
     keylessCoreSearch: true,
-    groqUsed: Boolean(ai),
+    groqUsed: aiRequested === 'true' && logger.logs.some(x => x.event === 'ai-rerank-complete'),
     cached: false,
     providers: providerStats,
+    tavily: { calls: tv?.calls || 0, succeeded: tv?.succeeded || 0, results: tv?.results?.length || 0 },
     quality: {
-      validatedResults: finalResults.filter(r => r.contentAvailable).length,
-      relevantResults: finalResults.filter(r => (r.relevanceMetrics?.strong || r.relevanceScore >= 70)).length,
+      validatedResults: validationCount,
+      relevantResults: final.filter(r => r.relevanceScore >= 54).length,
       requestedResults: count,
       realContentOnly: requireRealContent,
+      contentGuarantee: 'Final results use validated source content when requireRealContent=true; snippets are not promoted to pageContent.',
     },
     searchPlan: {
-      queryVariants: plannedQueries,
-      engineRequests: totalEngineRequests,
+      queryVariants: preciseQueries,
+      engineRequests: Object.values(providerStats).reduce((s, p) => s + Number(p.ok || 0) + Number(p.failed || 0), 0),
       verificationRequested: verifyRequested,
-      verificationPerformed: flags.verificationPerformed,
-      verificationSucceeded: flags.verificationSucceeded,
+      verificationPerformed: validationCount,
+      verificationSucceeded: validationCount,
       commonCrawlEnabled: useCc,
-      commonCrawlPerformed: flags.commonCrawlPerformed,
-      publisherResolutionAttempted: flags.publisherResolutionAttempted,
-      publisherResolutionSucceeded: flags.publisherResolutionSucceeded,
-      dateIntent,
+      commonCrawlPerformed: final.filter(r => r.commonCrawl).length,
+      dateIntent: plan.dateIntent,
       streamed: true,
-      contentGuarantee: requireRealContent ? 'final results contain only validated live publisher/reader/PDF/transcript content; snippet-only candidates are excluded' : 'fallback content allowed because requireRealContent=false',
+      logStreamSupported: true,
       requireRealContent,
-      latencyTargetMs: SEARCH_WORK_BUDGET_MS,
-      concurrency: { search: SEARCH_CONCURRENCY, content: CONTENT_CONCURRENCY },
+      latencyTargetMs: SEARCH_BUDGET_MS,
+      deep,
+      aiRequested,
     },
-    results: finalResults,
-    warnings: [
-      'Discovery, publisher resolution, and page validation run concurrently under a bounded fast-path budget.',
-      'Validated page content is never replaced with a search snippet when requireRealContent=true.',
-      'Some sites can still block automation, require JavaScript/authentication, or expose media without machine-readable text; those candidates are excluded rather than mislabeled.',
-      ...warnings,
-    ],
+    liveLog: logger.logs,
+    results: final,
+    warnings: [],
   };
-
-  cacheSet(SEARCH_CACHE, cacheKey, result);
+  if (requireRealContent && final.length < count) result.warnings.push(`Only ${final.length} validated relevant sources completed within the crawler budget; ${count} were requested. No snippet-only sources were substituted.`);
+  if (!final.length) result.warnings.push('No source satisfied the current content/relevance contract. No fabricated page content was emitted.');
+  if (result.latencyMs > SEARCH_BUDGET_MS) result.warnings.push('The outer platform/runtime may have added latency beyond the crawler work budget.');
   return result;
-}
-
-function corsHeaders() {
-  return {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store, no-transform',
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET,POST,OPTIONS',
-    'access-control-allow-headers': 'content-type, authorization, x-arix-search-key',
-    'x-arix-crawler-version': VERSION,
-  };
-}
-
-function withCors(body, status = 200) {
-  return new Response(JSON.stringify(body, null, 2), { status, headers: corsHeaders() });
-}
-
-function encodeJson(value) { return JSON.stringify(value); }
-
-function streamSearch(input) {
-  const encoder = new TextEncoder();
-  const started = Date.now();
-  const deadline = started + SEARCH_WORK_BUDGET_MS;
-  const query = truncate(String(input.query ?? input.q ?? '').trim(), MAX_QUERY_LEN);
-  const count = parseCount(input.count ?? input.limit ?? DEFAULT_RESULTS);
-  const mode = String(input.mode || 'auto').toLowerCase();
-
-  const stream = new ReadableStream({
-    start(controller) {
-      let closed = false;
-      const enqueue = chunk => {
-        if (closed) return;
-        try { controller.enqueue(encoder.encode(chunk)); } catch { closed = true; }
-      };
-
-      // IMPORTANT: this is valid JSON immediately. Do not replace it with whitespace.
-      enqueue('{"ok":true,"version":' + encodeJson(VERSION) + ',"query":' + encodeJson(query) + ',"requestedResults":' + String(count) + ',"mode":' + encodeJson(mode) + ',"streaming":true,"results":[');
-
-      const heartbeat = setInterval(() => enqueue('\n'), STREAM_HEARTBEAT_MS);
-
-      Promise.resolve()
-        .then(() => performSearch(input, started, deadline))
-        .then(result => {
-          clearInterval(heartbeat);
-          const results = Array.isArray(result.results) ? result.results : [];
-          results.forEach((r, i) => {
-            enqueue((i ? ',' : '') + JSON.stringify(r));
-          });
-          const metadata = { ...result };
-          delete metadata.results;
-          enqueue('],');
-          const entries = Object.entries(metadata);
-          entries.forEach(([key, value], i) => enqueue(JSON.stringify(key) + ':' + JSON.stringify(value) + (i === entries.length - 1 ? '' : ',')));
-          enqueue('}');
-          try { controller.close(); } catch {}
-          closed = true;
-        })
-        .catch(error => {
-          clearInterval(heartbeat);
-          enqueue('],"returnedResults":0,"generatedAt":' + encodeJson(nowIso()) + ',"latencyMs":' + String(Date.now() - started) + ',"keylessCoreSearch":true,"groqUsed":false,"resultsError":' + encodeJson(error?.message || 'SEARCH_FAILED') + ',"warnings":["The search stream failed safely after the response had already started."]}');
-          try { controller.close(); } catch {}
-          closed = true;
-        });
-    },
-  });
-
-  return new Response(stream, {
-    status: 200,
-    headers: { ...corsHeaders(), 'x-arix-search-stream': '1', 'x-arix-stream-heartbeat-ms': String(STREAM_HEARTBEAT_MS) },
-  });
 }
 
 async function readInput(req) {
@@ -2743,18 +1116,104 @@ async function readInput(req) {
   try { return JSON.parse(raw); } catch { return Object.fromEntries(new URLSearchParams(raw).entries()); }
 }
 
-export default async function handler(req) {
-  if (req.method === 'OPTIONS') return withCors({ ok: true, version: VERSION });
-  if (!['GET', 'POST'].includes(req.method)) return withCors({ ok: false, error: 'METHOD_NOT_ALLOWED', message: 'Use GET or POST.' }, 405);
+function corsHeaders(contentType = 'application/json; charset=utf-8') {
+  return {
+    'content-type': contentType,
+    'cache-control': 'no-store, no-transform',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET,POST,OPTIONS',
+    'access-control-allow-headers': 'content-type, authorization, x-arix-search-key',
+    'x-arix-crawler-version': VERSION,
+  };
+}
 
+function jsonResponse(body, status = 200) { return new Response(JSON.stringify(body, null, 2), { status, headers: corsHeaders() }); }
+
+function streamJsonSearch(input) {
+  const encoder = new TextEncoder();
+  const started = Date.now();
+  const logger = createLogger();
+  const query = truncate(String(input.query ?? input.q ?? '').trim(), MAX_QUERY_LEN);
+  const count = safeInt(input.count ?? input.limit, DEFAULT_RESULTS, 1, MAX_RESULTS);
+  const mode = String(input.mode || 'auto').toLowerCase();
+  const deadline = started + SEARCH_BUDGET_MS;
+
+  const stream = new ReadableStream({
+    start(controller) {
+      let closed = false;
+      const send = chunk => { if (!closed) { try { controller.enqueue(encoder.encode(chunk)); } catch { closed = true; } } };
+      logger.add('request-start', `Starting live search for ${query}.`, { count, mode });
+      send(`{"ok":true,"version":${encode(VERSION)},"query":${encode(query)},"requestedResults":${count},"mode":${encode(mode)},"streaming":true,"results":[`);
+      const heartbeat = setInterval(() => send('\n'), STREAM_HEARTBEAT_MS);
+      Promise.resolve().then(() => performSearch(input, started, logger, deadline)).then(result => {
+        clearInterval(heartbeat);
+        const results = Array.isArray(result.results) ? result.results : [];
+        results.forEach((r, i) => send(`${i ? ',' : ''}${JSON.stringify(r)}`));
+        const metadata = { ...result };
+        delete metadata.results;
+        send('],');
+        const entries = Object.entries(metadata);
+        entries.forEach(([k, v], i) => send(`${JSON.stringify(k)}:${JSON.stringify(v)}${i === entries.length - 1 ? '' : ','}`));
+        send('}');
+        try { controller.close(); } catch {}
+        closed = true;
+      }).catch(error => {
+        clearInterval(heartbeat);
+        send(`],"returnedResults":0,"generatedAt":${encode(nowIso())},"latencyMs":${Date.now() - started},"keylessCoreSearch":true,"groqUsed":false,"resultsError":${encode(error?.message || 'SEARCH_FAILED')},"liveLog":${JSON.stringify(logger.logs)},"warnings":[${encode('The crawler failed safely after the stream had already started.').replace(/\[|\]/g,'')}]}`);
+        try { controller.close(); } catch {}
+        closed = true;
+      });
+    },
+  });
+  return new Response(stream, { status: 200, headers: { ...corsHeaders(), 'x-arix-search-stream': '1', 'x-arix-stream-heartbeat-ms': String(STREAM_HEARTBEAT_MS) } });
+}
+
+function streamSseSearch(input) {
+  const encoder = new TextEncoder();
+  const started = Date.now();
+  const logger = createLogger();
+  const stream = new ReadableStream({
+    start(controller) {
+      let closed = false;
+      const sendEvent = (event, data) => {
+        if (closed) return;
+        try { controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)); } catch { closed = true; }
+      };
+      const heartbeat = setInterval(() => sendEvent('heartbeat', { at: nowIso(), version: VERSION }), STREAM_HEARTBEAT_MS);
+      const originalAdd = logger.add;
+      logger.add = (event, message, extra = {}) => {
+        originalAdd(event, message, extra);
+        sendEvent('log', logger.logs[logger.logs.length - 1]);
+      };
+      Promise.resolve().then(() => performSearch(input, started, logger)).then(result => {
+        clearInterval(heartbeat);
+        sendEvent('result', result);
+        sendEvent('done', { ok: true, latencyMs: Date.now() - started });
+        try { controller.close(); } catch {}
+        closed = true;
+      }).catch(error => {
+        clearInterval(heartbeat);
+        sendEvent('error', { ok: false, error: error?.message || 'SEARCH_FAILED', latencyMs: Date.now() - started });
+        try { controller.close(); } catch {}
+        closed = true;
+      });
+    },
+  });
+  return new Response(stream, { status: 200, headers: { ...corsHeaders('text/event-stream; charset=utf-8'), 'x-arix-log-stream': 'sse' } });
+}
+
+export default async function handler(req) {
+  if (req.method === 'OPTIONS') return jsonResponse({ ok: true, version: VERSION });
+  if (!['GET', 'POST'].includes(req.method)) return jsonResponse({ ok: false, version: VERSION, error: 'METHOD_NOT_ALLOWED', message: 'Use GET or POST.' }, 405);
   try {
     const input = await readInput(req);
     const query = truncate(String(input.query ?? input.q ?? '').trim(), MAX_QUERY_LEN);
-    if (!query) return withCors({ ok: false, error: 'MISSING_QUERY', message: 'Provide query in ?query=... or a JSON body with {"query":"..."}.' }, 400);
-    if (query.length < 2) return withCors({ ok: false, error: 'QUERY_TOO_SHORT' }, 400);
-    return streamSearch(input);
+    if (!query) return jsonResponse({ ok: false, version: VERSION, error: 'MISSING_QUERY' }, 400);
+    if (query.length < 2) return jsonResponse({ ok: false, version: VERSION, error: 'QUERY_TOO_SHORT' }, 400);
+    const wantsSse = String(input.logStream || '').toLowerCase() === 'true' || req.headers.get('accept')?.includes('text/event-stream');
+    return wantsSse ? streamSseSearch(input) : streamJsonSearch(input);
   } catch (error) {
-    const tooLarge = error?.message === 'REQUEST_BODY_TOO_LARGE';
-    return withCors({ ok: false, version: VERSION, error: tooLarge ? 'REQUEST_BODY_TOO_LARGE' : 'SEARCH_FAILED', message: error?.message || 'Unexpected crawler error' }, tooLarge ? 413 : 500);
+    const status = error?.message === 'REQUEST_BODY_TOO_LARGE' ? 413 : 500;
+    return jsonResponse({ ok: false, version: VERSION, error: error?.message || 'SEARCH_FAILED' }, status);
   }
 }
