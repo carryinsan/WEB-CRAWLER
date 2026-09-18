@@ -1,16 +1,16 @@
 /*
  * ArixAI Precision Page Algorithm
- * v1.5.0 (Full Page Content Extractor Edition)
+ * v1.6.0 (Defense-in-Depth Extractor Edition)
  * 
- * Purpose: Advanced query planning, REAL page acquisition, highly robust HTML/SPA extraction, 
- * analytics/ad rejection, and post-fetch query comparison.
+ * Purpose: Advanced query planning, REAL page acquisition, robust HTML/SPA extraction, 
+ * analytics/ad rejection, search wrapper unwrapping, and post-fetch query comparison.
  */
 
 export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-content-algorithm-1.5.0';
+const VERSION = 'arix-content-algorithm-1.6.0';
 const MAX_RESULTS = 40;
 const MAX_QUERY_LEN = 700;
 const MAX_CANDIDATES = 500;
@@ -18,7 +18,6 @@ const MAX_PAGE_BYTES = 1_000_000;
 const MAX_TEXT_CHARS = 24_000;
 const MIN_REAL_CONTENT = 150;
 
-// Increased timeouts to ensure we have enough time to fetch and extract complex pages
 const DEFAULT_BUDGET_MS = 14_500;
 const PAGE_TIMEOUT_MS = 4_500;
 const READER_TIMEOUT_MS = 5_200;
@@ -102,6 +101,32 @@ function tokens(v) {
 }
 function unique(arr) { return [...new Set(arr.filter(Boolean))]; }
 
+function unwrapUrl(url) {
+  try {
+    let current = String(url || '');
+    const u = new URL(current);
+    
+    // Bing Wrapper Decoding
+    if (u.hostname.includes('bing.com') && u.pathname.startsWith('/ck/a')) {
+      const uParam = u.searchParams.get('u');
+      if (uParam && uParam.startsWith('a1')) {
+        let b64 = uParam.slice(2).replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        const decoded = atob(b64);
+        if (/^https?:\/\//i.test(decoded)) return decoded;
+      }
+    }
+    
+    // Google Wrapper Decoding
+    if (u.hostname.includes('google.') && u.pathname === '/url') {
+      const q = u.searchParams.get('q') || u.searchParams.get('url');
+      if (q && /^https?:\/\//i.test(q)) return q;
+    }
+    
+    return current;
+  } catch { return url; }
+}
+
 function safeUrl(url) {
   try {
     const u = new URL(url);
@@ -155,42 +180,34 @@ function decodeHtml(v = '') {
 }
 
 function strip(html = '') {
-  // 1. Completely obliterate dangerous and noisy structural tags.
   let s = String(html)
     .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(script|style|noscript|iframe|nav|footer|aside|header|form|menu|dialog|canvas|svg|button|map|object|embed|picture|video|audio)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ');
-
-  // 2. Eradicate common UI wrappers, ads, sidebars, cookie popups, and analytics via class/id patterns.
-  s = s.replace(/<div\b[^>]*\b(?:class|id)=["']?(?:[^"']*(?:cookie|banner|nav-|footer|sidebar|advert|promo|menu|widget|social|modal|popup|consent|related|share|comments|ad-|sponsor|search|auth|login|signup))["']?[^>]*>[\s\S]*?<\/div>/gi, ' ');
-
-  // 3. Remove all remaining HTML tags
-  s = s.replace(/<[^>]+>/g, ' ');
-
+    .replace(/<(script|style|noscript|iframe|nav|footer|aside|header|form|menu|dialog|canvas|svg|button|map|object|embed|picture|video|audio)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<div\b[^>]*\b(?:class|id)=["']?(?:[^"']*(?:cookie|banner|nav-|footer|sidebar|advert|promo|menu|widget|social|modal|popup|consent|related|share|comments|ad-|sponsor|search|auth|login|signup))["']?[^>]*>[\s\S]*?<\/div>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ');
   return decodeHtml(s).replace(/\s+/g, ' ').trim();
 }
 
 function cleanContent(v) {
   let s = String(v || '').replace(/\s+/g, ' ').trim();
-  // Remove markdown artifacts
   s = s.replace(/\[[^\]]{0,80}\]\([^)]{0,500}\)/g, '');
   s = s.replace(/!\[[^\]]*\]\([^)]*\)/g, '');
-  // Remove obvious inline JS or CSS blocks that slipped through the HTML stripper
   s = s.replace(/(?:\bfunction\b|\bconst\b|\blet\b|\bvar\b|\bwindow\.|document\.|console\.)[^;{}]+?[;{}]/gi, ' ');
-  // Remove boilerplate navigation links
   s = s.replace(/(?:skip to content|accept cookies|cookie settings|privacy settings|sign in|log in|search this site)\b/gi, ' ');
   return truncate(s.replace(/\s+/g, ' ').trim(), MAX_TEXT_CHARS);
 }
 
 function isBotChallenge(text) {
   const t = String(text || '').toLowerCase();
-  // Genuine articles are usually long. Bot challenges are brief stubs.
   if (t.length > 4500) return false; 
   const triggers = [
     'just a moment...', 'checking your browser', 'enable javascript and cookies',
     'please enable js', 'cloudflare', 'cf-browser-verification', 'verify you are human',
     'security check to access', 'why do i have to complete a captcha', 'attention required!',
     'robot or human', 'datadome', 'perimeterx', 'access denied', '403 forbidden',
-    'checking if the site connection is secure', 'needs to review the security of your connection'
+    'checking if the site connection is secure', 'needs to review the security of your connection',
+    'are you a robot', 'verifying you are not a robot', 'pardon our interruption',
+    'to proceed, please verify', 'complete the security check', 'help us keep your account safe'
   ];
   return triggers.some(trigger => t.includes(trigger));
 }
@@ -221,8 +238,7 @@ function extractStringsFromObj(obj, outArray, maxDepth = 6) {
   if (maxDepth <= 0 || !obj) return;
   if (typeof obj === 'string') {
     const t = obj.trim();
-    // Keep substantial sentences/paragraphs. Ignore code, URLs, and tiny UI labels.
-    if (t.length > 80 && !t.startsWith('http') && !t.startsWith('/') && t.includes(' ')) {
+    if (t.length > 60 && t.includes(' ') && !/^http|^\/|^<[^>]+>|^[.{#a-z0-9_-]+\s*\{/i.test(t)) {
       outArray.push(t);
     }
     return;
@@ -232,8 +248,7 @@ function extractStringsFromObj(obj, outArray, maxDepth = 6) {
       for (const item of obj) extractStringsFromObj(item, outArray, maxDepth - 1);
     } else {
       for (const key of Object.keys(obj)) {
-        // Skip purely technical keys
-        if (key.startsWith('__') || /css|style|class|config/i.test(key)) continue;
+        if (key.startsWith('__') || /css|style|class|config|url|src|href|id|key/i.test(key)) continue;
         extractStringsFromObj(obj[key], outArray, maxDepth - 1);
       }
     }
@@ -242,14 +257,10 @@ function extractStringsFromObj(obj, outArray, maxDepth = 6) {
 
 function extractSpaState(html) {
   const out = [];
-  // Target Next.js, Nuxt, or general JSON payload islands
   const scripts = String(html).match(/<script[^>]+type=["']application\/json["'][^>]*>[\s\S]*?<\/script>/gi) || [];
   for (const block of scripts) {
     const raw = block.replace(/^<[\s\S]*?>/i, '').replace(/<\/script>$/i, '');
-    try {
-      const data = JSON.parse(raw.trim());
-      extractStringsFromObj(data, out);
-    } catch {}
+    try { extractStringsFromObj(JSON.parse(raw.trim()), out); } catch {}
   }
   return out.join('\n\n');
 }
@@ -258,30 +269,23 @@ function extractJsonLdBody(html) {
   const out = [];
   for (const block of String(html).match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/gi) || []) {
     const raw = block.replace(/^<[\s\S]*?>/i, '').replace(/<\/script>$/i, '');
-    try {
-      const value = JSON.parse(raw.trim());
-      extractStringsFromObj(value, out);
-    } catch {}
+    try { extractStringsFromObj(JSON.parse(raw.trim()), out); } catch {}
   }
-  return out;
+  return out.join('\n\n');
 }
 
 function extractArticleText(html) {
-  // Pre-clean removes the vast majority of junk (navs, footers, scripts, ads, sidebars)
   const cleanHtml = String(html || '')
     .replace(/<!--[\s\S]*?-->/g, ' ')
     .replace(/<(script|style|noscript|iframe|nav|footer|aside|header|form|menu|dialog|canvas|svg|button|map|object|embed|picture|video|audio)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
     .replace(/<div\b[^>]*\b(?:class|id)=["']?(?:[^"']*(?:cookie|banner|nav-|footer|sidebar|advert|promo|menu|widget|social|modal|popup|consent|related|share|comments|ad-|sponsor|search|auth|login|signup))["']?[^>]*>[\s\S]*?<\/div>/gi, ' ');
 
-  // 1. Check for JSON-LD schema (NewsArticle, Article, etc) which is often pristine
-  const jsonLd = cleanContent(extractJsonLdBody(html).join('\n\n'));
+  const jsonLd = cleanContent(extractJsonLdBody(html));
   if (jsonLd.length >= 300 && !isBotChallenge(jsonLd)) return jsonLd;
 
-  // 2. Check SPA Data (Next.js __NEXT_DATA__, Nuxt, Apollo state)
   const spaText = cleanContent(extractSpaState(html));
   if (spaText.length >= 300 && !isBotChallenge(spaText)) return spaText;
 
-  // 3. Extract core Semantic blocks (<article>, <main>)
   let mainBlocks = [];
   for (const m of cleanHtml.matchAll(/<(article|main)\b[^>]*>([\s\S]*?)<\/\1>/gi)) {
      const t = strip(m[2]);
@@ -292,7 +296,6 @@ function extractArticleText(html) {
      if (mText.length >= 300 && !isBotChallenge(mText)) return mText;
   }
 
-  // 4. Extract common Content Divs
   let divBlocks = [];
   for (const m of cleanHtml.matchAll(/<div\b[^>]*\b(?:class|id)=["']?(?:[^"']*(?:content|article|body|post|story|text))["']?[^>]*>([\s\S]*?)<\/div>/gi)) {
      const t = strip(m[1]);
@@ -303,17 +306,14 @@ function extractArticleText(html) {
      if (dText.length >= 300 && !isBotChallenge(dText)) return dText;
   }
 
-  // 5. General Paragraphs fallback
   const pBlocks = [];
   for (const m of cleanHtml.matchAll(/<(?:p|h[1-6]|li|blockquote)\b[^>]*>([\s\S]*?)<\/(?:p|h[1-6]|li|blockquote)>/gi)) {
     const t = strip(m[1]);
-    // Only accept paragraphs with enough words to filter out UI links/buttons
     if (t.length >= 40 && t.split(/\s+/).length >= 6) pBlocks.push(t);
   }
   const pText = cleanContent(pBlocks.join('\n\n'));
   if (pText.length >= 300 && !isBotChallenge(pText)) return pText;
 
-  // 6. Ultimate fallback: just strip everything from the remaining body
   const body = cleanHtml.match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
   const fallbackText = cleanContent(strip(body ? body[1] : cleanHtml));
   if (!isBotChallenge(fallbackText) && fallbackText.length >= MIN_REAL_CONTENT) return fallbackText;
@@ -344,7 +344,7 @@ async function fetchResponse(url, timeout, deadline, headers = {}) {
       redirect: 'follow',
       signal: controller.signal,
       headers: {
-        'user-agent': 'Mozilla/5.0 (compatible; ArixAI-PageAlgorithm/1.5.0; +https://lexis-ai-chatini.vercel.app/)',
+        'user-agent': 'Mozilla/5.0 (compatible; ArixAI-PageAlgorithm/1.6.0; +https://lexis-ai-chatini.vercel.app/)',
         'accept': 'text/html,application/xhtml+xml,application/pdf,text/plain;q=0.9,*/*;q=0.2',
         'accept-language': 'en-IN,en;q=0.9',
         ...headers,
@@ -461,7 +461,6 @@ function typeFits(c, plan) {
 export function comparePageToQuery(query, page = {}) {
   const plan = analyzeQuery(query, { type: page.type || '' });
   const title = String(page.title || ''); 
-  // Safety check: if snippet is passed in lieu of full content, ensure it's evaluated properly
   const body = String(page.pageContent || page.extractedText || page.content || page.rawContent || page.snippet || ''); 
   const all = `${title} ${body}`;
   const canonSet = value => { const out = new Set(); for (const x of tokens(value)) out.add(SYNONYM_INDEX.get(x) || x); return out; };
@@ -506,58 +505,78 @@ export function rankCandidates(candidates, queryOrPlan, options = {}) {
 }
 
 async function readerContent(candidate, plan, deadline) {
-  if (!safeUrl(candidate.url) || blocked(candidate.url) || left(deadline) < 350) return null;
-  let u;
+  const unwrapped = unwrapUrl(candidate.url);
+  if (!safeUrl(unwrapped) || blocked(unwrapped) || left(deadline) < 350) return null;
+  
   try {
-    // Jina Reader natively reads standard URLs.
-    u = `https://r.jina.ai/${candidate.url}`;
-  } catch { return null; }
-  try {
-    const res = await fetchResponse(u, READER_TIMEOUT_MS, deadline, { accept: 'text/plain,text/markdown;q=0.9,*/*;q=0.2' });
+    let res = await fetchResponse(`https://r.jina.ai/${unwrapped}`, READER_TIMEOUT_MS, deadline, { accept: 'text/plain,text/markdown;q=0.9,*/*;q=0.2' });
+    
+    // Jina HTTP Fallback if HTTPS fails
+    if (!res.ok && unwrapped.startsWith('https://')) {
+       const httpFallback = unwrapped.replace('https://', 'http://');
+       res = await fetchResponse(`https://r.jina.ai/${httpFallback}`, READER_TIMEOUT_MS, deadline, { accept: 'text/plain,text/markdown;q=0.9,*/*;q=0.2' });
+    }
+    
     if (!res.ok) return null;
     const raw = await readText(res, MAX_PAGE_BYTES, deadline);
     
-    // Parse Markdown response from Jina Reader
     const title = raw.match(/^Title:\s*(.+)$/im)?.[1]?.trim() || candidate.title;
-    const sourceUrl = raw.match(/^URL Source:\s*(\S+)$/im)?.[1]?.trim() || candidate.url;
+    const sourceUrl = raw.match(/^URL Source:\s*(\S+)$/im)?.[1]?.trim() || unwrapped;
     const text = textFromMarkdown(raw);
     
-    // Check against title-only and bot challenges
-    if (text.length < MIN_REAL_CONTENT || isBotChallenge(text) || text === title) return null;
+    if (text.length < MIN_REAL_CONTENT || isBotChallenge(text) || text === title || text === candidate.snippet) return null;
     
+    // VERY IMPORTANT: candidate.url MUST remain the original tracking URL, otherwise crawler.js matching fails!
     const rel = comparePageToQuery(plan.query, { ...candidate, title, pageContent: text });
-    return { ...candidate, title, pageContent: text, extractedText: text, contentStatus: 'reader', contentMethod: 'jina-reader', contentSourceUrl: sourceUrl, contentLength: text.length, contentConfidence: 0.88, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, relevanceAccepted: false, verified: true, verificationMethod: 'jina-reader', contentType: 'text/markdown' };
+    return { ...candidate, url: candidate.url, title, pageContent: text, extractedText: text, contentStatus: 'reader', contentMethod: 'jina-reader', contentSourceUrl: sourceUrl, contentLength: text.length, contentConfidence: 0.88, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, relevanceAccepted: false, verified: true, verificationMethod: 'jina-reader', contentType: 'text/markdown' };
   } catch { return null; }
 }
 
 async function directContent(candidate, plan, deadline) {
-  const cache = contentCacheGet(candidate.url); if (cache) return { ...candidate, ...cache };
-  if (!safeUrl(candidate.url) || blocked(candidate.url) || left(deadline) < 350) return null;
+  const unwrapped = unwrapUrl(candidate.url);
+  const cache = contentCacheGet(candidate.url); 
+  if (cache) return { ...candidate, ...cache, url: candidate.url };
+  if (!safeUrl(unwrapped) || blocked(unwrapped) || left(deadline) < 350) return null;
   
   const directJob = (async () => {
     try {
-      const res = await fetchResponse(candidate.url, PAGE_TIMEOUT_MS, deadline);
-      const finalUrl = normalizedUrl(res.url || candidate.url) || candidate.url;
-      const ct = String(res.headers.get('content-type') || '').toLowerCase();
+      let res = await fetchResponse(unwrapped, PAGE_TIMEOUT_MS, deadline);
+      let finalUrl = normalizedUrl(res.url || unwrapped) || unwrapped;
+      let ct = String(res.headers.get('content-type') || '').toLowerCase();
       if (!safeUrl(finalUrl) || blocked(finalUrl)) return null;
       
       if (/application\/pdf/i.test(ct) || /\.pdf(?:\?|$)/i.test(finalUrl)) {
         const bytes = await readBytes(res, MAX_PAGE_BYTES, deadline);
         const text = await extractPdfText(bytes, deadline).catch(() => '');
         if (text.length < MIN_REAL_CONTENT) return null;
-        const rel = comparePageToQuery(plan.query, { ...candidate, url: finalUrl, pageContent: text });
-        return { ...candidate, url: finalUrl, domain: host(finalUrl), pageContent: text, extractedText: text, contentStatus: 'full', contentMethod: 'direct-pdf-text', contentSourceUrl: finalUrl, contentLength: text.length, contentConfidence: 0.94, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, verified: Boolean(res.ok), httpStatus: res.status, contentType: ct || 'application/pdf', verificationMethod: 'direct-pdf-text' };
+        const rel = comparePageToQuery(plan.query, { ...candidate, pageContent: text });
+        // Keeping candidate.url as original wrapped URL to allow merging in crawler.js
+        const out = { ...candidate, url: candidate.url, contentSourceUrl: finalUrl, domain: host(finalUrl), pageContent: text, extractedText: text, contentStatus: 'full', contentMethod: 'direct-pdf-text', contentLength: text.length, contentConfidence: 0.94, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, verified: Boolean(res.ok), httpStatus: res.status, contentType: ct || 'application/pdf', verificationMethod: 'direct-pdf-text' };
+        contentCacheSet(candidate.url, stripCached(out)); return out;
       }
       
       if (!res.ok) return null;
-      const body = await readText(res, MAX_PAGE_BYTES, deadline);
+      let body = await readText(res, MAX_PAGE_BYTES, deadline);
+      
+      // Auto-Follow Meta Refresh for wrappers that don't do native HTTP redirects
+      const metaRefresh = body.match(/<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?\d+;\s*url=['"]?([^"'>]+)['"]?/i);
+      if (metaRefresh && metaRefresh[1] && left(deadline) > 1000) {
+          const redirectUrl = new URL(metaRefresh[1].replace(/&amp;/g, '&'), finalUrl).href;
+          if (safeUrl(redirectUrl) && !blocked(redirectUrl)) {
+              res = await fetchResponse(redirectUrl, PAGE_TIMEOUT_MS, deadline);
+              finalUrl = normalizedUrl(res.url || redirectUrl) || redirectUrl;
+              ct = String(res.headers.get('content-type') || '').toLowerCase();
+              body = await readText(res, MAX_PAGE_BYTES, deadline);
+          }
+      }
+
       if (/javascript|ecmascript|json|xml|css/i.test(ct) || /^\s*(?:\{|\[|function\s)/.test(body)) return null;
       
       if (/text\/plain/i.test(ct) && body.trim().length >= MIN_REAL_CONTENT) {
         const text = cleanContent(body);
-        if (isBotChallenge(text)) return null; // Reject plain text Cloudflare challenges
-        const rel = comparePageToQuery(plan.query, { ...candidate, url: finalUrl, pageContent: text });
-        const out = { ...candidate, url: finalUrl, title: truncate(candidate.title || 'Text page', 300), domain: host(finalUrl), pageContent: text, extractedText: text, contentStatus: 'full', contentMethod: 'direct-text', contentSourceUrl: finalUrl, contentLength: text.length, contentConfidence: 0.9, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, verified: true, httpStatus: res.status, contentType: ct || 'text/plain', verificationMethod: 'direct-text' };
+        if (isBotChallenge(text)) return null; 
+        const rel = comparePageToQuery(plan.query, { ...candidate, pageContent: text });
+        const out = { ...candidate, url: candidate.url, contentSourceUrl: finalUrl, title: truncate(candidate.title || 'Text page', 300), domain: host(finalUrl), pageContent: text, extractedText: text, contentStatus: 'full', contentMethod: 'direct-text', contentLength: text.length, contentConfidence: 0.9, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, verified: true, httpStatus: res.status, contentType: ct || 'text/plain', verificationMethod: 'direct-text' };
         contentCacheSet(candidate.url, stripCached(out)); return out;
       }
       
@@ -565,15 +584,13 @@ async function directContent(candidate, plan, deadline) {
       const canonical = extractCanonical(body, finalUrl);
       const usableCanonical = canonical && safeUrl(canonical) && !blocked(canonical) ? canonical : finalUrl;
       
-      // Highly robust text extraction using new multi-layered SPA and HTML extraction
       const text = extractArticleText(body);
       
-      // Reject if it's a bot challenge, barely any text, or just returned the title
-      if (text.length < MIN_REAL_CONTENT || isBotChallenge(text) || text === title) return null;
+      if (text.length < MIN_REAL_CONTENT || isBotChallenge(text) || text === title || text === candidate.snippet) return null;
       
-      const rel = comparePageToQuery(plan.query, { ...candidate, url: usableCanonical, title, pageContent: text });
+      const rel = comparePageToQuery(plan.query, { ...candidate, title, pageContent: text });
       const publishedAt = extractMeta(body, 'article:published_time') || extractMeta(body, 'datePublished') || ((body.match(/<time[^>]+datetime=["']([^"']+)["']/i) || [])[1] || null);
-      const out = { ...candidate, url: usableCanonical, title: truncate(title, 300), snippet: truncate(extractMeta(body, 'description') || candidate.snippet, 1200), publishedAt, domain: host(usableCanonical), pageContent: text, extractedText: text, contentStatus: 'full', contentMethod: ARTICLE_PATH.test(usableCanonical) ? 'direct-html-article' : 'direct-html', contentSourceUrl: usableCanonical, contentLength: text.length, contentConfidence: 0.92, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, verified: true, httpStatus: res.status, contentType: ct || 'text/html', verificationMethod: 'direct-html' };
+      const out = { ...candidate, url: candidate.url, contentSourceUrl: usableCanonical, title: truncate(title, 300), snippet: truncate(extractMeta(body, 'description') || candidate.snippet, 1200), publishedAt, domain: host(usableCanonical), pageContent: text, extractedText: text, contentStatus: 'full', contentMethod: ARTICLE_PATH.test(usableCanonical) ? 'direct-html-article' : 'direct-html', contentLength: text.length, contentConfidence: 0.92, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, verified: true, httpStatus: res.status, contentType: ct || 'text/html', verificationMethod: 'direct-html' };
       
       contentCacheSet(candidate.url, stripCached(out)); 
       return out;
@@ -606,7 +623,7 @@ export function isRealSourceContent(result) {
   const m = String(result?.contentMethod || '').toLowerCase();
   if (c.length < MIN_REAL_CONTENT || isBotChallenge(c)) return false;
   if (['snippet', 'search-snippet', 'metadata', 'metadata-fallback'].includes(s) || m === 'search-snippet') return false;
-  if (blocked(result?.contentSourceUrl || result?.url)) return false;
+  if (blocked(unwrapUrl(result?.contentSourceUrl || result?.url))) return false;
   return ['full', 'reader'].includes(s) || /direct-html|direct-pdf|jina-reader/i.test(m);
 }
 
@@ -626,7 +643,7 @@ export async function enrichCandidates(candidates, queryOrPlan, options = {}) {
   const dedupe = new Map();
   for (const raw of Array.isArray(candidates) ? candidates : []) {
     const url = normalizedUrl(raw?.url || raw?.link || '');
-    if (!url || blocked(url) || !typeFits({ ...raw, url }, plan)) continue;
+    if (!url || blocked(unwrapUrl(url)) || !typeFits({ ...raw, url }, plan)) continue;
     const key = normalizedKey(url);
     if (!dedupe.has(key)) dedupe.set(key, { ...raw, url, title: truncate(raw?.title || '', 500), snippet: truncate(raw?.snippet || '', 2500), type: raw?.type || 'web' });
   }
