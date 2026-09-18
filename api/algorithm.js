@@ -108,6 +108,7 @@ function unwrapUrl(url) {
     let current = String(url || '').replace(/&amp;/gi, '&');
     const u = new URL(current);
     
+    // Auto-unwrap Bing tracking links completely
     if (u.hostname.includes('bing.com') && u.pathname.startsWith('/ck/a')) {
       let uParam = u.searchParams.get('u');
       if (uParam) {
@@ -263,12 +264,14 @@ function extractSpaState(html) {
   const out = [];
   const htmlStr = String(html);
   
+  // Extracts Next.js / Nuxt / Apollo / Storefront state dumps reliably
   const jsonScripts = htmlStr.match(/<script[^>]*type=["']application\/(?:ld\+)?json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
   for (const block of jsonScripts) {
     const raw = block.replace(/^<[^>]+>/i, '').replace(/<\/script>$/i, '');
     try { extractStringsFromObj(JSON.parse(raw.trim()), out); } catch {}
   }
 
+  // Extracts window.__INITIAL_STATE__ typical of ecommerce sites (Flipkart, Croma, etc)
   const stateScripts = htmlStr.match(/<script[^>]*>\s*(?:window\.[a-zA-Z0-9_]+\s*=\s*|\s*var\s+[a-zA-Z0-9_]+\s*=\s*)(\{[\s\S]*?\})\s*;/gi) || [];
   for (const block of stateScripts) {
     const match = block.match(/(?:window\.[a-zA-Z0-9_]+\s*=\s*|\s*var\s+[a-zA-Z0-9_]+\s*=\s*)(\{[\s\S]*?\})\s*;/i);
@@ -289,6 +292,7 @@ function extractArticleText(html) {
   if (jsonLd.length >= 300 && !isBotChallenge(jsonLd)) return jsonLd;
 
   let mainBlocks = [];
+  // Target semantic articles and ecommerce product content divs explicitly
   for (const m of cleanHtml.matchAll(/<(article|main|div\s+[^>]*class=["'][^"']*(?:product|content|detail|description)[^"']*["'])[^>]*>([\s\S]*?)<\/\1>/gi)) {
      const t = strip(m[2]);
      if (t.length >= 50) mainBlocks.push(t);
@@ -355,6 +359,7 @@ async function fetchAndRead(url, timeout, deadline, maxBytes = MAX_PAGE_BYTES, h
         return { ok: false, status: res.status, url: res.url, headers: res.headers, bytes: new Uint8Array(0), text: '' };
     }
 
+    // arrayBuffer delegates GZIP/Brotli decompression to runtime natively, preventing empty/corrupted reads.
     const buf = await res.arrayBuffer();
     const bytes = new Uint8Array(buf.slice(0, maxBytes));
     return {
@@ -525,7 +530,7 @@ async function directContent(candidate, plan, deadline) {
   try {
     let res = await fetchAndRead(unwrapped, PAGE_TIMEOUT_MS, deadline);
     let finalUrl = normalizedUrl(res.url || unwrapped) || unwrapped;
-    let ct = String(res.headers?.get('content-type') || '').toLowerCase();
+    let ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
     if (!safeUrl(finalUrl) || blocked(finalUrl)) return null;
     
     if (/application\/pdf/i.test(ct) || /\.pdf(?:\?|$)/i.test(finalUrl)) {
@@ -543,7 +548,7 @@ async function directContent(candidate, plan, deadline) {
         if (safeUrl(redirectUrl) && !blocked(redirectUrl)) {
             res = await fetchAndRead(redirectUrl, PAGE_TIMEOUT_MS, deadline);
             finalUrl = normalizedUrl(res.url || redirectUrl) || redirectUrl;
-            ct = String(res.headers?.get('content-type') || '').toLowerCase();
+            ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
         }
     }
 
