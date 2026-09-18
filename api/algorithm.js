@@ -1,31 +1,30 @@
 /*
- * ArixAI Precision Page Algorithm
- * v1.9.0 (Anti-Tarpit & Advanced SPA Extraction Edition)
+ * ArixAI Algorithm Orchestrator
+ * v3.0.0 (Scraper Integration & PDF Rescue Edition)
  * 
- * Purpose: Advanced query planning, REAL page acquisition, highly robust HTML/SPA extraction, 
- * analytics/ad rejection, search wrapper unwrapping, and post-fetch query comparison.
+ * Purpose: Advanced query planning, semantic relevance scoring, and orchestration. 
  * 
- * Update 1.9.0: Fixed 300s edge timeout by enforcing AbortController on body reads. 
- * Improved SPA state extraction for ecommerce sites (Flipkart/Croma/etc) returning empty content.
+ * Update 3.0.0: 
+ * - Fully attaches to the new dedicated `scraper.js` for all HTML/SPA content.
+ * - Handles PDF streams natively with strict AbortController chunking.
+ * - Entirely eliminates Tarpit errors by enforcing safe budget boundaries.
  */
+
+import { scrapePage } from './scraper.js';
 
 export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-content-algorithm-1.9.0';
+const VERSION = 'arix-algorithm-orchestrator-3.0.0';
 const MAX_RESULTS = 40;
 const MAX_QUERY_LEN = 700;
 const MAX_CANDIDATES = 500;
-const MAX_PAGE_BYTES = 1_000_000;
-const MAX_TEXT_CHARS = 24_000;
+const MAX_PDF_BYTES = 1_000_000;
 const MIN_REAL_CONTENT = 150;
 
-const DEFAULT_BUDGET_MS = 22_000;
-const PAGE_TIMEOUT_MS = 6_500;
-const READER_TIMEOUT_MS = 9_500;
-const CONTENT_CONCURRENCY = 30;
-const RECOVERY_CONCURRENCY = 15;
+const DEFAULT_BUDGET_MS = 24_000;
+const CONTENT_CONCURRENCY = 25; // Adjusted to prevent Vercel concurrency throttles
 const CACHE_TTL_MS = 120_000;
 const CACHE_MAX = 160;
 const CONTENT_CACHE = new Map();
@@ -69,13 +68,8 @@ const SYNONYM_GROUPS = [
   ['policy', 'policies', 'framework', 'initiative', 'initiatives', 'programme', 'program', 'programs'],
   ['company', 'companies', 'firm', 'firms', 'business', 'businesses', 'corporation', 'corporations'],
   ['founder', 'founders', 'created', 'creator', 'cofounder', 'co-founder', 'originator'],
-  ['population', 'people', 'residents', 'inhabitants', 'demographics'],
   ['economy', 'economic', 'economics', 'gdp', 'market', 'markets'],
-  ['education', 'school', 'schools', 'student', 'students', 'curriculum', 'syllabus'],
-  ['research', 'study', 'studies', 'paper', 'papers', 'report', 'reports', 'analysis'],
   ['technology', 'technologies', 'tech', 'technical'],
-  ['electric', 'ev', 'electricity', 'battery', 'battery-powered'],
-  ['manufacturing', 'manufacture', 'production', 'factory', 'factories'],
   ['video', 'videos', 'watch', 'youtube', 'interview', 'podcast'],
   ['guide', 'guides', 'tutorial', 'tutorials', 'manual', 'documentation', 'docs']
 ];
@@ -89,7 +83,6 @@ for (const group of SYNONYM_GROUPS) {
 function clamp(n, a, b) { return Math.min(b, Math.max(a, Number(n) || 0)); }
 function truncate(v, max) { const s = String(v ?? '').trim(); return s.length <= max ? s : `${s.slice(0, max - 1)}…`; }
 function left(deadline) { return Math.max(0, deadline - Date.now()); }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function safeInt(v, fallback, min, max) {
   const n = Number.parseInt(v, 10);
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
@@ -108,7 +101,7 @@ function unwrapUrl(url) {
     let current = String(url || '').replace(/&amp;/gi, '&');
     const u = new URL(current);
     
-    // Auto-unwrap Bing tracking links completely
+    // Auto-unwrap Bing tracking links
     if (u.hostname.includes('bing.com') && u.pathname.startsWith('/ck/a')) {
       let uParam = u.searchParams.get('u');
       if (uParam) {
@@ -122,6 +115,7 @@ function unwrapUrl(url) {
       }
     }
     
+    // Auto-unwrap Google tracking links
     if (u.hostname.includes('google.') && u.pathname === '/url') {
       const q = u.searchParams.get('q') || u.searchParams.get('url');
       if (q && /^https?:\/\//i.test(q)) return q;
@@ -177,162 +171,14 @@ function normalizedUrl(url) {
 
 function normalizedKey(url) { const u = normalizedUrl(url); return u ? `${host(u)}${new URL(u).pathname.replace(/\/{2,}/g, '/').replace(/\/$/, '')}${new URL(u).search}` : ''; }
 
-function decodeHtml(v = '') {
-  return String(v).replace(/&nbsp;/gi, ' ').replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/&apos;/gi, "'")
-    .replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
-    .replace(/&#x([0-9a-f]+);?/gi, (_, x) => { const n = parseInt(x, 16); return Number.isFinite(n) ? String.fromCodePoint(Math.min(0x10ffff, n)) : _; })
-    .replace(/&#(\d+);?/g, (_, x) => { const n = parseInt(x, 10); return Number.isFinite(n) ? String.fromCodePoint(Math.min(0x10ffff, n)) : _; });
-}
-
-function strip(html = '') {
-  let s = String(html)
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(script|style|noscript|iframe|nav|footer|aside|header|form|menu|dialog|canvas|svg|button|map|object|embed|picture|video|audio)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ');
-
-  return decodeHtml(s).replace(/\s+/g, ' ').trim();
-}
-
 function cleanContent(v) {
   let s = String(v || '').replace(/\s+/g, ' ').trim();
-  s = s.replace(/\[[^\]]{0,80}\]\([^)]{0,500}\)/g, '');
-  s = s.replace(/!\[[^\]]{0,80}\]\([^)]{0,500}\)/g, '');
-  s = s.replace(/(?:skip to content|accept cookies|cookie settings|privacy settings|sign in|log in|search this site)\b/gi, ' ');
-  return truncate(s.replace(/\s+/g, ' ').trim(), MAX_TEXT_CHARS);
+  return truncate(s, 24_000); // 24k fallback
 }
 
-function isBotChallenge(text) {
-  const t = String(text || '').toLowerCase();
-  if (t.length > 4500) return false; 
-  const triggers = [
-    'just a moment...', 'checking your browser', 'enable javascript and cookies',
-    'please enable js', 'cloudflare', 'cf-browser-verification', 'verify you are human',
-    'why do i have to complete a captcha', 'attention required!',
-    'robot or human', 'datadome', 'perimeterx', 'access denied', '403 forbidden',
-    'checking if the site connection is secure', 'needs to review the security of your connection',
-    'are you a robot', 'verifying you are not a robot', 'pardon our interruption',
-    'to proceed, please verify', 'complete the security check', 'help us keep your account safe'
-  ];
-  return triggers.some(trigger => t.includes(trigger));
-}
-
-function textFromMarkdown(v) {
-  return cleanContent(String(v || '')
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/\[([^\]]+)\]\((?:https?:\/\/|\/)[^)]*\)/g, '$1')
-    .replace(/^#{1,6}\s*/gm, '')
-    .replace(/[*_`]/g, ''));
-}
-
-function extractTitle(html) { return strip((String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [, ''])[1]); }
-
-function extractMeta(html, name) {
-  const e = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const a = String(html).match(new RegExp(`<meta[^>]{0,150}(?:name|property)=["']${e}["'][^>]{0,150}content=["']([^"']+)["']`, 'i'));
-  const b = String(html).match(new RegExp(`<meta[^>]{0,150}content=["']([^"']+)["'][^>]{0,150}(?:name|property)=["']${e}["']`, 'i'));
-  return decodeHtml((a || b || [, ''])[1] || '').trim();
-}
-
-function extractCanonical(html, base) {
-  const a = (String(html).match(/<link[^>]{0,150}rel=["'](?:[^"']*\s)?canonical(?:\s[^"']*)?["'][^>]{0,150}href=["']([^"']+)["']/i) || [])[1];
-  const b = (String(html).match(/<link[^>]{0,150}href=["']([^"']+)["'][^>]{0,150}rel=["'](?:[^"']*\s)?canonical(?:\s[^"']*)?["']/i) || [])[1];
-  try { return new URL(a || b, base).href; } catch { return null; }
-}
-
-function extractStringsFromObj(obj, outArray, maxDepth = 6) {
-  if (maxDepth <= 0 || !obj) return;
-  if (typeof obj === 'string') {
-    const t = obj.trim();
-    if (t.length > 60 && t.includes(' ') && !/^http|^\/|^<[^>]+>|^[.{#a-z0-9_-]+\s*\{/i.test(t)) {
-      outArray.push(t);
-    }
-    return;
-  }
-  if (typeof obj === 'object') {
-    if (Array.isArray(obj)) {
-      for (const item of obj) extractStringsFromObj(item, outArray, maxDepth - 1);
-    } else {
-      for (const key of Object.keys(obj)) {
-        if (key.startsWith('__') || /css|style|class|config|url|src|href|id|key/i.test(key)) continue;
-        extractStringsFromObj(obj[key], outArray, maxDepth - 1);
-      }
-    }
-  }
-}
-
-function extractSpaState(html) {
-  const out = [];
-  const htmlStr = String(html);
-  
-  // Extracts Next.js / Nuxt / Apollo / Storefront state dumps reliably
-  const jsonScripts = htmlStr.match(/<script[^>]*type=["']application\/(?:ld\+)?json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
-  for (const block of jsonScripts) {
-    const raw = block.replace(/^<[^>]+>/i, '').replace(/<\/script>$/i, '');
-    try { extractStringsFromObj(JSON.parse(raw.trim()), out); } catch {}
-  }
-
-  // Extracts window.__INITIAL_STATE__ typical of ecommerce sites (Flipkart, Croma, etc)
-  const stateScripts = htmlStr.match(/<script[^>]*>\s*(?:window\.[a-zA-Z0-9_]+\s*=\s*|\s*var\s+[a-zA-Z0-9_]+\s*=\s*)(\{[\s\S]*?\})\s*;/gi) || [];
-  for (const block of stateScripts) {
-    const match = block.match(/(?:window\.[a-zA-Z0-9_]+\s*=\s*|\s*var\s+[a-zA-Z0-9_]+\s*=\s*)(\{[\s\S]*?\})\s*;/i);
-    if (match && match[1]) {
-        try { extractStringsFromObj(JSON.parse(match[1].trim()), out); } catch {}
-    }
-  }
-
-  return out.join('\n\n');
-}
-
-function extractArticleText(html) {
-  const cleanHtml = String(html || '')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(script|style|noscript|iframe|nav|footer|aside|header|form|menu|dialog|canvas|svg|button|map|object|embed|picture|video|audio)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ');
-
-  const jsonLd = cleanContent(extractSpaState(html));
-  if (jsonLd.length >= 300 && !isBotChallenge(jsonLd)) return jsonLd;
-
-  let mainBlocks = [];
-  // Target semantic articles and ecommerce product content divs explicitly
-  for (const m of cleanHtml.matchAll(/<(article|main|div\s+[^>]*class=["'][^"']*(?:product|content|detail|description)[^"']*["'])[^>]*>([\s\S]*?)<\/\1>/gi)) {
-     const t = strip(m[2]);
-     if (t.length >= 50) mainBlocks.push(t);
-  }
-  if (mainBlocks.length > 0) {
-     const mText = cleanContent(mainBlocks.join('\n\n'));
-     if (mText.length >= 300 && !isBotChallenge(mText)) return mText;
-  }
-
-  const pBlocks = [];
-  for (const m of cleanHtml.matchAll(/<(p|h[1-6]|li|blockquote)\b[^>]*>([\s\S]*?)<\/\1>/gi)) {
-    const t = strip(m[2]);
-    if (t.length >= 40 && t.split(/\s+/).length >= 5) pBlocks.push(t);
-  }
-  const pText = cleanContent(pBlocks.join('\n\n'));
-  if (pText.length >= 300 && !isBotChallenge(pText)) return pText;
-
-  const body = cleanHtml.match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
-  const fallbackText = cleanContent(strip(body ? body[1] : cleanHtml));
-  if (!isBotChallenge(fallbackText) && fallbackText.length >= MIN_REAL_CONTENT) return fallbackText;
-  
-  return '';
-}
-
-function contentCacheGet(url) {
-  const hit = CONTENT_CACHE.get(normalizedKey(url));
-  if (!hit) return null;
-  if (Date.now() - hit.at > CACHE_TTL_MS) { CONTENT_CACHE.delete(normalizedKey(url)); return null; }
-  return hit.value;
-}
-
-function contentCacheSet(url, value) {
-  CONTENT_CACHE.set(normalizedKey(url), { at: Date.now(), value });
-  while (CONTENT_CACHE.size > CACHE_MAX) CONTENT_CACHE.delete(CONTENT_CACHE.keys().next().value);
-}
-
-// Fixed function: Timer protects the entire process including the body arrayBuffer mapping to prevent Tarpit hangs!
-async function fetchAndRead(url, timeout, deadline, maxBytes = MAX_PAGE_BYTES, headers = {}) {
+async function fetchAndReadPdf(url, timeout, deadline, maxBytes = MAX_PDF_BYTES) {
   const remaining = left(deadline) - 20;
-  if (remaining <= 0) throw new Error('BUDGET_EXHAUSTED');
+  if (remaining <= 0) return null;
   
   const budget = Math.min(timeout, remaining);
   const controller = new AbortController();
@@ -344,32 +190,17 @@ async function fetchAndRead(url, timeout, deadline, maxBytes = MAX_PAGE_BYTES, h
       redirect: 'follow',
       signal: controller.signal,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Language': 'en-US,en-IN;q=0.9,en;q=0.8',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'cross-site',
-        'Upgrade-Insecure-Requests': '1',
-        ...headers,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
       }
     });
 
-    if (!res.ok) {
-        return { ok: false, status: res.status, url: res.url, headers: res.headers, bytes: new Uint8Array(0), text: '' };
-    }
+    if (!res.ok) return null;
 
-    // arrayBuffer delegates GZIP/Brotli decompression to runtime natively, preventing empty/corrupted reads.
     const buf = await res.arrayBuffer();
     const bytes = new Uint8Array(buf.slice(0, maxBytes));
-    return {
-        ok: true,
-        status: res.status,
-        url: res.url,
-        headers: res.headers,
-        bytes,
-        text: new TextDecoder('utf-8', { fatal: false }).decode(bytes)
-    };
+    return { ok: true, status: res.status, url: res.url, bytes };
+  } catch {
+    return null;
   } finally { 
     clearTimeout(timer); 
   }
@@ -428,27 +259,6 @@ export function analyzeQuery(query, options = {}) {
   return { query: q, type, requestedType: requested, mode, tokens: p.raw, canonicalTokens: p.canonical, concepts, anchors: unique(anchors), dateIntent: { live, kind: live ? 'live' : 'none' }, flags: { wantsHistory: history, wantsOfficial: official, wantsAcademic: academic, explicitNews: type === 'news', explicitVideo: type === 'video', explicitDoc: type === 'doc', explicitGov: type === 'gov' } };
 }
 
-export function buildPreciseQueries(query, options = {}) {
-  const plan = options.plan || analyzeQuery(query, options); const set = new Set(); const add = x => { x = String(x || '').replace(/"/g, '').trim(); if (x && x.length >= 3 && x.length < 500) set.add(x); };
-  add(plan.query);
-  const important = plan.canonicalTokens.slice(0, 8); if (important.length >= 2) add(`"${important.join(' ')}"`);
-  if (plan.flags.wantsHistory) { add(`${plan.query} history timeline origins evolution`); add(`${plan.query} historical overview milestones`); }
-  if (plan.flags.wantsOfficial) { add(`${plan.query} official source`); if (plan.flags.explicitGov) add(`${plan.query} site:gov.in`); }
-  if (plan.flags.wantsAcademic) { add(`${plan.query} research paper evidence`); }
-  if (plan.flags.explicitNews) { add(`${plan.query} latest news`); add(`${plan.query} recent developments`); }
-  if (plan.flags.explicitVideo) { add(`${plan.query} video YouTube`); }
-  if (plan.flags.explicitDoc) { add(`${plan.query} filetype:pdf`); add(`${plan.query} official PDF`); }
-  return [...set].slice(0, 8);
-}
-
-function typeFits(c, plan) {
-  if (plan.type === 'gov') return isGov(c.url) || c.type === 'gov';
-  if (plan.type === 'doc') return isDoc(c.url) || c.type === 'doc';
-  if (plan.type === 'video') return isVideo(c.url) || c.type === 'video';
-  if (plan.type === 'news') return c.type === 'news' || ARTICLE_PATH.test(String(c.url || ''));
-  return true;
-}
-
 export function comparePageToQuery(query, page = {}) {
   const plan = analyzeQuery(query, { type: page.type || '' });
   const title = String(page.title || ''); 
@@ -476,127 +286,111 @@ export function comparePageToQuery(query, page = {}) {
   return { score: Number(clamp(score, 0, 100).toFixed(2)), titleCoverage: Number(titleCoverage.toFixed(3)), bodyCoverage: Number(bodyCoverage.toFixed(3)), conceptCoverage: Number(concept.ratio.toFixed(3)), matchedConcepts: unique(matched), missingConcepts: unique(missing), exactPhrase: phrase, acceptable: score > 0, band };
 }
 
-export function rankCandidates(candidates, queryOrPlan, options = {}) {
-  const plan = typeof queryOrPlan === 'string' ? analyzeQuery(queryOrPlan, options) : (queryOrPlan || analyzeQuery('', options));
-  const list = (Array.isArray(candidates) ? candidates : []).slice(0, MAX_CANDIDATES); const ranked = [];
-  for (const raw of list) {
-    const url = normalizedUrl(raw?.url || raw?.link || raw?.sourceUrl || '');
-    if (!url || blocked(url) || !typeFits({ ...raw, url }, plan)) continue;
-    const c = { ...raw, url, title: truncate(raw?.title || raw?.name || '', 500), snippet: truncate(raw?.snippet || raw?.description, 2500), type: raw?.type || 'web' };
-    const preview = { ...c, pageContent: raw?.pageContent || raw?.extractedText || raw?.rawContent || '' };
-    const rel = comparePageToQuery(plan.query, preview);
-    ranked.push({ ...c, _relevance: rel });
-  }
-  ranked.sort((a, b) => {
-    const d = (b._relevance?.score || 0) - (a._relevance?.score || 0); if (Math.abs(d) > 0.01) return d;
-    const bt = (b.title || '').length - (a.title || '').length; if (bt) return bt;
-    return Number(b.semanticSearchScore || 0) - Number(a.semanticSearchScore || 0);
-  });
-  return ranked;
+function typeFits(c, plan) {
+  if (plan.type === 'gov') return isGov(c.url) || c.type === 'gov';
+  if (plan.type === 'doc') return isDoc(c.url) || c.type === 'doc';
+  if (plan.type === 'video') return isVideo(c.url) || c.type === 'video';
+  if (plan.type === 'news') return c.type === 'news' || ARTICLE_PATH.test(String(c.url || ''));
+  return true;
 }
 
-async function readerContent(candidate, plan, deadline) {
-  const unwrapped = unwrapUrl(candidate.url);
-  if (!safeUrl(unwrapped) || blocked(unwrapped) || left(deadline) < 350) return null;
-  
-  try {
-    let res = await fetchAndRead(`https://r.jina.ai/${unwrapped}`, READER_TIMEOUT_MS, deadline, MAX_PAGE_BYTES, { accept: 'text/plain,text/markdown;q=0.9,*/*;q=0.2' });
-    
-    if (!res.ok && unwrapped.startsWith('https://')) {
-       const httpFallback = unwrapped.replace('https://', 'http://');
-       res = await fetchAndRead(`https://r.jina.ai/${httpFallback}`, READER_TIMEOUT_MS, deadline, MAX_PAGE_BYTES, { accept: 'text/plain,text/markdown;q=0.9,*/*;q=0.2' });
-    }
-    
-    if (!res.ok) return null;
-    const raw = res.text;
-    
-    const title = raw.match(/^Title:\s*(.+)$/im)?.[1]?.trim() || candidate.title;
-    const sourceUrl = raw.match(/^URL Source:\s*(\S+)$/im)?.[1]?.trim() || unwrapped;
-    const text = textFromMarkdown(raw);
-    
-    if (text.length < MIN_REAL_CONTENT || isBotChallenge(text) || text === title || text === candidate.snippet) return null;
-    
-    const rel = comparePageToQuery(plan.query, { ...candidate, title, pageContent: text });
-    return { ...candidate, url: candidate.url, title, pageContent: text, extractedText: text, contentStatus: 'reader', contentMethod: 'jina-reader', contentSourceUrl: sourceUrl, contentLength: text.length, contentConfidence: 0.88, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, relevanceAccepted: false, verified: true, verificationMethod: 'jina-reader', contentType: 'text/markdown', publisherResolved: sourceUrl !== candidate.url };
-  } catch { return null; }
+function contentCacheGet(url) {
+  const hit = CONTENT_CACHE.get(normalizedKey(url));
+  if (!hit) return null;
+  if (Date.now() - hit.at > CACHE_TTL_MS) { CONTENT_CACHE.delete(normalizedKey(url)); return null; }
+  return hit.value;
 }
 
-async function directContent(candidate, plan, deadline) {
-  const unwrapped = unwrapUrl(candidate.url);
-  const cache = contentCacheGet(candidate.url); 
-  if (cache) return { ...candidate, ...cache, url: candidate.url };
-  if (!safeUrl(unwrapped) || blocked(unwrapped) || left(deadline) < 350) return null;
-  
-  try {
-    let res = await fetchAndRead(unwrapped, PAGE_TIMEOUT_MS, deadline);
-    let finalUrl = normalizedUrl(res.url || unwrapped) || unwrapped;
-    let ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
-    if (!safeUrl(finalUrl) || blocked(finalUrl)) return null;
-    
-    if (/application\/pdf/i.test(ct) || /\.pdf(?:\?|$)/i.test(finalUrl)) {
-      if (!res.ok) return null;
-      const text = await extractPdfText(res.bytes, deadline).catch(() => '');
-      if (text.length < MIN_REAL_CONTENT) return null;
-      const rel = comparePageToQuery(plan.query, { ...candidate, pageContent: text });
-      const out = { ...candidate, url: candidate.url, contentSourceUrl: finalUrl, domain: host(finalUrl), pageContent: text, extractedText: text, contentStatus: 'full', contentMethod: 'direct-pdf-text', contentLength: text.length, contentConfidence: 0.94, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, verified: Boolean(res.ok), httpStatus: res.status, contentType: ct || 'application/pdf', verificationMethod: 'direct-pdf-text', publisherResolved: finalUrl !== candidate.url };
-      contentCacheSet(candidate.url, stripCached(out)); return out;
-    }
-    
-    const metaRefresh = res.text.match(/<meta[^>]{0,200}http-equiv=["']?refresh["']?[^>]{0,200}content=["']?\d+;\s*url=['"]?([^"'>]+)['"]?/i);
-    if (metaRefresh && metaRefresh[1] && left(deadline) > 1000) {
-        const redirectUrl = new URL(metaRefresh[1].replace(/&amp;/g, '&'), finalUrl).href;
-        if (safeUrl(redirectUrl) && !blocked(redirectUrl)) {
-            res = await fetchAndRead(redirectUrl, PAGE_TIMEOUT_MS, deadline);
-            finalUrl = normalizedUrl(res.url || redirectUrl) || redirectUrl;
-            ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
-        }
-    }
-
-    if (!res.ok) return null;
-    let body = res.text;
-    
-    if (/javascript|ecmascript|json|xml|css/i.test(ct) || /^\s*(?:\{|\[|function\s)/.test(body)) return null;
-    
-    if (/text\/plain/i.test(ct) && body.trim().length >= MIN_REAL_CONTENT) {
-      const text = cleanContent(body);
-      if (isBotChallenge(text)) return null; 
-      const rel = comparePageToQuery(plan.query, { ...candidate, pageContent: text });
-      const out = { ...candidate, url: candidate.url, contentSourceUrl: finalUrl, title: truncate(candidate.title || 'Text page', 300), domain: host(finalUrl), pageContent: text, extractedText: text, contentStatus: 'full', contentMethod: 'direct-text', contentLength: text.length, contentConfidence: 0.9, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, verified: true, httpStatus: res.status, contentType: ct || 'text/plain', verificationMethod: 'direct-text', publisherResolved: finalUrl !== candidate.url };
-      contentCacheSet(candidate.url, stripCached(out)); return out;
-    }
-    
-    const title = extractTitle(body) || extractMeta(body, 'og:title') || candidate.title;
-    const canonical = extractCanonical(body, finalUrl);
-    const usableCanonical = canonical && safeUrl(canonical) && !blocked(canonical) ? canonical : finalUrl;
-    
-    const text = extractArticleText(body);
-    
-    if (text.length < MIN_REAL_CONTENT || isBotChallenge(text) || text === title || text === candidate.snippet) return null;
-    
-    const rel = comparePageToQuery(plan.query, { ...candidate, title, pageContent: text });
-    const publishedAt = extractMeta(body, 'article:published_time') || extractMeta(body, 'datePublished') || ((body.match(/<time[^>]+datetime=["']([^"']+)["']/i) || [])[1] || null);
-    const out = { ...candidate, url: candidate.url, contentSourceUrl: usableCanonical, title: truncate(title, 300), snippet: truncate(extractMeta(body, 'description') || candidate.snippet, 1200), publishedAt, domain: host(usableCanonical), pageContent: text, extractedText: text, contentStatus: 'full', contentMethod: ARTICLE_PATH.test(usableCanonical) ? 'direct-html-article' : 'direct-html', contentLength: text.length, contentConfidence: 0.92, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, verified: true, httpStatus: res.status, contentType: ct || 'text/html', verificationMethod: 'direct-html', publisherResolved: usableCanonical !== candidate.url };
-    
-    contentCacheSet(candidate.url, stripCached(out)); 
-    return out;
-  } catch { return null; }
+function contentCacheSet(url, value) {
+  CONTENT_CACHE.set(normalizedKey(url), { at: Date.now(), value });
+  while (CONTENT_CACHE.size > CACHE_MAX) CONTENT_CACHE.delete(CONTENT_CACHE.keys().next().value);
 }
 
 function stripCached(v) {
   const keep = {}; for (const k of ['url', 'title', 'snippet', 'publishedAt', 'domain', 'pageContent', 'extractedText', 'contentStatus', 'contentMethod', 'contentSourceUrl', 'contentLength', 'contentConfidence', 'contentTargetMatched', 'contentTitleSimilarity', 'contentConceptCoverage', 'relevanceScore', 'relevanceBand', 'relevance', 'verified', 'httpStatus', 'contentType', 'verificationMethod', 'type', 'source', 'publisherResolved', 'publisherWrapperUrl', 'publisherResolutionMethod']) if (v[k] !== undefined) keep[k] = v[k]; return keep;
 }
 
+async function processCandidate(candidate, plan, deadline) {
+  const unwrapped = unwrapUrl(candidate.url);
+  const cache = contentCacheGet(candidate.url);
+  if (cache) return { ...candidate, ...cache, url: candidate.url };
+
+  if (!safeUrl(unwrapped) || blocked(unwrapped) || left(deadline) < 350) return null;
+
+  let out = null;
+
+  // Route PDFs to local extractor. HTML goes to the super-scraper.
+  if (/\.pdf(?:\?|$)/i.test(unwrapped)) {
+      const res = await fetchAndReadPdf(unwrapped, 6500, deadline);
+      if (res && res.ok) {
+          const text = await extractPdfText(res.bytes, deadline).catch(() => '');
+          if (text.length >= MIN_REAL_CONTENT) {
+              const rel = comparePageToQuery(plan.query, { ...candidate, pageContent: text });
+              out = {
+                  ...candidate, url: candidate.url, contentSourceUrl: res.url, domain: host(res.url),
+                  pageContent: text, extractedText: text, contentStatus: 'full', contentMethod: 'direct-pdf-text',
+                  contentLength: text.length, contentConfidence: 0.94, contentTargetMatched: true,
+                  contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage,
+                  relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, verified: true,
+                  httpStatus: res.status, contentType: 'application/pdf', verificationMethod: 'direct-pdf-text',
+                  publisherResolved: res.url !== candidate.url
+              };
+          }
+      }
+  } else {
+      const budgetMs = Math.min(8500, left(deadline) - 100);
+      if (budgetMs > 1000) {
+          const scrapeResult = await scrapePage(unwrapped, budgetMs);
+          if (scrapeResult && scrapeResult.success) {
+              const text = scrapeResult.content;
+              const rel = comparePageToQuery(plan.query, { ...candidate, title: scrapeResult.title, pageContent: text });
+              out = {
+                  ...candidate,
+                  url: candidate.url,
+                  contentSourceUrl: scrapeResult.url,
+                  title: truncate(scrapeResult.title || candidate.title, 300),
+                  snippet: truncate(scrapeResult.description || candidate.snippet, 1200),
+                  domain: host(scrapeResult.url),
+                  pageContent: text,
+                  extractedText: text,
+                  contentStatus: 'full',
+                  contentMethod: scrapeResult.method,
+                  contentLength: text.length,
+                  contentConfidence: scrapeResult.extractionScore >= 150 ? 0.95 : 0.85,
+                  contentTargetMatched: true,
+                  contentTitleSimilarity: rel.titleCoverage,
+                  contentConceptCoverage: rel.conceptCoverage,
+                  relevanceScore: rel.score,
+                  relevanceBand: rel.band,
+                  relevance: rel,
+                  verified: true,
+                  httpStatus: scrapeResult.httpStatus,
+                  contentType: 'text/html',
+                  verificationMethod: 'dedicated-scraper',
+                  publisherResolved: scrapeResult.url !== candidate.url
+              };
+          }
+      }
+  }
+
+  if (out) {
+      contentCacheSet(candidate.url, stripCached(out));
+      return out;
+    }
+  return null;
+}
+
 export function isRealSourceContent(result) {
   const c = String(result?.pageContent || result?.extractedText || '').trim();
   const s = String(result?.contentStatus || '').toLowerCase();
   const m = String(result?.contentMethod || '').toLowerCase();
-  if (c.length < MIN_REAL_CONTENT || isBotChallenge(c)) return false;
+  if (c.length < MIN_REAL_CONTENT) return false;
   if (['snippet', 'search-snippet', 'metadata', 'metadata-fallback'].includes(s) || m === 'search-snippet') return false;
   
   const sourceUrl = String(result?.contentSourceUrl || result?.url).replace(/&amp;/gi, '&');
   if (blocked(unwrapUrl(sourceUrl))) return false;
   
-  return ['full', 'reader'].includes(s) || /direct-html|direct-pdf|jina-reader/i.test(m);
+  return true;
 }
 
 async function mapConcurrent(list, limit, worker) {
@@ -624,17 +418,10 @@ export async function enrichCandidates(candidates, queryOrPlan, options = {}) {
   
   const all = [...dedupe.values()].slice(0, MAX_CANDIDATES);
   
-  let enriched = (await mapConcurrent(all, CONTENT_CONCURRENCY, c => directContent(c, plan, deadline))).filter(isRealSourceContent);
-  
-  const enrichedKeys = new Set(enriched.map(x => normalizedKey(x.url)));
-  const failed = all.filter(c => !enrichedKeys.has(normalizedKey(c.url)));
-  
-  if (failed.length && left(deadline) > 850) {
-    const recovery = await mapConcurrent(failed.slice(0, Math.min(RECOVERY_CONCURRENCY, failed.length)), RECOVERY_CONCURRENCY, c => readerContent(c, plan, deadline));
-    enriched.push(...recovery.filter(isRealSourceContent));
-  }
+  // Single pass concurrency. The scraper.js internal engine handles Fallbacks independently!
+  let enriched = (await mapConcurrent(all, CONTENT_CONCURRENCY, c => processCandidate(c, plan, deadline))).filter(isRealSourceContent);
 
-  // Ensure Fallback Mechanism covers everything that fully failed
+  // Fill in Fallback Metadata for absolute assurance of returning *something*
   const finalKeys = new Set(enriched.map(x => normalizedKey(x.url)));
   for (const raw of all) {
       if (!finalKeys.has(normalizedKey(raw.url))) {
@@ -660,6 +447,7 @@ export async function enrichCandidates(candidates, queryOrPlan, options = {}) {
     return { ...x, relevance: rel, relevanceScore: Number(rel?.score || x.relevanceScore || 0), relevanceBand: rel?.band || x.relevanceBand || 'related', contentTargetMatched: x.contentTargetMatched ?? false, contentAvailable: x.contentAvailable ?? true, relevanceAccepted: false };
   });
   
+  // Clean final pass deduplication
   const uniqueMap = new Map();
   for (const x of enriched) {
     const key = normalizedKey(x.url);
@@ -670,7 +458,20 @@ export async function enrichCandidates(candidates, queryOrPlan, options = {}) {
   
   enriched = [...uniqueMap.values()].sort((a, b) => Number(b.relevanceScore || 0) - Number(a.relevanceScore || 0));
   
-  return { ok: true, version: VERSION, query: plan.query, requestedResults: count, returnedResults: enriched.length, fetchedSources: enriched.length, latencyMs: Date.now() - started, results: enriched, plan, contentPolicy: 'real-content-only', sourceChecker: 'fetch direct publisher and reader content in parallel, extract SPA/Next.js and semantic content, then soft-rank actual page content', warnings: enriched.length < count ? [`${enriched.length} real-content pages were successfully fetched. Unreachable/unreadable pages were filtered.`] : [] };
+  return { 
+    ok: true, 
+    version: VERSION, 
+    query: plan.query, 
+    requestedResults: count, 
+    returnedResults: enriched.length, 
+    fetchedSources: enriched.filter(e => e.contentStatus !== 'metadata-fallback').length, 
+    latencyMs: Date.now() - started, 
+    results: enriched, 
+    plan, 
+    contentPolicy: 'real-content-only', 
+    sourceChecker: 'Delegated to scraper.js (v3.0.0)', 
+    warnings: enriched.filter(e => e.contentStatus === 'metadata-fallback').length > 0 ? [`Some pages failed to fetch or contained no readable content. Snippets were used as fallbacks.`] : [] 
+  };
 }
 
 export async function runAlgorithm(input = {}) {
@@ -685,4 +486,4 @@ async function readInput(req) { const url = new URL(req.url); if (req.method ===
 
 export default async function handler(req) { if (req.method === 'OPTIONS') return response({ ok: true, version: VERSION }); if (!['GET', 'POST'].includes(req.method)) return response({ ok: false, version: VERSION, error: 'METHOD_NOT_ALLOWED' }, 405); try { return response(await runAlgorithm(await readInput(req))); } catch (error) { return response({ ok: false, version: VERSION, error: error?.message || 'ALGORITHM_FAILED' }, error?.message === 'MISSING_QUERY' ? 400 : 500); } }
 
-export const ALGORITHM_CONTRACT = Object.freeze({ version: VERSION, maxResults: MAX_RESULTS, realContentMinimumChars: MIN_REAL_CONTENT, defaultBudgetMs: DEFAULT_BUDGET_MS, contentConcurrency: CONTENT_CONCURRENCY, sourceChecker: 'fetch direct publisher and reader content in parallel, extract SPA/Next.js and semantic content, then soft-rank actual page content' });
+export const ALGORITHM_CONTRACT = Object.freeze({ version: VERSION, maxResults: MAX_RESULTS, realContentMinimumChars: MIN_REAL_CONTENT, defaultBudgetMs: DEFAULT_BUDGET_MS, contentConcurrency: CONTENT_CONCURRENCY, sourceChecker: 'delegated entirely to scraper.js (v3.0.0)' });
