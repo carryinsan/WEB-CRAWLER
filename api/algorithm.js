@@ -19,18 +19,19 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-content-algorithm-1.1.0';
+const VERSION = 'arix-content-algorithm-1.3.0';
 const MAX_RESULTS = 40;
 const MAX_QUERY_LEN = 700;
-const MAX_CANDIDATES = 160;
+const MAX_CANDIDATES = 500;
 const MAX_PAGE_BYTES = 800_000;
-const MAX_TEXT_CHARS = 30_000;
+const MAX_TEXT_CHARS = 18_000;
 const MIN_REAL_CONTENT = 120;
-const DEFAULT_BUDGET_MS = 8_200;
-const PAGE_TIMEOUT_MS = 1_650;
-const READER_TIMEOUT_MS = 1_850;
-const CONTENT_CONCURRENCY = 40;
-const RECOVERY_CONCURRENCY = 30;
+const DEFAULT_BUDGET_MS = 8_900;
+const PAGE_TIMEOUT_MS = 2_100;
+const READER_TIMEOUT_MS = 2_700;
+const CONTENT_CONCURRENCY = 48;
+const RECOVERY_CONCURRENCY = 36;
+const FIRST_WAVE_MIN_REMAINING_MS = 700;
 const CACHE_TTL_MS = 120_000;
 const CACHE_MAX = 160;
 
@@ -241,7 +242,7 @@ async function fetchResponse(url, timeout, deadline, headers={}) {
   const timer = setTimeout(()=>controller.abort(), budget);
   try {
     return await fetch(url,{method:'GET',redirect:'follow',signal:controller.signal,headers:{
-      'user-agent':'Mozilla/5.0 (compatible; ArixAI-PageAlgorithm/1.1; +https://lexis-ai-chatini.vercel.app/)',
+      'user-agent':'Mozilla/5.0 (compatible; ArixAI-PageAlgorithm/1.2.1; +https://lexis-ai-chatini.vercel.app/)',
       accept:'text/html,application/xhtml+xml,application/pdf,text/plain;q=0.9,*/*;q=0.2',
       'accept-language':'en-IN,en;q=0.9',...headers
     }});
@@ -390,35 +391,87 @@ export function rankCandidates(candidates, queryOrPlan, options={}) {
 }
 
 async function readerContent(candidate,plan,deadline){
-  if(!safeUrl(candidate.url)||blocked(candidate.url)||left(deadline)<500)return null;
-  const urls=[`https://r.jina.ai/http://${new URL(candidate.url).host}${new URL(candidate.url).pathname}${new URL(candidate.url).search}`,`https://r.jina.ai/https://${new URL(candidate.url).host}${new URL(candidate.url).pathname}${new URL(candidate.url).search}`];
-  for(const u of urls){ if(left(deadline)<420)break; try{const res=await fetchResponse(u,READER_TIMEOUT_MS,deadline,{accept:'text/plain,text/markdown;q=0.95,*/*;q=0.2'}); if(!res.ok)continue; const raw=await readText(res,MAX_PAGE_BYTES,deadline); const title=raw.match(/^Title:\s*(.+)$/im)?.[1]?.trim()||candidate.title; const text=textFromMarkdown(raw); if(text.length<MIN_REAL_CONTENT)continue; const rel=comparePageToQuery(plan.query,{...candidate,title,pageContent:text}); if(!rel.acceptable)continue; return {...candidate,title,pageContent:text,extractedText:text,contentStatus:'reader',contentMethod:'jina-reader',contentSourceUrl:candidate.url,contentLength:text.length,contentConfidence:0.88,contentTargetMatched:true,contentTitleSimilarity:rel.titleCoverage,contentConceptCoverage:rel.conceptCoverage,relevanceScore:rel.score,relevanceBand:rel.band,relevance:rel,verified:true,verificationMethod:'jina-reader',contentType:'text/markdown'};}catch{}}
-  return null;
+  if(!safeUrl(candidate.url)||blocked(candidate.url)||left(deadline)<350)return null;
+  let u;
+  try {
+    const target=new URL(candidate.url);
+    u=`https://r.jina.ai/http://${target.host}${target.pathname}${target.search}`;
+  } catch { return null; }
+  try {
+    const res=await fetchResponse(u,READER_TIMEOUT_MS,deadline,{accept:'text/plain,text/markdown;q=0.95,*/*;q=0.2'});
+    if(!res.ok)return null;
+    const raw=await readText(res,MAX_PAGE_BYTES,deadline);
+    const title=raw.match(/^Title:\s*(.+)$/im)?.[1]?.trim()||candidate.title;
+    const sourceUrl=raw.match(/^URL Source:\s*(\S+)$/im)?.[1]?.trim()||candidate.url;
+    const text=textFromMarkdown(raw);
+    if(text.length<MIN_REAL_CONTENT)return null;
+    // Reader content is accepted only when it is tied to the requested URL host.
+    const readerHost=host(sourceUrl);
+    const targetHost=host(candidate.url);
+    if(!readerHost || !targetHost || !(readerHost===targetHost || readerHost.endsWith(`.${targetHost}`) || targetHost.endsWith(`.${readerHost}`))) return null;
+    const rel=comparePageToQuery(plan.query,{...candidate,title,pageContent:text});
+    return {...candidate,title,pageContent:text,extractedText:text,contentStatus:'reader',contentMethod:'jina-reader',contentSourceUrl:sourceUrl,contentLength:text.length,contentConfidence:0.88,contentTargetMatched:true,contentTitleSimilarity:rel.titleCoverage,contentConceptCoverage:rel.conceptCoverage,relevanceScore:rel.score,relevanceBand:rel.band,relevance:rel,relevanceAccepted:false,verified:true,verificationMethod:'jina-reader',contentType:'text/markdown'};
+  } catch { return null; }
 }
 
 async function directContent(candidate,plan,deadline){
   const cache=contentCacheGet(candidate.url); if(cache)return {...candidate,...cache};
   if(!safeUrl(candidate.url)||blocked(candidate.url)||left(deadline)<350)return null;
-  try{
-    const res=await fetchResponse(candidate.url,PAGE_TIMEOUT_MS,deadline); const finalUrl=normalizedUrl(res.url||candidate.url)||candidate.url; const ct=String(res.headers.get('content-type')||'').toLowerCase();
-    if(/application\/pdf/i.test(ct)||/\.pdf(?:\?|$)/i.test(finalUrl)){
-      const bytes=await readBytes(res,MAX_PAGE_BYTES,deadline); let text=''; try{text=await extractPdfText(bytes,deadline);}catch{}
-      if(text.length<MIN_REAL_CONTENT){const reader=await readerContent({...candidate,url:finalUrl},plan,deadline);if(reader){contentCacheSet(candidate.url,stripCached(reader));return reader;}return null;}
-      const rel=comparePageToQuery(plan.query,{...candidate,url:finalUrl,pageContent:text}); if(!rel.acceptable)return null;
-      const out={...candidate,url:finalUrl,pageContent:text,extractedText:text,contentStatus:'full',contentMethod:'direct-pdf-text',contentSourceUrl:finalUrl,contentLength:text.length,contentConfidence:0.94,contentTargetMatched:true,contentTitleSimilarity:rel.titleCoverage,contentConceptCoverage:rel.conceptCoverage,relevanceScore:rel.score,relevanceBand:rel.band,relevance:rel,verified:Boolean(res.ok),httpStatus:res.status,contentType:ct||'application/pdf',verificationMethod:'direct-pdf-text'}; contentCacheSet(candidate.url,stripCached(out)); return out;
-    }
-    if(!res.ok){return await readerContent({...candidate,url:finalUrl},plan,deadline);}
-    const body=await readText(res,MAX_PAGE_BYTES,deadline);
-    if(/javascript|ecmascript|json|xml|css/i.test(ct)||/^\s*(?:\{|\[|function\s)/.test(body))return await readerContent({...candidate,url:finalUrl},plan,deadline);
-    const title=extractTitle(body)||extractMeta(body,'og:title')||candidate.title; const canonical=extractCanonical(body,finalUrl); const usableCanonical=canonical&&safeUrl(canonical)&&!blocked(canonical)?canonical:finalUrl;
-    let text=extractArticleText(body); if(text.length<MIN_REAL_CONTENT)return await readerContent({...candidate,url:usableCanonical,title},plan,deadline);
-    const rel=comparePageToQuery(plan.query,{...candidate,url:usableCanonical,title,pageContent:text});
-    if(!rel.acceptable){return null;}
-    const publishedAt=extractMeta(body,'article:published_time')||extractMeta(body,'datePublished')||((body.match(/<time[^>]+datetime=["']([^"']+)["']/i)||[, ''])[1]||null);
-    const out={...candidate,url:usableCanonical,title:truncate(title,300),snippet:truncate(extractMeta(body,'description')||candidate.snippet,1200),publishedAt,domain:host(usableCanonical),pageContent:text,extractedText:text,contentStatus:'full',contentMethod:ARTICLE_PATH.test(usableCanonical)?'direct-html-article':'direct-html',contentSourceUrl:usableCanonical,contentLength:text.length,contentConfidence:0.92,contentTargetMatched:true,contentTitleSimilarity:rel.titleCoverage,contentConceptCoverage:rel.conceptCoverage,relevanceScore:rel.score,relevanceBand:rel.band,relevance:rel,verified:true,httpStatus:res.status,contentType:ct||'text/html',verificationMethod:'direct-html'};
-    contentCacheSet(candidate.url,stripCached(out)); return out;
-  }catch{return null;}
+
+  const directJob=(async()=>{
+    try{
+      const res=await fetchResponse(candidate.url,PAGE_TIMEOUT_MS,deadline);
+      const finalUrl=normalizedUrl(res.url||candidate.url)||candidate.url;
+      const ct=String(res.headers.get('content-type')||'').toLowerCase();
+      if(!safeUrl(finalUrl)||blocked(finalUrl))return null;
+
+      if(/application\/pdf/i.test(ct)||/\.pdf(?:\?|$)/i.test(finalUrl)){
+        const bytes=await readBytes(res,MAX_PAGE_BYTES,deadline);
+        const text=await extractPdfText(bytes,deadline).catch(()=> '');
+        if(text.length<MIN_REAL_CONTENT)return null;
+        const rel=comparePageToQuery(plan.query,{...candidate,url:finalUrl,pageContent:text});
+        return {...candidate,url:finalUrl,domain:host(finalUrl),pageContent:text,extractedText:text,contentStatus:'full',contentMethod:'direct-pdf-text',contentSourceUrl:finalUrl,contentLength:text.length,contentConfidence:0.94,contentTargetMatched:true,contentTitleSimilarity:rel.titleCoverage,contentConceptCoverage:rel.conceptCoverage,relevanceScore:rel.score,relevanceBand:rel.band,relevance:rel,verified:Boolean(res.ok),httpStatus:res.status,contentType:ct||'application/pdf',verificationMethod:'direct-pdf-text'};
+      }
+
+      if(!res.ok)return null;
+      const body=await readText(res,MAX_PAGE_BYTES,deadline);
+      if(/javascript|ecmascript|json|xml|css/i.test(ct)||/^\s*(?:\{|\[|function\s)/.test(body))return null;
+
+      if(/text\/plain/i.test(ct) && body.trim().length>=MIN_REAL_CONTENT){
+        const text=cleanContent(body);
+        const rel=comparePageToQuery(plan.query,{...candidate,url:finalUrl,pageContent:text});
+        const out={...candidate,url:finalUrl,title:truncate(candidate.title||'Text page',300),domain:host(finalUrl),pageContent:text,extractedText:text,contentStatus:'full',contentMethod:'direct-text',contentSourceUrl:finalUrl,contentLength:text.length,contentConfidence:0.9,contentTargetMatched:true,contentTitleSimilarity:rel.titleCoverage,contentConceptCoverage:rel.conceptCoverage,relevanceScore:rel.score,relevanceBand:rel.band,relevance:rel,verified:true,httpStatus:res.status,contentType:ct||'text/plain',verificationMethod:'direct-text'};
+        contentCacheSet(candidate.url,stripCached(out)); return out;
+      }
+
+      const title=extractTitle(body)||extractMeta(body,'og:title')||candidate.title;
+      const canonical=extractCanonical(body,finalUrl);
+      const usableCanonical=canonical&&safeUrl(canonical)&&!blocked(canonical)?canonical:finalUrl;
+      const text=extractArticleText(body);
+      if(text.length<MIN_REAL_CONTENT)return null;
+      const rel=comparePageToQuery(plan.query,{...candidate,url:usableCanonical,title,pageContent:text});
+      const publishedAt=extractMeta(body,'article:published_time')||extractMeta(body,'datePublished')||((body.match(/<time[^>]+datetime=["']([^"']+)["']/i)||[, ''])[1]||null);
+      const out={...candidate,url:usableCanonical,title:truncate(title,300),snippet:truncate(extractMeta(body,'description')||candidate.snippet,1200),publishedAt,domain:host(usableCanonical),pageContent:text,extractedText:text,contentStatus:'full',contentMethod:ARTICLE_PATH.test(usableCanonical)?'direct-html-article':'direct-html',contentSourceUrl:usableCanonical,contentLength:text.length,contentConfidence:0.92,contentTargetMatched:true,contentTitleSimilarity:rel.titleCoverage,contentConceptCoverage:rel.conceptCoverage,relevanceScore:rel.score,relevanceBand:rel.band,relevance:rel,verified:true,httpStatus:res.status,contentType:ct||'text/html',verificationMethod:'direct-html'};
+      contentCacheSet(candidate.url,stripCached(out)); return out;
+    }catch{return null;}
+  })();
+
+  // Critical fast-path change: direct publisher fetch and Jina Reader start together.
+  // The first successful real page is available even when the publisher blocks server-side fetches.
+  const readerJob=readerContent(candidate,plan,deadline);
+  const rows=await Promise.allSettled([directJob,readerJob]);
+  const valid=rows.map(x=>x.status==='fulfilled'?x.value:null).filter(isRealSourceContent);
+  if(!valid.length)return null;
+  valid.sort((a,b)=>{
+    const qa=(a.relevanceScore||0)+(a.contentMethod==='direct-html-article'?4:0)+(a.contentMethod==='direct-pdf-text'?4:0);
+    const qb=(b.relevanceScore||0)+(b.contentMethod==='direct-html-article'?4:0)+(b.contentMethod==='direct-pdf-text'?4:0);
+    return qb-qa || String(b.pageContent||'').length-String(a.pageContent||'').length;
+  });
+  const best=valid[0];
+  if(isRealSourceContent(best))contentCacheSet(candidate.url,stripCached(best));
+  return best;
 }
+
 function stripCached(v){
   const keep={}; for(const k of ['url','title','snippet','publishedAt','domain','pageContent','extractedText','contentStatus','contentMethod','contentSourceUrl','contentLength','contentConfidence','contentTargetMatched','contentTitleSimilarity','contentConceptCoverage','relevanceScore','relevanceBand','relevance','verified','httpStatus','contentType','verificationMethod','type','source','publisherResolved','publisherWrapperUrl','publisherResolutionMethod']) if(v[k]!==undefined)keep[k]=v[k]; return keep;
 }
@@ -434,34 +487,74 @@ async function mapConcurrent(list,limit,worker){
 }
 
 export async function enrichCandidates(candidates,queryOrPlan,options={}){
-  const started=Date.now(); const budgetMs=safeInt(options.budgetMs,DEFAULT_BUDGET_MS,1_200,9_000); const deadline=started+budgetMs; const count=safeInt(options.count,10,1,MAX_RESULTS); const plan=typeof queryOrPlan==='string'?analyzeQuery(queryOrPlan,options):(queryOrPlan||analyzeQuery('',options));
+  const started=Date.now();
+  const budgetMs=safeInt(options.budgetMs,DEFAULT_BUDGET_MS,1_800,9_000);
+  const deadline=started+budgetMs;
+  const count=safeInt(options.count,10,1,MAX_RESULTS);
+  const plan=typeof queryOrPlan==='string'?analyzeQuery(queryOrPlan,options):(queryOrPlan||analyzeQuery('',options));
   const dedupe=new Map();
-  for(const raw of Array.isArray(candidates)?candidates:[]){const url=normalizedUrl(raw?.url||raw?.link||'');if(!url||blocked(url)||!typeFits({...raw,url},plan))continue;const key=normalizedKey(url);if(!dedupe.has(key))dedupe.set(key,{...raw,url,title:truncate(raw?.title||'',500),snippet:truncate(raw?.snippet||'',2500),type:raw?.type||'web'});}
-  const all=[...dedupe.values()].slice(0,MAX_CANDIDATES);
-  const directTarget=Math.min(all.length,Math.max(count*2+12, count+20));
-  const firstWave=all.slice(0,directTarget);
-  const direct=await mapConcurrent(firstWave,CONTENT_CONCURRENCY,c=>directContent(c,plan,deadline));
-  let enriched=direct.filter(isRealSourceContent);
+  for(const raw of Array.isArray(candidates)?candidates:[]){
+    const url=normalizedUrl(raw?.url||raw?.link||'');
+    if(!url||blocked(url)||!typeFits({...raw,url},plan))continue;
+    const key=normalizedKey(url);
+    if(!dedupe.has(key))dedupe.set(key,{...raw,url,title:truncate(raw?.title||'',500),snippet:truncate(raw?.snippet||'',2500),type:raw?.type||'web'});
+  }
 
-  // A second wave uses candidates not attempted in the first wave. This is still
-  // just URL -> page -> query comparison, never a heavy relevance pipeline.
-  if(enriched.length<count && left(deadline)>550){
-    const used=new Set(enriched.map(x=>normalizedKey(x.url))); const remaining=all.filter(x=>!used.has(normalizedKey(x.url)) && !firstWave.some(y=>normalizedKey(y.url)===normalizedKey(x.url)));
-    const recovery=await mapConcurrent(remaining.slice(0,Math.min(60,Math.max(count*2,24))),RECOVERY_CONCURRENCY,c=>directContent(c,plan,deadline));
+  // IMPORTANT: do not rank-filter or slice to `count` before content acquisition.
+  // The caller asked for every source we can actually fetch. Count is used only for metadata/ranking context.
+  const all=[...dedupe.values()].slice(0,MAX_CANDIDATES);
+  // Each candidate gets direct + reader attempts concurrently inside directContent.
+  // This eliminates the old failure mode where a slow direct wave consumed the deadline before reader recovery started.
+  let enriched=(await mapConcurrent(all,CONTENT_CONCURRENCY,c=>directContent(c,plan,deadline))).filter(isRealSourceContent);
+
+  // A final tiny recovery pass is reserved only for true misses and only when meaningful budget remains.
+  const enrichedKeys=new Set(enriched.map(x=>normalizedKey(x.url)));
+  const failed=all.filter(c=>!enrichedKeys.has(normalizedKey(c.url)));
+  if(failed.length && left(deadline)>650){
+    const recovery=await mapConcurrent(failed.slice(0,Math.min(RECOVERY_CONCURRENCY,failed.length)),RECOVERY_CONCURRENCY,c=>readerContent(c,plan,deadline));
     enriched.push(...recovery.filter(isRealSourceContent));
   }
 
-  // Relevance is an ordering signal only. Once a page has real source content, do not
-  // throw it away because the lightweight score is modest; search discovery already
-  // supplied the candidate set. The best-matching pages are simply placed first.
-  enriched=enriched.map(x=>{ const rel=x.relevance||comparePageToQuery(plan.query,x); return {...x,relevance:rel,relevanceScore:Number(rel?.score||x.relevanceScore||0),relevanceBand:rel?.band||x.relevanceBand||'related'}; });
-  const uniqueMap=new Map(); for(const x of enriched){const key=normalizedKey(x.url);if(!key)continue;const old=uniqueMap.get(key);if(!old||Number(x.relevanceScore||0)>Number(old.relevanceScore||0))uniqueMap.set(key,x);}
+  // Relevance is ONLY an ordering signal. It never decides whether real page content is returned.
+  enriched=enriched.map(x=>{
+    const rel=x.relevance||comparePageToQuery(plan.query,x);
+    return {
+      ...x,
+      relevance:rel,
+      relevanceScore:Number(rel?.score||x.relevanceScore||0),
+      relevanceBand:rel?.band||x.relevanceBand||'related',
+      contentTargetMatched:true,
+      contentAvailable:true,
+      relevanceAccepted:false,
+    };
+  });
+
+  const uniqueMap=new Map();
+  for(const x of enriched){
+    const key=normalizedKey(x.url);
+    if(!key)continue;
+    const old=uniqueMap.get(key);
+    if(!old || Number(x.relevanceScore||0)>Number(old.relevanceScore||0))uniqueMap.set(key,x);
+  }
   enriched=[...uniqueMap.values()].sort((a,b)=>Number(b.relevanceScore||0)-Number(a.relevanceScore||0));
 
-  // Never fail closed merely because a soft relevance score is modest. The URL was
-  // fetched, the page produced real content, and at least one query signal matched.
-  const final=enriched.slice(0,count).map(x=>({...x,relevanceScore:Number(x.relevanceScore||0),relevance:x.relevance||comparePageToQuery(plan.query,x)}));
-  return {ok:true,version:VERSION,query:plan.query,requestedResults:count,returnedResults:final.length,latencyMs:Date.now()-started,results:final,plan,contentPolicy:'real-content-only',sourceChecker:'fetch-then-query-compare',warnings: final.length<count?[`Only ${final.length} real-content pages matched the query within the algorithm budget; ${count} requested.`]:[]};
+  // Return the complete fetched-content set, not just the requested count.
+  return {
+    ok:true,
+    version:VERSION,
+    query:plan.query,
+    requestedResults:count,
+    returnedResults:enriched.length,
+    fetchedSources:enriched.length,
+    latencyMs:Date.now()-started,
+    results:enriched,
+    plan,
+    contentPolicy:'real-content-only',
+    sourceChecker:'fetch-all-candidates-then-soft-query-rank',
+    warnings: enriched.length<count
+      ? [`${enriched.length} real-content pages were fetched; ${count} requested. Unreachable/unreadable pages were not fabricated.`]
+      : []
+  };
 }
 
 export async function runAlgorithm(input={}){
@@ -474,4 +567,4 @@ function response(body,status=200){return new Response(JSON.stringify(body,null,
 async function readInput(req){const url=new URL(req.url);if(req.method==='GET')return Object.fromEntries(url.searchParams.entries());const raw=await req.text();if(raw.length>100000)throw new Error('REQUEST_BODY_TOO_LARGE');if(!raw)return{};try{return JSON.parse(raw)}catch{return Object.fromEntries(new URLSearchParams(raw).entries())}}
 export default async function handler(req){if(req.method==='OPTIONS')return response({ok:true,version:VERSION});if(!['GET','POST'].includes(req.method))return response({ok:false,version:VERSION,error:'METHOD_NOT_ALLOWED'},405);try{return response(await runAlgorithm(await readInput(req)))}catch(error){return response({ok:false,version:VERSION,error:error?.message||'ALGORITHM_FAILED'},error?.message==='MISSING_QUERY'?400:500)}}
 
-export const ALGORITHM_CONTRACT=Object.freeze({version:VERSION,maxResults:MAX_RESULTS,realContentMinimumChars:MIN_REAL_CONTENT,defaultBudgetMs:DEFAULT_BUDGET_MS,contentConcurrency:CONTENT_CONCURRENCY,sourceChecker:'fetch pages first, then compare page content against the user query'});
+export const ALGORITHM_CONTRACT=Object.freeze({version:VERSION,maxResults:MAX_RESULTS,realContentMinimumChars:MIN_REAL_CONTENT,defaultBudgetMs:DEFAULT_BUDGET_MS,contentConcurrency:CONTENT_CONCURRENCY,sourceChecker:'fetch direct publisher and reader content in parallel, then soft-rank actual page content; no post-fetch relevance rejection'});
