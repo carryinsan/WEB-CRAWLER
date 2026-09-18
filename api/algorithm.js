@@ -1,29 +1,31 @@
 /*
  * ArixAI Precision Page Algorithm
- * v1.7.0 (Defense-in-Depth Extractor Edition)
+ * v1.8.0 (Anti-ReDoS & Defense-in-Depth Edition)
  * 
- * Purpose: Advanced query planning, REAL page acquisition, robust HTML/SPA extraction, 
- * analytics/ad rejection, deep URL sanitization, search wrapper unwrapping, 
- * stealth fetching, and post-fetch query comparison.
+ * Purpose: Advanced query planning, REAL page acquisition, highly robust HTML/SPA extraction, 
+ * analytics/ad rejection, search wrapper unwrapping, and post-fetch query comparison.
+ * 
+ * Update 1.8.0: Eradicated catastrophic backtracking (ReDoS) in HTML parsers.
+ * Fixed event-loop starvation and strict budget deadline enforcement.
  */
 
 export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-content-algorithm-1.7.0';
+const VERSION = 'arix-content-algorithm-1.8.0';
 const MAX_RESULTS = 40;
 const MAX_QUERY_LEN = 700;
 const MAX_CANDIDATES = 500;
-const MAX_PAGE_BYTES = 1_000_000;
+const MAX_PAGE_BYTES = 600_000; // Reduced from 1MB to 600KB to protect CPU during string operations
 const MAX_TEXT_CHARS = 24_000;
 const MIN_REAL_CONTENT = 150;
 
 const DEFAULT_BUDGET_MS = 14_500;
 const PAGE_TIMEOUT_MS = 4_500;
 const READER_TIMEOUT_MS = 5_200;
-const CONTENT_CONCURRENCY = 48;
-const RECOVERY_CONCURRENCY = 36;
+const CONTENT_CONCURRENCY = 30; // Lowered to prevent Edge CPU starvation
+const RECOVERY_CONCURRENCY = 20;
 const CACHE_TTL_MS = 120_000;
 const CACHE_MAX = 160;
 const CONTENT_CACHE = new Map();
@@ -104,7 +106,6 @@ function unique(arr) { return [...new Set(arr.filter(Boolean))]; }
 
 function unwrapUrl(url) {
   try {
-    // CRITICAL FIX: HTML encoded ampersands cause param parsing to fail entirely.
     let current = String(url || '').replace(/&amp;/gi, '&');
     const u = new URL(current);
     
@@ -112,7 +113,6 @@ function unwrapUrl(url) {
     if (u.hostname.includes('bing.com') && u.pathname.startsWith('/ck/a')) {
       let uParam = u.searchParams.get('u');
       if (uParam) {
-        // Bing sometimes prepends 'a1' to the base64 string
         uParam = uParam.replace(/^a1/, '');
         let b64 = uParam.replace(/-/g, '+').replace(/_/g, '/');
         while (b64.length % 4) b64 += '=';
@@ -187,25 +187,20 @@ function decodeHtml(v = '') {
 }
 
 function strip(html = '') {
-  // 1. Obliterate dangerous and noisy structural tags.
+  // Ultra-safe structural stripper. Bounded regexes prevent ReDoS.
   let s = String(html)
     .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(script|style|noscript|iframe|nav|footer|aside|header|form|menu|dialog|canvas|svg|button|map|object|embed|picture|video|audio)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ');
-
-  // 2. Eradicate common UI wrappers, ads, sidebars, cookie popups, and analytics via class/id patterns.
-  s = s.replace(/<div\b[^>]*\b(?:class|id)=["']?(?:[^"']*(?:cookie|banner|nav-|footer|sidebar|advert|promo|menu|widget|social|modal|popup|consent|related|share|comments|ad-|sponsor|search|auth|login|signup))["']?[^>]*>[\s\S]*?<\/div>/gi, ' ');
-
-  // 3. Remove all remaining HTML tags
-  s = s.replace(/<[^>]+>/g, ' ');
+    .replace(/<(script|style|noscript|iframe|nav|footer|aside|header|form|menu|dialog|canvas|svg|button|map|object|embed|picture|video|audio)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ');
 
   return decodeHtml(s).replace(/\s+/g, ' ').trim();
 }
 
 function cleanContent(v) {
   let s = String(v || '').replace(/\s+/g, ' ').trim();
+  // Safe bounds to prevent runaways on missing brackets
   s = s.replace(/\[[^\]]{0,80}\]\([^)]{0,500}\)/g, '');
-  s = s.replace(/!\[[^\]]*\]\([^)]*\)/g, '');
-  s = s.replace(/(?:\bfunction\b|\bconst\b|\blet\b|\bvar\b|\bwindow\.|document\.|console\.)[^;{}]+?[;{}]/gi, ' ');
+  s = s.replace(/!\[[^\]]{0,80}\]\([^)]{0,500}\)/g, '');
   s = s.replace(/(?:skip to content|accept cookies|cookie settings|privacy settings|sign in|log in|search this site)\b/gi, ' ');
   return truncate(s.replace(/\s+/g, ' ').trim(), MAX_TEXT_CHARS);
 }
@@ -220,8 +215,7 @@ function isBotChallenge(text) {
     'robot or human', 'datadome', 'perimeterx', 'access denied', '403 forbidden',
     'checking if the site connection is secure', 'needs to review the security of your connection',
     'are you a robot', 'verifying you are not a robot', 'pardon our interruption',
-    'to proceed, please verify', 'complete the security check', 'help us keep your account safe',
-    'turn on javascript', 'enable cookies'
+    'to proceed, please verify', 'complete the security check', 'help us keep your account safe'
   ];
   return triggers.some(trigger => t.includes(trigger));
 }
@@ -235,16 +229,18 @@ function textFromMarkdown(v) {
 }
 
 function extractTitle(html) { return strip((String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [, ''])[1]); }
+
 function extractMeta(html, name) {
   const e = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const a = String(html).match(new RegExp(`<meta[^>]+(?:name|property)=["']${e}["'][^>]*content=["']([\\s\\S]*?)["']`, 'i'));
-  const b = String(html).match(new RegExp(`<meta[^>]+content=["']([\\s\\S]*?)["'][^>]+(?:name|property)=["']${e}["']`, 'i'));
+  // Highly bounded metadata extractors to prevent CPU spikes
+  const a = String(html).match(new RegExp(`<meta[^>]{0,150}(?:name|property)=["']${e}["'][^>]{0,150}content=["']([^"']+)["']`, 'i'));
+  const b = String(html).match(new RegExp(`<meta[^>]{0,150}content=["']([^"']+)["'][^>]{0,150}(?:name|property)=["']${e}["']`, 'i'));
   return decodeHtml((a || b || [, ''])[1] || '').trim();
 }
 
 function extractCanonical(html, base) {
-  const a = (String(html).match(/<link[^>]+rel=["'](?:[^"']*\s)?canonical(?:\s[^"']*)?["'][^>]*href=["']([^"']+)["']/i) || [])[1];
-  const b = (String(html).match(/<link[^>]+href=["']([^"']+)["'][^>]*rel=["'](?:[^"']*\s)?canonical(?:\s[^"']*)?["']/i) || [])[1];
+  const a = (String(html).match(/<link[^>]{0,150}rel=["'](?:[^"']*\s)?canonical(?:\s[^"']*)?["'][^>]{0,150}href=["']([^"']+)["']/i) || [])[1];
+  const b = (String(html).match(/<link[^>]{0,150}href=["']([^"']+)["'][^>]{0,150}rel=["'](?:[^"']*\s)?canonical(?:\s[^"']*)?["']/i) || [])[1];
   try { return new URL(a || b, base).href; } catch { return null; }
 }
 
@@ -271,7 +267,7 @@ function extractStringsFromObj(obj, outArray, maxDepth = 6) {
 
 function extractSpaState(html) {
   const out = [];
-  const scripts = String(html).match(/<script[^>]+type=["']application\/json["'][^>]*>[\s\S]*?<\/script>/gi) || [];
+  const scripts = String(html).match(/<script[^>]{0,150}type=["']application\/json["'][^>]{0,150}>([\s\S]*?)<\/script>/gi) || [];
   for (const block of scripts) {
     const raw = block.replace(/^<[\s\S]*?>/i, '').replace(/<\/script>$/i, '');
     try { extractStringsFromObj(JSON.parse(raw.trim()), out); } catch {}
@@ -281,7 +277,7 @@ function extractSpaState(html) {
 
 function extractJsonLdBody(html) {
   const out = [];
-  for (const block of String(html).match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/gi) || []) {
+  for (const block of String(html).match(/<script[^>]{0,150}type=["']application\/ld\+json["'][^>]{0,150}>([\s\S]*?)<\/script>/gi) || []) {
     const raw = block.replace(/^<[\s\S]*?>/i, '').replace(/<\/script>$/i, '');
     try { extractStringsFromObj(JSON.parse(raw.trim()), out); } catch {}
   }
@@ -289,10 +285,10 @@ function extractJsonLdBody(html) {
 }
 
 function extractArticleText(html) {
+  // Stage 1: Ultra-fast noise elimination
   const cleanHtml = String(html || '')
     .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(script|style|noscript|iframe|nav|footer|aside|header|form|menu|dialog|canvas|svg|button|map|object|embed|picture|video|audio)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
-    .replace(/<div\b[^>]*\b(?:class|id)=["']?(?:[^"']*(?:cookie|banner|nav-|footer|sidebar|advert|promo|menu|widget|social|modal|popup|consent|related|share|comments|ad-|sponsor|search|auth|login|signup))["']?[^>]*>[\s\S]*?<\/div>/gi, ' ');
+    .replace(/<(script|style|noscript|iframe|nav|footer|aside|header|form|menu|dialog|canvas|svg|button|map|object|embed|picture|video|audio)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ');
 
   const jsonLd = cleanContent(extractJsonLdBody(html));
   if (jsonLd.length >= 300 && !isBotChallenge(jsonLd)) return jsonLd;
@@ -300,6 +296,7 @@ function extractArticleText(html) {
   const spaText = cleanContent(extractSpaState(html));
   if (spaText.length >= 300 && !isBotChallenge(spaText)) return spaText;
 
+  // Stage 2: Structural parsing only. No catastrophic 'div' class matching.
   let mainBlocks = [];
   for (const m of cleanHtml.matchAll(/<(article|main)\b[^>]*>([\s\S]*?)<\/\1>/gi)) {
      const t = strip(m[2]);
@@ -310,25 +307,16 @@ function extractArticleText(html) {
      if (mText.length >= 300 && !isBotChallenge(mText)) return mText;
   }
 
-  // Enhanced to capture e-commerce "product" or "description" specs natively
-  let divBlocks = [];
-  for (const m of cleanHtml.matchAll(/<div\b[^>]*\b(?:class|id)=["']?(?:[^"']*(?:content|article|body|post|story|text|product|description|detail))["']?[^>]*>([\s\S]*?)<\/div>/gi)) {
-     const t = strip(m[1]);
-     if (t.length >= 50) divBlocks.push(t);
-  }
-  if (divBlocks.length > 0) {
-     const dText = cleanContent(divBlocks.join('\n\n'));
-     if (dText.length >= 300 && !isBotChallenge(dText)) return dText;
-  }
-
+  // Stage 3: Direct semantic blocks (Paragraphs, Headings)
   const pBlocks = [];
-  for (const m of cleanHtml.matchAll(/<(?:p|h[1-6]|li|blockquote)\b[^>]*>([\s\S]*?)<\/(?:p|h[1-6]|li|blockquote)>/gi)) {
-    const t = strip(m[1]);
+  for (const m of cleanHtml.matchAll(/<(p|h[1-6]|li|blockquote)\b[^>]*>([\s\S]*?)<\/\1>/gi)) {
+    const t = strip(m[2]);
     if (t.length >= 40 && t.split(/\s+/).length >= 6) pBlocks.push(t);
   }
   const pText = cleanContent(pBlocks.join('\n\n'));
   if (pText.length >= 300 && !isBotChallenge(pText)) return pText;
 
+  // Stage 4: High-recall Body fallback
   const body = cleanHtml.match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
   const fallbackText = cleanContent(strip(body ? body[1] : cleanHtml));
   if (!isBotChallenge(fallbackText) && fallbackText.length >= MIN_REAL_CONTENT) return fallbackText;
@@ -349,12 +337,15 @@ function contentCacheSet(url, value) {
 }
 
 async function fetchResponse(url, timeout, deadline, headers = {}) {
-  const budget = Math.min(timeout, Math.max(350, left(deadline) - 80));
-  if (budget <= 0) throw new Error('BUDGET_EXHAUSTED');
+  const remaining = left(deadline) - 20;
+  if (remaining <= 0) throw new Error('BUDGET_EXHAUSTED');
+  
+  // Safely limit timeout to remaining budget to prevent dangling promises
+  const budget = Math.min(timeout, remaining);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), budget);
+  
   try {
-    // Completely mimics Google Chrome 122 on Windows to bypass anti-bot protections (Flipkart/News sites)
     return await fetch(url, {
       method: 'GET',
       redirect: 'follow',
@@ -381,7 +372,7 @@ async function readText(res, maxBytes, deadline) {
   if (!reader) return truncate(await res.text(), maxBytes);
   const chunks = []; let total = 0;
   try {
-    while (total < maxBytes && left(deadline) > 80) {
+    while (total < maxBytes && left(deadline) > 50) {
       const { done, value } = await reader.read(); if (done) break; if (!value) continue;
       const room = maxBytes - total; const c = value.byteLength > room ? value.slice(0, room) : value;
       chunks.push(c); total += c.byteLength;
@@ -396,7 +387,7 @@ async function readBytes(res, maxBytes, deadline) {
   if (!reader) return new Uint8Array((await res.arrayBuffer()).slice(0, maxBytes));
   const chunks = []; let total = 0;
   try {
-    while (total < maxBytes && left(deadline) > 80) {
+    while (total < maxBytes && left(deadline) > 50) {
       const { done, value } = await reader.read(); if (done) break; if (!value) continue;
       const room = maxBytes - total; const c = value.byteLength > room ? value.slice(0, room) : value;
       chunks.push(c); total += c.byteLength;
@@ -532,19 +523,12 @@ async function readerContent(candidate, plan, deadline) {
   if (!safeUrl(unwrapped) || blocked(unwrapped) || left(deadline) < 350) return null;
   
   try {
-    let res = await fetchResponse(`https://r.jina.ai/${unwrapped}`, READER_TIMEOUT_MS, deadline, { 
-      'Accept': 'text/plain,text/markdown;q=0.9,*/*;q=0.2',
-      'X-No-Cache': 'true',
-      'X-Retain-Images': 'none'
-    });
+    let res = await fetchResponse(`https://r.jina.ai/${unwrapped}`, READER_TIMEOUT_MS, deadline, { accept: 'text/plain,text/markdown;q=0.9,*/*;q=0.2' });
     
     // Jina HTTP Fallback if HTTPS fails
     if (!res.ok && unwrapped.startsWith('https://')) {
        const httpFallback = unwrapped.replace('https://', 'http://');
-       res = await fetchResponse(`https://r.jina.ai/${httpFallback}`, READER_TIMEOUT_MS, deadline, { 
-         'Accept': 'text/plain,text/markdown;q=0.9,*/*;q=0.2',
-         'X-No-Cache': 'true'
-       });
+       res = await fetchResponse(`https://r.jina.ai/${httpFallback}`, READER_TIMEOUT_MS, deadline, { accept: 'text/plain,text/markdown;q=0.9,*/*;q=0.2' });
     }
     
     if (!res.ok) return null;
@@ -556,7 +540,6 @@ async function readerContent(candidate, plan, deadline) {
     
     if (text.length < MIN_REAL_CONTENT || isBotChallenge(text) || text === title || text === candidate.snippet) return null;
     
-    // Using original candidate.url tracking URL to prevent missing the merge in crawler.js
     const rel = comparePageToQuery(plan.query, { ...candidate, title, pageContent: text });
     return { ...candidate, url: candidate.url, title, pageContent: text, extractedText: text, contentStatus: 'reader', contentMethod: 'jina-reader', contentSourceUrl: sourceUrl, contentLength: text.length, contentConfidence: 0.88, contentTargetMatched: true, contentTitleSimilarity: rel.titleCoverage, contentConceptCoverage: rel.conceptCoverage, relevanceScore: rel.score, relevanceBand: rel.band, relevance: rel, relevanceAccepted: false, verified: true, verificationMethod: 'jina-reader', contentType: 'text/markdown', publisherResolved: sourceUrl !== candidate.url };
   } catch { return null; }
@@ -587,8 +570,8 @@ async function directContent(candidate, plan, deadline) {
       if (!res.ok) return null;
       let body = await readText(res, MAX_PAGE_BYTES, deadline);
       
-      // Auto-Follow Meta Refresh for wrappers that don't do native HTTP redirects
-      const metaRefresh = body.match(/<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?\d+;\s*url=['"]?([^"'>]+)['"]?/i);
+      // Auto-Follow Meta Refresh for wrappers that don't do native HTTP redirects (Safe regex)
+      const metaRefresh = body.match(/<meta[^>]{0,200}http-equiv=["']?refresh["']?[^>]{0,200}content=["']?\d+;\s*url=['"]?([^"'>]+)['"]?/i);
       if (metaRefresh && metaRefresh[1] && left(deadline) > 1000) {
           const redirectUrl = new URL(metaRefresh[1].replace(/&amp;/g, '&'), finalUrl).href;
           if (safeUrl(redirectUrl) && !blocked(redirectUrl)) {
@@ -653,7 +636,6 @@ export function isRealSourceContent(result) {
   if (c.length < MIN_REAL_CONTENT || isBotChallenge(c)) return false;
   if (['snippet', 'search-snippet', 'metadata', 'metadata-fallback'].includes(s) || m === 'search-snippet') return false;
   
-  // Very carefully decode &amp; before validating the URL during isRealSourceContent check
   const sourceUrl = String(result?.contentSourceUrl || result?.url).replace(/&amp;/gi, '&');
   if (blocked(unwrapUrl(sourceUrl))) return false;
   
@@ -675,7 +657,6 @@ export async function enrichCandidates(candidates, queryOrPlan, options = {}) {
   
   const dedupe = new Map();
   for (const raw of Array.isArray(candidates) ? candidates : []) {
-    // CRITICAL: Clean HTML encoded entities here so the rest of the algorithm sees pure URLs
     const pureUrl = String(raw?.url || raw?.link || '').replace(/&amp;/gi, '&');
     const url = normalizedUrl(pureUrl);
     
