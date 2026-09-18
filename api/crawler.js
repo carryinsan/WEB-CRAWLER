@@ -29,7 +29,7 @@
  * - Heartbeats keep the stream active while live work continues.
  * - Upstream calls are bounded individually.
  * - Discovery and content verification use bounded concurrent fan-out instead of serial retries.
- * - The default fast-path budget is ~9.2s; successful validated results are oversampled and content-aware discovery can use Tavily raw page content when TAVILY_API_KEY[_N] is configured.
+ * - The default fast-path budget is ~9.5s; successful validated results are oversampled and content-aware discovery can use Tavily raw page content when TAVILY_API_KEY[_N] is configured.
  * - The crawler never attempts to evade provider/site rate limits.
  * - No serverless implementation can honestly guarantee unlimited execution;
  *   Vercel remains the platform authority on maximum execution duration.
@@ -39,45 +39,45 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-1.8.0';
+const VERSION = 'arix-crawler-1.9.0';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 500;
 const MAX_REQUEST_BODY = 64_000;
 
-const SEARCH_TIMEOUT_MS = 1700;
-const PAGE_TIMEOUT_MS = 2400;
-const READER_TIMEOUT_MS = 2600;
-const NEWS_RESOLVE_TIMEOUT_MS = 1200;
-const COMMON_CRAWL_TIMEOUT_MS = 1000;
-const YOUTUBE_TIMEOUT_MS = 3200;
-const PDF_DECOMPRESS_TIMEOUT_MS = 1400;
+const SEARCH_TIMEOUT_MS = 1500;
+const PAGE_TIMEOUT_MS = 2200;
+const READER_TIMEOUT_MS = 2200;
+const NEWS_RESOLVE_TIMEOUT_MS = 900;
+const COMMON_CRAWL_TIMEOUT_MS = 700;
+const YOUTUBE_TIMEOUT_MS = 2600;
+const PDF_DECOMPRESS_TIMEOUT_MS = 1200;
 
-const MAX_PAGE_BYTES = 900_000;
-const MAX_SEARCH_BYTES = 700_000;
-const MAX_YOUTUBE_BYTES = 1_800_000;
+const MAX_PAGE_BYTES = 650_000;
+const MAX_SEARCH_BYTES = 500_000;
+const MAX_YOUTUBE_BYTES = 1_500_000;
 const MAX_TEXT_CHARS = 30_000;
 const MAX_TRANSCRIPT_CHARS = 30_000;
 
 const DEFAULT_VERIFY = 40;
 const DEEP_VERIFY = 40;
 const MAX_VERIFY = 40;
-const MAX_ENGINE_REQUESTS = 18;
-const MAX_NEWS_RESOLVES = 6;
-const MAX_PUBLISHER_LOOKUPS = 4;
-const MAX_CC_LOOKUPS = 4;
+const MAX_ENGINE_REQUESTS = 20;
+const MAX_NEWS_RESOLVES = 3;
+const MAX_PUBLISHER_LOOKUPS = 3;
+const MAX_CC_LOOKUPS = 2;
 
 // Starts below Vercel's documented Edge streaming ceiling and leaves safety margin.
-const STREAM_HEARTBEAT_MS = 1800;
-const SEARCH_WORK_BUDGET_MS = 9_200;
+const STREAM_HEARTBEAT_MS = 1500;
+const SEARCH_WORK_BUDGET_MS = 9_500;
 
-const DISCOVERY_MIN_REMAINING_MS = 4_800;
-const CONTENT_MIN_REMAINING_MS = 2_900;
-const SEARCH_CONCURRENCY = 18;
-const CONTENT_CONCURRENCY = 24;
+const DISCOVERY_MIN_REMAINING_MS = 5_000;
+const CONTENT_MIN_REMAINING_MS = 3_300;
+const SEARCH_CONCURRENCY = 20;
+const CONTENT_CONCURRENCY = 30;
 const FAST_FALLBACK_LIMIT = 40;
-const SEARCH_CACHE_TTL_MS = 8_000;
-const CONTENT_CACHE_TTL_MS = 120_000;
+const SEARCH_CACHE_TTL_MS = 10_000;
+const CONTENT_CACHE_TTL_MS = 180_000;
 const CACHE_MAX_ENTRIES = 80;
 
 const TAVILY_SEARCH_TIMEOUT_MS = 2500;
@@ -85,8 +85,10 @@ const TAVILY_MAX_SEARCH_CALLS = 2;
 const TAVILY_MAX_RESULTS_PER_CALL = 20;
 const TAVILY_KEY_SCAN_MAX = 12;
 const TAVILY_CONTENT_MIN_CHARS = 350;
-const RELEVANCE_MIN_SCORE = 24;
-const RELEVANCE_MIN_TITLE_COVERAGE = 0.20;
+const RELEVANCE_MIN_SCORE = 20;
+const RELEVANCE_MIN_TITLE_COVERAGE = 0.16;
+const RELEVANCE_BACKFILL_SCORE = 15;
+const MIN_RESULTS_TARGET = 1;
 
 const SEARCH_CACHE = new Map();
 const CONTENT_CACHE = new Map();
@@ -124,7 +126,7 @@ async function mapConcurrent(items, limit, worker) {
 }
 
 const USER_AGENT =
-  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.8; +https://lexis-ai-chatini.vercel.app/)';
+  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.9; +https://lexis-ai-chatini.vercel.app/)';
 
 const COMMON_CRAWL_INDEXES = [
   'CC-MAIN-2026-34',
@@ -760,24 +762,24 @@ function queryIntent(query, requestedType) {
   const hasAny = xs => xs.some(x => q.includes(x));
   const explicit = String(requestedType || '').toLowerCase();
   const mixed = explicit === 'mixed' || explicit === 'all';
-  const indiaGovHint = /\b(india|indian|government|govt|ministry|scheme|gst|income tax|mca|rbi|sebi|law|act|notification|circular|policy)\b/i.test(q);
+  const indiaGovHint = /\b(government|govt|ministry|department|scheme|gst|income tax|mca|rbi|sebi|supreme court|high court|law|laws|legal|act|acts|notification|circular|gazette|policy|policies|regulation|regulations|official)\b/i.test(q);
 
-  // An explicit requested type must dominate lexical hints.
-  // Example: "latest semiconductor policy India PDF" in mode=doc must NOT turn into a news search.
   if (!mixed && explicit) {
     return {
       type: explicit,
       wantsNews: explicit === 'news',
       wantsVideo: explicit === 'video',
       wantsDocs: explicit === 'doc' || explicit === 'docs' || explicit === 'document',
-      wantsGov: explicit === 'gov' || indiaGovHint || explicit === 'doc' || explicit === 'docs' || explicit === 'document',
+      wantsGov: explicit === 'gov' || explicit === 'doc' || explicit === 'docs' || explicit === 'document' || indiaGovHint,
     };
   }
 
-  const wantsNews = mixed || hasAny(NEWS_QUERY_HINTS);
-  const wantsVideo = mixed || hasAny(VIDEO_QUERY_HINTS);
-  const wantsDocs = mixed || hasAny(DOC_QUERY_HINTS);
-  const wantsGov = mixed || indiaGovHint;
+  // `mixed` is an output/discovery mode, not a request for every modality.
+  // Only lexical evidence in the actual query activates news/video/document/government lanes.
+  const wantsNews = hasAny(NEWS_QUERY_HINTS);
+  const wantsVideo = hasAny(VIDEO_QUERY_HINTS);
+  const wantsDocs = hasAny(DOC_QUERY_HINTS);
+  const wantsGov = indiaGovHint;
   return {
     type: mixed ? 'mixed' : (wantsVideo ? 'video' : wantsNews ? 'news' : wantsDocs ? 'doc' : 'web'),
     wantsNews, wantsVideo, wantsGov, wantsDocs,
@@ -842,61 +844,83 @@ function parseDateIntent(query) {
 
 function buildSearchQueries(query, intent, mode, dateIntent) {
   const queries = [];
-  const add = q => { if (q && !queries.includes(q)) queries.push(q); };
+  const add = q => {
+    const v = String(q || '').replace(/\s+/g, ' ').trim();
+    if (v && !queries.includes(v)) queries.push(v);
+  };
   const gov = intent.wantsGov || mode === 'gov';
   const docs = intent.wantsDocs || mode === 'doc';
   const video = intent.wantsVideo || mode === 'video';
   const news = intent.wantsNews || mode === 'news';
-  const hasSpaces = /\s/.test(query);
+  const q = String(query || '').trim();
+  const hasSpaces = /\s/.test(q);
+
+  // Exact intent always comes first.
+  add(q);
+  if (hasSpaces && q.length <= 220 && (mode === 'deep' || intent.type === 'mixed')) add(`"${q}"`);
+
+  // Complementary variants increase source coverage without switching topics.
+  if (/\bhistory|historical|timeline|origins?\b/i.test(q)) {
+    add(`${q} timeline`);
+    add(`${q} origins milestones`);
+  } else if (/\b(compare|comparison|vs\.?|versus)\b/i.test(q)) {
+    add(`${q} comparison`);
+  } else if (/\bhow\s+to|tutorial|guide|learn\b/i.test(q)) {
+    add(`${q} guide`);
+  } else if (/\bprice|prices|cost|costs|pricing\b/i.test(q)) {
+    add(`${q} current prices`);
+  } else if (/\bpolicy|policies|law|legal|regulation|scheme|notification|circular\b/i.test(q)) {
+    add(`${q} official source`);
+  } else if (mode === 'deep') {
+    add(`${q} overview`);
+    add(`${q} authoritative sources`);
+  }
 
   if (gov) {
-    add(`${query} site:gov.in`); add(`${query} site:nic.in`); add(`${query} site:india.gov.in`); add(`${query} site:mygov.in`);
+    add(`${q} site:gov.in`);
+    add(`${q} site:nic.in`);
+    add(`${q} site:india.gov.in`);
   }
   if (docs) {
-    add(`${query} filetype:pdf`); add(`${query} official PDF`); add(`${query} site:gov.in filetype:pdf`);
+    add(`${q} filetype:pdf`);
+    add(`${q} official PDF`);
   }
   if (video) {
-    add(`site:youtube.com ${query}`); add(`${query} YouTube`);
+    add(`site:youtube.com ${q}`);
+    add(`${q} YouTube`);
   }
-  if (news) add(`${query} latest news`);
-
-  // Every normal web query gets complementary discovery variants. They are designed
-  // to increase source coverage, not to broaden the topic semantically.
-  add(query);
-  if (hasSpaces && query.length <= 220) add(`"${query}"`);
-  add(`${query} official source`);
-  add(`${query} detailed information`);
-  if (intent.wantsGov || /\b(india|indian)\b/i.test(query)) add(`${query} government source`);
+  if (news) add(`${q} latest news`);
 
   if (dateIntent.kind === 'explicit-month' || dateIntent.kind === 'explicit-year') {
-    add(`${query} after:${dateIntent.start.slice(0, 10)} before:${dateIntent.end.slice(0, 10)}`);
+    add(`${q} after:${dateIntent.start.slice(0, 10)} before:${dateIntent.end.slice(0, 10)}`);
   }
-  if (mode === 'deep') { add(`${query} latest update`); add(`${query} primary source`); }
-  return queries.slice(0, 6);
+  return queries.slice(0, 8);
 }
 
 function buildEngineUrls(q, intent) {
   const encoded = encodeURIComponent(q);
-  const isPdfQuery = /filetype:\s*pdf|\bpdf\b|official pdf/i.test(q);
-  const isGovQuery = /site:(?:gov\.in|nic\.in|india\.gov\.in|mygov\.in)/i.test(q);
-  const isVideoQuery = /site:youtube\.com|\byoutube\b/i.test(q);
-  const typeForQuery = isGovQuery ? 'gov' : isPdfQuery ? 'doc' : isVideoQuery ? 'video' : 'web';
+  const isPdfQuery = /filetype:\s*pdf|\bpdf\b|official pdf/i.test(q) || intent.wantsDocs;
+  const isGovQuery = /site:(?:gov\.in|nic\.in|india\.gov\.in|mygov\.in)/i.test(q) || intent.wantsGov;
+  const isVideoQuery = /site:youtube\.com|\byoutube\b/i.test(q) || intent.wantsVideo;
   const urls = [
-    { provider: 'bing', type: typeForQuery, url: `https://www.bing.com/search?q=${encoded}&count=20&setlang=en-IN&cc=in` },
-    { provider: 'google', type: typeForQuery, url: `https://www.google.com/search?q=${encoded}&num=20&hl=en&gl=in` },
-    { provider: 'duckduckgo', type: typeForQuery, url: `https://html.duckduckgo.com/html/?q=${encoded}&kl=in-en` },
+    { provider: 'bing', type: 'web', url: `https://www.bing.com/search?q=${encoded}&count=20&setlang=en-IN&cc=in` },
+    { provider: 'google', type: 'web', url: `https://www.google.com/search?q=${encoded}&num=20&hl=en&gl=in` },
+    { provider: 'duckduckgo', type: 'web', url: `https://html.duckduckgo.com/html/?q=${encoded}&kl=in-en` },
+    { provider: 'yahoo', type: 'web', url: `https://search.yahoo.com/search?p=${encoded}` },
+    { provider: 'mojeek', type: 'web', url: `https://www.mojeek.com/search?q=${encoded}` },
   ];
-  if (intent.wantsNews) urls.push({ provider: 'google-news', type: 'news', url: `https://news.google.com/rss/search?q=${encoded}&hl=en-IN&gl=IN&ceid=IN:en` });
-  urls.push(
-    { provider: 'yahoo', type: typeForQuery, url: `https://search.yahoo.com/search?p=${encoded}` },
-    { provider: 'mojeek', type: typeForQuery, url: `https://www.mojeek.com/search?q=${encoded}` },
-  );
-  if (intent.wantsVideo) {
-    urls.push({ provider: 'youtube', type: 'video', url: `https://www.youtube.com/results?search_query=${encoded}&hl=en-IN` });
-    urls.push({ provider: 'google-video', type: 'video', url: `https://www.google.com/search?q=${encodeURIComponent(`site:youtube.com ${q}`)}&num=20&hl=en&gl=in` });
+  if (intent.wantsNews || /\blatest news\b/i.test(q)) {
+    urls.push({ provider: 'google-news', type: 'news', url: `https://news.google.com/rss/search?q=${encoded}&hl=en-IN&gl=IN&ceid=IN:en` });
   }
-  if (isGovQuery) urls.push({ provider: 'google-gov', type: 'gov', url: `https://www.google.com/search?q=${encodeURIComponent(`${q} site:gov.in`)}&num=20&hl=en&gl=in` });
-  if (isPdfQuery) urls.push({ provider: 'google-doc', type: 'doc', url: `https://www.google.com/search?q=${encodeURIComponent(`${q} filetype:pdf`)}&num=20&hl=en&gl=in` });
+  if (isVideoQuery) urls.push({ provider: 'youtube', type: 'video', url: `https://www.youtube.com/results?search_query=${encoded}&hl=en-IN` });
+  if (isGovQuery) {
+    const govQ = `${q} site:gov.in`;
+    urls.push({ provider: 'google-gov', type: 'gov', url: `https://www.google.com/search?q=${encodeURIComponent(govQ)}&num=20&hl=en&gl=in` });
+  }
+  if (isPdfQuery) {
+    const docQ = `${q} filetype:pdf`;
+    urls.push({ provider: 'google-doc', type: 'doc', url: `https://www.google.com/search?q=${encodeURIComponent(docQ)}&num=20&hl=en&gl=in` });
+  }
   return urls;
 }
 
@@ -1400,7 +1424,7 @@ function applyDateConstraint(results, dateIntent, count, warnings) {
 }
 
 function enforceRequestedType(results, requestedType, mode, warnings) {
-  const wanted = String(requestedType || mode || '').toLowerCase();
+  const wanted = String(requestedType || (['mixed', 'deep', 'auto'].includes(mode) ? '' : mode) || '').toLowerCase();
   let type = null;
   if (wanted === 'gov') type = 'gov';
   else if (wanted === 'doc' || wanted === 'docs' || wanted === 'document') type = 'doc';
@@ -1448,6 +1472,8 @@ function contentPriorityScore(r, query, intent, dateIntent) {
   if (isPublisherCandidateUrl(u, r)) score += 4;
   if (r.publisherResolved) score += 6;
   if (/^https?:\/\/www\.(bing|google|search\.)\w+/i.test(u)) score -= 30;
+  if (/^news\.google\.com$/i.test(hostname(u))) score -= 35;
+  if (r.contentMethod === 'tavily-raw-content') score += 12;
   if (r.contentStatus === 'snippet_fallback') score += 2;
   if (r.contentStatus === 'full' || r.contentStatus === 'reader' || r.contentStatus === 'alternate') score -= 3;
   const terms = extractSearchTerms(query);
@@ -1640,33 +1666,38 @@ function readerMatchesTarget(raw, result, requestedUrl) {
   const readerHost = normalizedHost(meta.sourceUrl);
   const hostMatch = Boolean(sourceHost && readerHost && (sourceHost === readerHost || readerHost.endsWith(`.${sourceHost}`) || sourceHost.endsWith(`.${readerHost}`)));
   const isNewsLike = result?.type === 'news' || result?.type === 'doc' || ARTICLE_PATH_HINT.test(requestedUrl || '');
-  if (isNewsLike && !hostMatch) return { ok: false, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
-  if (targetTitle && sim < 0.28 && !ARTICLE_PATH_HINT.test(requestedUrl || '')) {
+  const rawText = String(raw || '').slice(0, 7000);
+  const tokenEvidence = queryConcepts(targetTitle || '').filter(c => textHasConcept(rawText, c)).length;
+  const titleKnown = Boolean(targetTitle && meta.title);
+
+  if (isNewsLike && meta.sourceUrl && !hostMatch) return { ok: false, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
+  if (titleKnown && sim < (isNewsLike ? 0.32 : 0.22) && tokenEvidence === 0) {
     return { ok: false, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
   }
-  if (targetTitle && sim < 0.32 && isNewsLike) {
+  if (isNewsLike && titleKnown && sim < 0.28 && tokenEvidence < 1) {
     return { ok: false, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
   }
   return { ok: true, titleSimilarity: sim, title: meta.title, sourceUrl: meta.sourceUrl };
 }
 
 async function readerFallback(url, deadline, result = null) {
-  if (!safeHttpUrl(url) || isBlockedContentUrl(url) || remainingMs(deadline) < 850) return null;
-  const urls = readerUrls(url).slice(0, 1);
-  const jobs = urls.map(async proxyUrl => {
+  if (!safeHttpUrl(url) || isBlockedContentUrl(url) || remainingMs(deadline) < 800) return null;
+  const urls = readerUrls(url).slice(0, 2);
+  for (const proxyUrl of urls) {
+    if (remainingMs(deadline) < 650) break;
     try {
       const timeout = effectiveTimeout(READER_TIMEOUT_MS, deadline, 500);
-      if (!timeout) return null;
+      if (!timeout) break;
       const res = await fetchResponse(proxyUrl, {
         timeout, deadline,
         headers: { accept: 'text/plain,text/markdown;q=0.95,*/*;q=0.1' },
       });
-      if (!res.ok) { try { await res.body?.cancel?.(); } catch {} return null; }
-      const raw = await readBodyText(res, MAX_PAGE_BYTES, deadline);
+      if (!res.ok) { try { await res.body?.cancel?.(); } catch {} continue; }
+      const raw = await readBodyText(res, Math.min(MAX_PAGE_BYTES, 500_000), deadline);
       const match = readerMatchesTarget(raw, result, url);
-      if (!match.ok) return null;
+      if (!match.ok) continue;
       const text = textFromMarkdown(raw);
-      if (text.length < 250) return null;
+      if (text.length < 250) continue;
       return {
         content: text,
         method: 'jina-reader',
@@ -1674,10 +1705,8 @@ async function readerFallback(url, deadline, result = null) {
         title: match.title || null,
         titleSimilarity: Number(match.titleSimilarity.toFixed(2)),
       };
-    } catch { return null; }
-  });
-  const rows = await Promise.allSettled(jobs);
-  for (const row of rows) if (row.status === 'fulfilled' && row.value) return row.value;
+    } catch {}
+  }
   return null;
 }
 
@@ -1973,7 +2002,7 @@ async function enrichResult(result, query, deadline) {
 
   const fallbackBase = ensureContentFields(result, query, { status: 'snippet_fallback', method: 'search-snippet', content: extractFallbackContent(result, query), confidence: 0.35 });
   try {
-    if (remainingMs(deadline) < 900) return fallbackBase;
+    if (remainingMs(deadline) < 650) return fallbackBase;
 
     const res = await fetchResponse(result.url, {
       timeout: PAGE_TIMEOUT_MS,
@@ -2004,7 +2033,7 @@ async function enrichResult(result, query, deadline) {
       let pdfText = '';
       try { pdfText = await extractPdfText(bytes, deadline); } catch {}
       if (!pdfText && remainingMs(deadline) > 1500) {
-        const reader = await readerFallback(finalUrl, deadline);
+        const reader = await readerFallback(finalUrl, deadline, result);
         if (reader?.content) pdfText = reader.content;
       }
       return ensureContentFields({
@@ -2165,34 +2194,104 @@ function isRealContentResult(result) {
   return content.length >= 250;
 }
 
-function relevanceGate(result, query, intent) {
+const QUERY_SYNONYMS = {
+  car: ['car', 'cars', 'automobile', 'automobiles', 'vehicle', 'vehicles', 'automotive'],
+  history: ['history', 'historical', 'origins', 'origin', 'evolution', 'timeline'],
+  price: ['price', 'prices', 'cost', 'costs', 'pricing', 'fee', 'fees'],
+  law: ['law', 'laws', 'legal', 'act', 'acts', 'regulation', 'regulations'],
+  policy: ['policy', 'policies', 'scheme', 'schemes', 'programme', 'program', 'initiative', 'initiatives'],
+  company: ['company', 'companies', 'firm', 'firms', 'corporation', 'corporations'],
+  founder: ['founder', 'founded', 'cofounder', 'co-founder', 'founding'],
+  education: ['education', 'school', 'schools', 'college', 'colleges', 'university', 'universities'],
+  population: ['population', 'populations', 'people', 'residents'],
+};
+
+function queryConcepts(query) {
   const terms = extractSearchTerms(query);
-  if (!terms.length) return true;
-  const title = String(result.title || '').toLowerCase();
-  const snippet = String(result.snippet || '').toLowerCase();
-  const body = String(result.pageContent || result.extractedText || '').toLowerCase().slice(0, 10000);
-  const matchedTitle = terms.filter(t => title.includes(t)).length;
-  const matchedSnippet = terms.filter(t => snippet.includes(t)).length;
-  const matchedBody = terms.filter(t => body.includes(t)).length;
-  const titleCoverage = matchedTitle / terms.length;
-  const snippetCoverage = matchedSnippet / terms.length;
-  const bodyCoverage = matchedBody / terms.length;
-  const tavilyScore = Number(result.searchScore);
-  if (Number.isFinite(tavilyScore) && tavilyScore >= 0.40) return true;
-  if (titleCoverage >= 0.50) return true;
-  if (titleCoverage >= 0.34 && (snippetCoverage >= 0.34 || bodyCoverage >= 0.30)) return true;
-  if (titleCoverage >= RELEVANCE_MIN_TITLE_COVERAGE && bodyCoverage >= 0.45) return true;
-  if (intent.wantsNews && result.publishedAt && titleCoverage >= 0.25) return true;
-  if (Number(result._score || 0) >= RELEVANCE_MIN_SCORE && (titleCoverage >= 0.18 || bodyCoverage >= 0.22)) return true;
+  const used = new Set();
+  const concepts = [];
+  for (const term of terms) {
+    if (used.has(term)) continue;
+    const key = Object.keys(QUERY_SYNONYMS).find(k => QUERY_SYNONYMS[k].includes(term));
+    const tokens = key ? QUERY_SYNONYMS[key] : [term];
+    concepts.push({ key: key || term, tokens });
+    tokens.forEach(t => used.add(t));
+  }
+  return concepts;
+}
+
+function textHasConcept(text, concept) {
+  const lower = String(text || '').toLowerCase();
+  return concept.tokens.some(t => lower.includes(t));
+}
+
+function queryRelevanceMetrics(result, query) {
+  const concepts = queryConcepts(query);
+  if (!concepts.length) return { conceptCoverage: 1, titleCoverage: 1, snippetCoverage: 1, bodyCoverage: 1, anchorMatched: true, strong: true, score: 100 };
+  const title = String(result.title || '');
+  const snippet = String(result.snippet || '');
+  const body = String(result.pageContent || result.extractedText || '').slice(0, 14000);
+  const titleHits = concepts.filter(c => textHasConcept(title, c)).length;
+  const snippetHits = concepts.filter(c => textHasConcept(snippet, c)).length;
+  const bodyHits = concepts.filter(c => textHasConcept(body, c)).length;
+  const conceptCoverage = bodyHits / concepts.length;
+  const titleCoverage = titleHits / concepts.length;
+  const snippetCoverage = snippetHits / concepts.length;
+  const queryLower = String(query).toLowerCase();
+  const anchorConcepts = concepts.filter(c => /^(history|price|law|policy|company|founder|education|population)$/i.test(c.key));
+  const anchorMatched = anchorConcepts.every(c => textHasConcept(`${title} ${snippet} ${body}`, c));
+  const exactPhrase = title.toLowerCase().includes(queryLower) || snippet.toLowerCase().includes(queryLower);
+  const searchScore = Number(result.searchScore);
+  let score = conceptCoverage * 45 + titleCoverage * 30 + snippetCoverage * 10;
+  if (exactPhrase) score += 14;
+  if (titleCoverage >= 0.5) score += 8;
+  if (Number.isFinite(searchScore)) score += Math.max(0, Math.min(12, searchScore * 12));
+  if (anchorMatched) score += 6; else if (anchorConcepts.length) score -= 15;
+  const minimumCoverage = concepts.length <= 2 ? 1 : concepts.length <= 4 ? 0.67 : 0.60;
+  const strong = anchorMatched && conceptCoverage >= minimumCoverage && (titleCoverage >= 0.25 || snippetCoverage >= 0.25);
+  return {
+    conceptCoverage: Number(conceptCoverage.toFixed(2)),
+    titleCoverage: Number(titleCoverage.toFixed(2)),
+    snippetCoverage: Number(snippetCoverage.toFixed(2)),
+    bodyCoverage: Number(conceptCoverage.toFixed(2)),
+    anchorMatched,
+    strong,
+    exactPhrase,
+    score: Number(score.toFixed(1)),
+  };
+}
+
+function relevanceGate(result, query, intent) {
+  const metrics = queryRelevanceMetrics(result, query);
+  result._relevance = metrics;
+  if (metrics.strong) return true;
+  const searchScore = Number(result.searchScore);
+  if (Number.isFinite(searchScore) && searchScore >= 0.60 && metrics.conceptCoverage >= 0.50 && metrics.anchorMatched) return true;
+  if (Number(result._score || 0) >= RELEVANCE_MIN_SCORE && metrics.conceptCoverage >= 0.50 && metrics.anchorMatched) return true;
   return false;
 }
 
 function contentOnlySelection(results, count, requireRealContent, warnings, query, intent) {
   const real = results.filter(isRealContentResult);
-  const relevant = real.filter(r => relevanceGate(r, query, intent));
-  const pool = relevant.length >= Math.min(count, 4) ? relevant : real;
-  if (!requireRealContent) return diversifyAndSelect(results, count, intent);
-  if (pool.length < count) warnings.push(`Only ${pool.length} result(s) had both validated live content and strong query relevance; ${count} were requested. Unvalidated or weakly matching candidates were excluded.`);
+  const ranked = real.map(r => {
+    const metrics = queryRelevanceMetrics(r, query);
+    r._relevance = metrics;
+    r._score = Number(r._score || 0) + metrics.score * 0.65;
+    return r;
+  }).sort((a, b) => (b._score || 0) - (a._score || 0));
+  if (!requireRealContent) return diversifyAndSelect(ranked.length ? ranked : results, count, intent);
+
+  const strong = ranked.filter(r => relevanceGate(r, query, intent));
+  const concepts = queryConcepts(query);
+  const backfillCoverage = concepts.length <= 2 ? 0.75 : concepts.length <= 4 ? 0.60 : 0.55;
+  const usable = strong.length >= Math.min(count, 4)
+    ? strong
+    : ranked.filter(r => {
+        const m = r._relevance || queryRelevanceMetrics(r, query);
+        return m.anchorMatched && m.conceptCoverage >= backfillCoverage && m.score >= RELEVANCE_BACKFILL_SCORE;
+      });
+  const pool = usable;
+  if (pool.length < count) warnings.push(`Only ${pool.length} validated result(s) met the relevance/content contract; ${count} were requested. Weak or unrelated candidates were excluded.`);
   return diversifyAndSelect(pool, count, intent);
 }
 
@@ -2213,15 +2312,33 @@ async function commonCrawlLookup(url, deadline) {
 }
 
 function plannedRequests(queries, intent) {
-  const byQuery = new Map();
-  queries.forEach((q, qi) => byQuery.set(qi, buildEngineUrls(q, intent).map(engine => ({ ...engine, __queryIndex: qi }))));
+  const rows = queries.map((q, qi) => ({
+    qi,
+    requests: buildEngineUrls(q, intent).map(engine => ({ ...engine, __queryIndex: qi })),
+  }));
+  const coreProviders = ['bing', 'google', 'duckduckgo', 'yahoo', 'mojeek'];
   const out = [];
-  const queryLimit = intent?.wantsNews ? Math.min(5, queries.length) : queries.length;
-  const maxRounds = Math.max(1, ...[...byQuery.values()].map(v => v.length));
-  for (let round = 0; round < maxRounds && out.length < MAX_ENGINE_REQUESTS; round++) {
-    for (let qi = 0; qi < queryLimit && out.length < MAX_ENGINE_REQUESTS; qi++) {
-      const row = byQuery.get(qi) || [];
-      if (row[round]) out.push(row[round]);
+
+  // Every complementary query gets broad provider coverage before any provider
+  // is repeated. This prevents one engine from monopolising the candidate pool.
+  for (const row of rows) {
+    for (const provider of coreProviders) {
+      if (out.length >= MAX_ENGINE_REQUESTS) break;
+      const req = row.requests.find(x => x.provider === provider);
+      if (req) out.push(req);
+    }
+    if (out.length >= MAX_ENGINE_REQUESTS) break;
+  }
+
+  // Add specialized surfaces only when the query actually requests them.
+  if (out.length < MAX_ENGINE_REQUESTS) {
+    for (const row of rows.slice(0, 4)) {
+      for (const req of row.requests) {
+        if (out.length >= MAX_ENGINE_REQUESTS) break;
+        if (coreProviders.includes(req.provider)) continue;
+        if (!out.some(x => x.url === req.url)) out.push(req);
+      }
+      if (out.length >= MAX_ENGINE_REQUESTS) break;
     }
   }
   return out.slice(0, MAX_ENGINE_REQUESTS);
@@ -2382,7 +2499,7 @@ async function performSearch(input, started, deadline) {
 
     // One compact fallback wave for candidates that failed direct extraction. This keeps quality high without serial retry chains.
     const missing = discovered.filter(r => !isRealContentResult(r)).slice(0, FAST_FALLBACK_LIMIT);
-    if (missing.length && remainingMs(deadline) > 1450) {
+    if (missing.length && remainingMs(deadline) > 1100) {
       const fallbackRows = await mapConcurrent(missing, Math.min(CONTENT_CONCURRENCY, 18), async r => {
         const url = r.url;
         const alternatePromise = fetchVariantContent(url, deadline, r);
@@ -2419,8 +2536,8 @@ async function performSearch(input, started, deadline) {
   }
 
   // AI reranking is optional and runs only after content is available; it is never allowed to consume the whole request budget.
-  const shouldRerank = useAi === 'true' || (useAi === 'auto' && deep && discovered.length > 12);
-  if (shouldRerank && discovered.length > 1 && remainingMs(deadline) > 1550) {
+  const shouldRerank = useAi === 'true' && discovered.length > 4;
+  if (shouldRerank && discovered.length > 1 && remainingMs(deadline) > 1200) {
     const orderPromise = aiRerank(query, discovered, mode, dateIntent, deadline);
     const order = await Promise.race([orderPromise, sleep(Math.max(0, remainingMs(deadline) - 700)).then(() => null)]).catch(() => null);
     if (order?.length) {
@@ -2460,6 +2577,7 @@ async function performSearch(input, started, deadline) {
     trust: Number((r.trust || domainTrust(r.url)).toFixed(2)),
     relevanceScore: Math.max(0, Math.min(100, Math.round(50 + (r._score || 0) * 2))),
     semanticSearchScore: Number.isFinite(Number(r.searchScore)) ? Number(Number(r.searchScore).toFixed(4)) : null,
+    relevanceMetrics: r._relevance || queryRelevanceMetrics(r, query),
     publisherResolved: Boolean(r.publisherResolved),
     publisherWrapperUrl: r.publisherWrapperUrl || null,
     publisherResolutionMethod: r.publisherResolutionMethod || null,
@@ -2487,7 +2605,7 @@ async function performSearch(input, started, deadline) {
     commonCrawl: r.commonCrawl || null,
   }));
 
-  if (requireRealContent && !finalResults.length) warnings.push('No validated live content completed within the fast budget; snippet-only candidates were excluded.');
+  if (requireRealContent && !finalResults.length) warnings.push('No result satisfied both requirements: validated live content and query relevance. No snippet-only content was substituted.');
 
   const result = {
     ok: true,
@@ -2498,7 +2616,7 @@ async function performSearch(input, started, deadline) {
     mode,
     intent: {
       ...baseIntent,
-      type: requestedType || ai?.intent || baseIntent.type,
+      type: requestedType || baseIntent.type,
       wantsNews: baseIntent.wantsNews || ai?.intent === 'news',
       wantsVideo: baseIntent.wantsVideo || ai?.intent === 'video',
       wantsGov: baseIntent.wantsGov || ai?.intent === 'gov' || mode === 'gov',
@@ -2510,6 +2628,12 @@ async function performSearch(input, started, deadline) {
     groqUsed: Boolean(ai),
     cached: false,
     providers: providerStats,
+    quality: {
+      validatedResults: finalResults.filter(r => r.contentAvailable).length,
+      relevantResults: finalResults.filter(r => (r.relevanceMetrics?.strong || r.relevanceScore >= 70)).length,
+      requestedResults: count,
+      realContentOnly: requireRealContent,
+    },
     searchPlan: {
       queryVariants: plannedQueries,
       engineRequests: totalEngineRequests,
