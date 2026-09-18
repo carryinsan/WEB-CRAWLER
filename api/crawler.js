@@ -34,7 +34,7 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-1.10.3';
+const VERSION = 'arix-crawler-1.10.4';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 700;
@@ -42,6 +42,7 @@ const MAX_REQUEST_BODY = 100_000;
 
 // The crawler's own wall-clock objective. External sites can still be slow or blocked.
 const SEARCH_BUDGET_MS = 9_500;
+const OUTPUT_MAX_SOURCES = 500;
 const SEARCH_TIMEOUT_MS = 1_450;
 const COMMON_CRAWL_TIMEOUT_MS = 650;
 const STREAM_HEARTBEAT_MS = 1_000;
@@ -87,7 +88,7 @@ const TRUSTED_DOMAINS = [
 ];
 
 const USER_AGENT =
-  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.10.3; +https://lexis-ai-chatini.vercel.app/)';
+  'Mozilla/5.0 (compatible; ArixAI-LiveSearch/1.10.4; +https://lexis-ai-chatini.vercel.app/)';
 
 function nowIso() { return new Date().toISOString(); }
 function left(deadline) { return Math.max(0, deadline - Date.now()); }
@@ -810,7 +811,7 @@ async function performSearch(input, started, logger) {
 
   // Final selection is intentionally soft: all returned sources have real page content;
   // relevance only determines ordering, not a brittle score cutoff.
-  const finalPool = [...new Map(enriched.filter(isRealSourceContent).map(r => [normalizedKey(r.url), r])).values()]
+  const finalPool = [...new Map(enriched.filter(isRealSourceContent).map(r => [normalizedKey(r.url), r])).values()].slice(0, OUTPUT_MAX_SOURCES)
     .map(r => ({ ...r, _score: Number(r.relevanceScore || 0) }))
     .sort((a, b) => Number(b.relevanceScore || 0) - Number(a.relevanceScore || 0));
 
@@ -900,6 +901,7 @@ function buildResponse({ query, count, mode, requestedType, plan, preciseQueries
     requestedResults: count,
     returnedResults: final.length,
     sourceCountMode: 'all-fetched-real-content',
+      resultSelectionPolicy: 'return-all-fetched-real-content-ranked-by-query-match',
     mode,
     intent: {
       type: requestedType || plan.type,
