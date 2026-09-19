@@ -18,23 +18,23 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-2.0.0';
+const VERSION = 'arix-crawler-2.1.0';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 700;
 const MAX_REQUEST_BODY = 100_000;
 
-const SEARCH_BUDGET_MS = 9_500;
-const SEARCH_TIMEOUT_MS = 1_250;
-const VERIFY_TIMEOUT_MS = 900;
-const VERIFY_HEADROOM_MS = 140;
-const DISCOVERY_CUTOFF_MS = 3_400;
+const SEARCH_BUDGET_MS = 6_800;
+const SEARCH_TIMEOUT_MS = 1_050;
+const VERIFY_TIMEOUT_MS = 700;
+const VERIFY_HEADROOM_MS = 90;
+const DISCOVERY_CUTOFF_MS = 2_650;
 const SEARCH_CONCURRENCY = 24;
 const VERIFY_CONCURRENCY = 18;
 const MAX_ENGINE_REQUESTS = 24;
-const MAX_DISCOVERY_RESULTS = 500;
+const MAX_DISCOVERY_RESULTS = 1000;
 const MAX_LIVE_LOG = 80;
-const OUTPUT_MAX_SOURCES = 500;
+const OUTPUT_MAX_SOURCES = 1000;
 const CACHE_MAX = 120;
 const CACHE_TTL_MS = 7_000;
 const LIVE_CACHE_TTL_MS = 2_500;
@@ -44,9 +44,9 @@ const COMMON_CRAWL_TIMEOUT_MS = 650;
 const MAX_COMMON_CRAWL = 4;
 const COMMON_CRAWL_INDEXES = ['CC-MAIN-2026-34', 'CC-MAIN-2026-30'];
 
-const AI_RERANK_TIMEOUT_MS = 850;
+const AI_RERANK_TIMEOUT_MS = 700;
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; ArixAI-LiveSearch/2.0.0; +https://lexis-ai-chatini.vercel.app/)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; ArixAI-LiveSearch/2.1.0; +https://lexis-ai-chatini.vercel.app/)';
 
 /* Only obvious tracking / measurement surfaces are blocked. Ordinary public sites,
  * PDFs, JS documentation, forums, media pages, etc. are not blanket-blocked. */
@@ -176,7 +176,9 @@ function isLikelySearchUrl(url) {
   const h = normalizeHost(url);
   try {
     const u = new URL(url);
-    return SEARCH_HOSTS.has(h) && (/\/search|\/url|\/ck\/a|\/l\/?|\/results|\/watch/i.test(u.pathname + '?' + u.search) || h === 'news.google.com');
+    if (h === 'youtube.com' || h === 'www.youtube.com') return !/^\/watch(?:$|\?)/i.test(u.pathname + u.search);
+    if (h === 'youtu.be') return false;
+    return SEARCH_HOSTS.has(h) && (/\/search|\/url|\/ck\/a|\/l\/?|\/results/i.test(u.pathname + '?' + u.search) || h === 'news.google.com');
   } catch { return false; }
 }
 
@@ -349,115 +351,212 @@ function makeCandidate(url, title, snippet, provider, type, extra = {}) {
   return result;
 }
 
-function parseBing(html, req) {
-  const out = []; const s = String(html || '');
-  const blocks = s.match(/<li[^>]+class=["'][^"']*b_algo[^"']*["'][\s\S]*?<\/li>/gi) || [];
-  let rank = 0;
-  for (const block of blocks) {
-    const m = block.match(/<h2[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
-    if (!m) continue;
-    const r = makeCandidate(m[1],m[2],(block.match(/<p[^>]*>([\s\S]*?)<\/p>/i)||[, ''])[1],'bing',req.type,{base:'https://www.bing.com/',providerRank:++rank,queryVariant:req.queryVariant,searchWrapperResolved:true});
-    if (r) out.push(r);
-    if (out.length >= 30) break;
+function decodeEntities(v = '') {
+  return String(v).replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'").replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/&#x([0-9a-f]+);?/gi, (_, x) => { const n = parseInt(x, 16); return Number.isFinite(n) ? String.fromCodePoint(Math.min(0x10ffff, n)) : ' '; })
+    .replace(/&#(\d+);?/g, (_, x) => { const n = parseInt(x, 10); return Number.isFinite(n) ? String.fromCodePoint(Math.min(0x10ffff, n)) : ' '; });
+}
+function searchTitle(v) {
+  const t = cleanSnippet(decodeEntities(v || '')).replace(/\s+/g, ' ').trim();
+  if (!t || t.length < 2 || /^(images?|videos?|maps?|news|shopping|settings|sign in|log in|menu|more|next|previous|feedback|tools)$/i.test(t)) return '';
+  return truncate(t, 500);
+}
+function hasSearchNoiseTitle(v) {
+  const t = normalizeText(v);
+  return !t || /^(sponsored|ad|advertisement|ads|sign in|log in|privacy|terms|cookie|feedback|more results|related searches|people also ask|images|videos|maps|shopping|news)$/.test(t);
+}
+function resultContext(html, index, width = 2500) {
+  const s = String(html || '');
+  return s.slice(Math.max(0, index - Math.floor(width * 0.35)), Math.min(s.length, index + width));
+}
+function nearbySnippet(html, index) {
+  const w = resultContext(html, index, 2600)
+    .replace(/<(script|style|noscript|svg|template|form)\b[\s\S]*?<\/\1>/gi, ' ');
+  return cleanSnippet(stripTags(w));
+}
+function scoreSearchAnchor(url, title, context, provider) {
+  let score = 0;
+  const h = normalizeHost(url);
+  const t = normalizeText(title);
+  const c = normalizeText(context);
+  if (!safeUrl(url) || blocked(url) || isLikelySearchUrl(url)) return -999;
+  if (hasSearchNoiseTitle(title)) return -999;
+  if (title.length >= 12) score += 8;
+  if (title.length >= 30) score += 5;
+  if (title.length <= 180) score += 3; else score -= 4;
+  if (/\b(home|homepage|about us|contact us|careers|login|sign in|privacy policy|terms of service)\b/i.test(title)) score -= 8;
+  if (/\b(sponsored|advertisement|ad)\b/i.test(title)) score -= 18;
+  if (new URL(url).pathname && new URL(url).pathname !== '/') score += 3;
+  if (/\b(?:result|organic|web-result|b_algo|MjjYud|result__a|algo|search-result)\b/i.test(context)) score += 12;
+  if (/<(?:h1|h2|h3|h4)\b/i.test(context)) score += 8;
+  if (/\b(?:sponsored|advertisement|ads by)\b/i.test(c)) score -= 20;
+  if (provider === 'bing' && /b_algo/i.test(context)) score += 12;
+  if (provider === 'google' && /MjjYud|g\.h3|<h3/i.test(context)) score += 8;
+  if (provider === 'duckduckgo' && /result__a|result__body|results_links/i.test(context)) score += 12;
+  if (provider === 'yahoo' && /search-result|algo-sr/i.test(context)) score += 8;
+  if (provider === 'mojeek' && /result|title/i.test(context)) score += 6;
+  if (provider === 'brave' && /snippet|result|fdb/i.test(context)) score += 7;
+  if (isGov(url)) score += 4;
+  if (isTrusted(url)) score += 3;
+  if (/\.(pdf|docx?|xlsx?|pptx?)$/i.test(new URL(url).pathname)) score += 2;
+  if (h === 'youtube.com' || h === 'youtu.be') score += 2;
+  return score;
+}
+function extractAnchors(html, base, provider, req, cap = 80) {
+  const out = [];
+  const s = String(html || '');
+  const seen = new Set();
+  const re = /<a\b([^>]*?)\bhref\s*=\s*(["'])([\s\S]*?)\2([^>]*)>([\s\S]*?)<\/a\s*>/gi;
+  let m;
+  while ((m = re.exec(s)) && out.length < cap * 4) {
+    const raw = decodeEntities(m[3]).trim();
+    const url = unwrap(raw, base);
+    if (!url || blocked(url) || isLikelySearchUrl(url)) continue;
+    const title = searchTitle(m[5]);
+    if (!title) continue;
+    const context = resultContext(s, m.index || 0, 3000);
+    const score = scoreSearchAnchor(url, title, context, provider);
+    if (score < 2) continue;
+    const key = normalizedKey(url);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      candidate: makeCandidate(url, title, nearbySnippet(s, m.index || 0), provider, req.type, {
+        base, providerRank: out.length + 1, queryVariant: req.queryVariant, searchWrapperResolved: true
+      }), score
+    });
   }
-  if (!out.length) {
-    rank = 0;
-    for (const m of s.matchAll(/<h2[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
-      const r = makeCandidate(m[1],m[2],'','bing',req.type,{base:'https://www.bing.com/',providerRank:++rank,queryVariant:req.queryVariant,searchWrapperResolved:true});
-      if (r) out.push(r);
-      if (out.length >= 30) break;
+  out.sort((a, b) => b.score - a.score);
+  return out.filter(x => x.candidate).slice(0, cap).map(x => x.candidate);
+}
+function extractHeadingAnchors(html, base, provider, req, heading = 'h3', cap = 40) {
+  const s = String(html || ''), out = [], seen = new Set();
+  const re = new RegExp(`<${heading}\\b[^>]*>([\\s\\S]*?)<\\/${heading}\\s*>`, 'gi');
+  let m;
+  while ((m = re.exec(s)) && out.length < cap) {
+    const idx = m.index || 0;
+    const before = s.slice(Math.max(0, idx - 1600), idx);
+    const after = s.slice(idx, Math.min(s.length, idx + 1600));
+    const around = `${before}${after}`;
+    const links = [];
+    for (const lm of around.matchAll(/<a\b[^>]*\bhref\s*=\s*(["'])([\s\S]*?)\1[^>]*>/gi)) links.push(lm[2]);
+    for (const raw of links.reverse()) {
+      const url = unwrap(decodeEntities(raw), base);
+      if (!url || blocked(url) || isLikelySearchUrl(url)) continue;
+      const title = searchTitle(m[1]);
+      if (!title) continue;
+      const key = normalizedKey(url); if (!key || seen.has(key)) continue;
+      const score = scoreSearchAnchor(url, title, around, provider) + 12;
+      if (score < 8) continue;
+      seen.add(key);
+      const c = makeCandidate(url, title, nearbySnippet(s, idx), provider, req.type, { base, providerRank: out.length + 1, queryVariant: req.queryVariant, searchWrapperResolved: true });
+      if (c) { out.push(c); break; }
     }
   }
   return out;
 }
-
-function parseGoogle(html, req, source = 'google') {
-  const out=[]; const seen=new Set(); const s=String(html || ''); let rank=0;
-  for (const m of s.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/gi)) {
-    const idx=m.index || 0; const window=s.slice(Math.max(0,idx-1800),Math.min(s.length,idx+700));
-    const links=[...window.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>/gi)].map(x=>x[1]);
-    let raw=links.reverse().find(x=>/^https?:\/\//i.test(decodeUri(x)) || /^\//.test(x));
-    if (!raw) continue;
-    try { if (raw.startsWith('/url?')) { const u=new URL(raw,'https://www.google.com/'); raw=u.searchParams.get('q')||u.searchParams.get('url')||raw; } } catch {}
-    const url=unwrap(raw,'https://www.google.com/'); if(!url || blocked(url) || isLikelySearchUrl(url)) continue;
-    const key=normalizedKey(url); if(seen.has(key)) continue; seen.add(key);
-    const r=makeCandidate(url,m[1],stripTags(window),source,req.type,{providerRank:++rank,queryVariant:req.queryVariant,searchWrapperResolved:true});
-    if(r) out.push(r); if(out.length>=30) break;
-  }
-  return out;
-}
-
-function parseDuck(html, req) {
-  const out=[]; let rank=0; const s=String(html || '');
-  for (const m of s.matchAll(/<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
-    const idx=m.index||0; const window=s.slice(idx,idx+2800);
-    const r=makeCandidate(m[1],m[2],(window.match(/class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\//i)||[,stripTags(window)])[1],'duckduckgo',req.type,{base:'https://html.duckduckgo.com/',providerRank:++rank,queryVariant:req.queryVariant,searchWrapperResolved:true});
-    if(r) out.push(r); if(out.length>=30) break;
-  }
-  return out;
-}
-
-function parseYahoo(html, req) {
-  const out=[]; let rank=0; const s=String(html || '');
-  for (const m of s.matchAll(/<h3[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
-    const idx=m.index||0; const window=s.slice(Math.max(0,idx-300),Math.min(s.length,idx+2200));
-    const r=makeCandidate(m[1],m[2],stripTags(window),'yahoo',req.type,{base:'https://search.yahoo.com/',providerRank:++rank,queryVariant:req.queryVariant,searchWrapperResolved:true});
-    if(r) out.push(r); if(out.length>=30) break;
-  }
-  return out;
-}
-
-function parseMojeek(html, req) {
-  const out=[]; let rank=0; const s=String(html || '');
-  const patterns=[
-    /<a[^>]+href=["']([^"']+)["'][^>]+class=["'][^"']*(?:title|ob|result)[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi,
-    /<h2[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi
+function extractEmbeddedResults(html, base, provider, req, cap = 40) {
+  const s = String(html || ''), out = [], seen = new Set();
+  const patterns = [
+    /"(?:url|link|targetUrl|resultUrl)"\s*:\s*"(https?:\/\/[^"]+)"/gi,
+    /(?:url|href)=["'](https?:\/\/[^"']+)["']/gi
   ];
-  for(const re of patterns){
-    for(const m of s.matchAll(re)){
-      const idx=m.index||0; const window=s.slice(idx,idx+2500);
-      const r=makeCandidate(m[1],m[2],stripTags(window),'mojeek',req.type,{base:'https://www.mojeek.com/',providerRank:++rank,queryVariant:req.queryVariant,searchWrapperResolved:true});
-      if(r) out.push(r); if(out.length>=30) break;
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(s)) && out.length < cap) {
+      const url = unwrap(m[1].replace(/\\\//g, '/'), base);
+      if (!url || blocked(url) || isLikelySearchUrl(url)) continue;
+      const key = normalizedKey(url); if (!key || seen.has(key)) continue;
+      const idx = m.index || 0;
+      const window = resultContext(s, idx, 1800);
+      const textMatches = [];
+      for (const tm of window.matchAll(/"(?:title|name|text|displayName)"\s*:\s*"((?:\\.|[^"\\]){5,280})"/gi)) textMatches.push(tm[1]);
+      const title = searchTitle(textMatches[0] || stripTags(window).slice(0, 240) || normalizeHost(url));
+      if (!title) continue;
+      const score = scoreSearchAnchor(url, title, window, provider);
+      if (score < 2) continue;
+      const c = makeCandidate(url, title, nearbySnippet(s, idx), provider, req.type, { base, providerRank: out.length + 1, queryVariant: req.queryVariant, searchWrapperResolved: true });
+      if (c) { seen.add(key); out.push(c); }
     }
-    if(out.length>=30) break;
   }
   return out;
 }
-
-function parseGoogleNews(xml, req) {
-  const out=[]; let rank=0;
-  for(const item of String(xml||'').match(/<item>[\s\S]*?<\/item>/gi)||[]){
-    const title=stripTags((item.match(/<title>([\s\S]*?)<\/title>/i)||[, ''])[1]);
-    const link=stripTags((item.match(/<link>([\s\S]*?)<\/link>/i)||[, ''])[1]);
-    const pub=stripTags((item.match(/<pubDate>([\s\S]*?)<\/pubDate>/i)||[, ''])[1]);
-    const desc=stripTags((item.match(/<description>([\s\S]*?)<\/description>/i)||[, ''])[1]);
-    const sm=item.match(/<source[^>]+url=["']([^"']+)["'][^>]*>([\s\S]*?)<\/source>/i);
-    const sourceName=stripTags(sm?.[2]||'');
-    const url=unwrap(link,'https://news.google.com/');
-    if(!title||!url||normalizeHost(url)==='news.google.com') continue;
-    const r=makeCandidate(url,title,desc,sourceName?`google-news:${sourceName}`:'google-news','news',{publishedAt:safeDate(pub),providerRank:++rank,queryVariant:req.queryVariant});
-    if(r) out.push(r); if(out.length>=80) break;
+function parseRssSearch(text, req, provider = req.provider) {
+  const out = [], items = String(text || '').match(/<item\b[\s\S]*?<\/item\s*>/gi) || [];
+  for (let i = 0; i < items.length && out.length < 80; i++) {
+    const item = items[i];
+    const title = searchTitle((item.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [, ''])[1]);
+    const link = decodeEntities((item.match(/<link[^>]*>([\s\S]*?)<\/link>/i) || [, ''])[1]);
+    const desc = cleanSnippet((item.match(/<(?:description|content:encoded)[^>]*>([\s\S]*?)<\/(?:description|content:encoded)>/i) || [, ''])[1]);
+    const pub = decodeEntities((item.match(/<(?:pubDate|published|updated)[^>]*>([\s\S]*?)<\/(?:pubDate|published|updated)>/i) || [, ''])[1]);
+    const c = makeCandidate(link, title, desc, provider, req.type, { publishedAt: safeDate(pub), providerRank: out.length + 1, queryVariant: req.queryVariant });
+    if (c) out.push(c);
   }
   return out;
 }
-
+function parseBing(html, req) {
+  const s = String(html || ''), primary = [];
+  for (const block of s.match(/<li[^>]+class=["'][^"']*b_algo[^"']*["'][\s\S]*?<\/li>/gi) || []) {
+    const m = block.match(/<a\b[^>]*href\s*=\s*(["'])([\s\S]*?)\1[^>]*>([\s\S]*?)<\/a\s*>/i);
+    if (!m) continue;
+    const t = searchTitle(m[3]); const c = makeCandidate(m[2], t, (block.match(/<p[^>]*>([\s\S]*?)<\/p>/i) || [, ''])[1], 'bing', req.type, { base:'https://www.bing.com/', providerRank:primary.length+1, queryVariant:req.queryVariant, searchWrapperResolved:true });
+    if (c) primary.push(c);
+  }
+  return primary.length >= 3 ? primary.slice(0, 40) : [...primary, ...extractHeadingAnchors(s, 'https://www.bing.com/', 'bing', req, 'h2', 40), ...extractAnchors(s, 'https://www.bing.com/', 'bing', req, 40), ...extractEmbeddedResults(s, 'https://www.bing.com/', 'bing', req, 20)].filter((v,i,a)=>a.findIndex(x=>normalizedKey(x.url)===normalizedKey(v.url))===i).slice(0,40);
+}
+function parseGoogle(html, req, source = 'google') {
+  const s = String(html || ''), primary = extractHeadingAnchors(s, 'https://www.google.com/', source, req, 'h3', 40);
+  if (primary.length >= 3) return primary;
+  const generic = extractAnchors(s, 'https://www.google.com/', source, req, 40);
+  const embedded = extractEmbeddedResults(s, 'https://www.google.com/', source, req, 30);
+  return [...primary, ...generic, ...embedded].filter((v,i,a)=>a.findIndex(x=>normalizedKey(x.url)===normalizedKey(v.url))===i).slice(0,40);
+}
+function parseDuck(html, req) {
+  const s = String(html || ''), out = [];
+  for (const m of s.matchAll(/<a\b[^>]*class=["'][^"']*result__a[^"']*["'][^>]*href\s*=\s*(["'])([\s\S]*?)\1[^>]*>([\s\S]*?)<\/a\s*>/gi)) {
+    const c = makeCandidate(m[2], searchTitle(m[3]), nearbySnippet(s, m.index || 0), 'duckduckgo', req.type, { base:'https://html.duckduckgo.com/', providerRank:out.length+1, queryVariant:req.queryVariant, searchWrapperResolved:true });
+    if (c) out.push(c);
+  }
+  if (out.length >= 3) return out.slice(0,40);
+  return [...out, ...extractAnchors(s, 'https://html.duckduckgo.com/', 'duckduckgo', req, 40)].filter((v,i,a)=>a.findIndex(x=>normalizedKey(x.url)===normalizedKey(v.url))===i).slice(0,40);
+}
+function parseYahoo(html, req) {
+  const s = String(html || ''), primary = [];
+  for (const m of s.matchAll(/<h3\b[^>]*>[\s\S]*?<a\b[^>]*href\s*=\s*(["'])([\s\S]*?)\1[^>]*>([\s\S]*?)<\/a\s*>[\s\S]*?<\/h3\s*>/gi)) {
+    const c = makeCandidate(m[2], searchTitle(m[3]), nearbySnippet(s, m.index || 0), 'yahoo', req.type, { base:'https://search.yahoo.com/', providerRank:primary.length+1, queryVariant:req.queryVariant, searchWrapperResolved:true });
+    if (c) primary.push(c);
+  }
+  return [...primary, ...extractAnchors(s, 'https://search.yahoo.com/', 'yahoo', req, 40)].filter((v,i,a)=>a.findIndex(x=>normalizedKey(x.url)===normalizedKey(v.url))===i).slice(0,40);
+}
+function parseMojeek(html, req) {
+  const s = String(html || ''), out = [];
+  for (const m of s.matchAll(/<a\b[^>]*href\s*=\s*(["'])([\s\S]*?)\1[^>]*class=["'][^"']*(?:title|ob|result)[^"']*["'][^>]*>([\s\S]*?)<\/a\s*>/gi)) {
+    const c = makeCandidate(m[2], searchTitle(m[3]), nearbySnippet(s, m.index || 0), 'mojeek', req.type, { base:'https://www.mojeek.com/', providerRank:out.length+1, queryVariant:req.queryVariant, searchWrapperResolved:true });
+    if (c) out.push(c);
+  }
+  return [...out, ...extractAnchors(s, 'https://www.mojeek.com/', 'mojeek', req, 40)].filter((v,i,a)=>a.findIndex(x=>normalizedKey(x.url)===normalizedKey(v.url))===i).slice(0,40);
+}
+function parseGoogleNews(xml, req) { return parseRssSearch(xml, req, 'google-news'); }
 function parseYoutube(html, req) {
-  const out=[]; const seen=new Set(); let rank=0; const s=String(html||'');
-  for(const m of s.matchAll(/"videoRenderer":\{[\s\S]*?"videoId":"([A-Za-z0-9_-]{6,20})"[\s\S]*?"title":\{"runs":\[\{"text":"((?:\\.|[^"\\])*)"/g)){
-    const id=m[1]; if(seen.has(id)) continue; seen.add(id);
-    const title=m[2].replace(/\\"/g,'"').replace(/\\\\/g,'\\');
-    const r=makeCandidate(`https://www.youtube.com/watch?v=${id}`,title,'YouTube result','youtube','video',{providerRank:++rank,queryVariant:req.queryVariant});
-    if(r) out.push(r); if(out.length>=30) break;
+  const out = [], seen = new Set(), s = String(html || '');
+  for (const m of s.matchAll(/"videoRenderer"\s*:\s*\{[\s\S]*?"videoId"\s*:\s*"([A-Za-z0-9_-]{6,20})"[\s\S]*?"title"\s*:\s*\{\s*"runs"\s*:\s*\[\s*\{\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"/g)) {
+    const id = m[1]; if (seen.has(id)) continue; seen.add(id);
+    const title = searchTitle(m[2].replace(/\\"/g,'"').replace(/\\\\/g,'\\')) || `YouTube video ${id}`;
+    const c = makeCandidate(`https://www.youtube.com/watch?v=${id}`, title, 'YouTube result', 'youtube', 'video', { providerRank:out.length+1, queryVariant:req.queryVariant });
+    if (c) out.push(c);
+    if (out.length >= 40) break;
   }
-  if(!out.length){
-    for(const m of s.matchAll(/"videoId":"([A-Za-z0-9_-]{6,20})"/g)){
+  if (out.length < 3) {
+    for (const m of s.matchAll(/"videoId"\s*:\s*"([A-Za-z0-9_-]{6,20})"/g)) {
       const id=m[1]; if(seen.has(id)) continue; seen.add(id);
-      const r=makeCandidate(`https://www.youtube.com/watch?v=${id}`,`YouTube video ${id}`,'YouTube result','youtube','video',{providerRank:++rank,queryVariant:req.queryVariant});
-      if(r) out.push(r); if(out.length>=30) break;
+      const c=makeCandidate(`https://www.youtube.com/watch?v=${id}`,`YouTube video ${id}`,'YouTube result','youtube','video',{providerRank:out.length+1,queryVariant:req.queryVariant});
+      if(c)out.push(c); if(out.length>=40)break;
     }
   }
   return out;
 }
+function parseBrave(html, req) { const s=String(html||''); const a=extractHeadingAnchors(s,'https://search.brave.com/','brave',req,'h2',40); const b=extractHeadingAnchors(s,'https://search.brave.com/','brave',req,'h3',40); const c=extractAnchors(s,'https://search.brave.com/','brave',req,40); return [...a,...b,...c].filter((v,i,arr)=>arr.findIndex(x=>normalizedKey(x.url)===normalizedKey(v.url))===i).slice(0,40); }
 
 function safeDate(value) { const t=Date.parse(String(value||'')); return Number.isNaN(t)?null:new Date(t).toISOString(); }
 function freshness(publishedAt) {
@@ -469,21 +568,29 @@ function freshness(publishedAt) {
 function providerRequests(queries, plan, deep) {
   const out=[]; const seen=new Set();
   const add=(provider,q,type,url,queryVariant)=>{ if(out.length>=MAX_ENGINE_REQUESTS || !url || seen.has(url)) return; seen.add(url); out.push({provider,query:q,type,url,queryVariant}); };
-  const base=queries[0]||plan.query;
-  const q0=encodeURIComponent(base);
-  const pages=deep?4:2;
-  for(let first=0;first<pages;first++) add('bing',base,plan.type==='news'?'news':'web',`https://www.bing.com/search?q=${q0}&count=10&first=${first*10}&setlang=en-IN&cc=in`,0);
-  for(let i=0;i<queries.length;i++){
-    const q=queries[i], e=encodeURIComponent(q);
-    if(i<3) add('google',q,plan.type==='news'?'news':'web',`https://www.google.com/search?q=${e}&num=20&hl=en&gl=in`,i);
-    if(i<3) add('duckduckgo',q,plan.type==='news'?'news':'web',`https://html.duckduckgo.com/html/?q=${e}&kl=in-en`,i);
-    if(i<3) add('yahoo',q,plan.type==='news'?'news':'web',`https://search.yahoo.com/search?p=${e}`,i);
-    if(i<3) add('mojeek',q,plan.type==='news'?'news':'web',`https://www.mojeek.com/search?q=${e}&lb=EN&lbb=100&rb=IN&rbb=10&s=${1+(i*10)}&t=10&fmt=html`,i);
+  const qs=queries.slice(0, deep ? 4 : 3);
+  const base=qs[0]||plan.query;
+  const e0=encodeURIComponent(base);
+  const bingPages=deep?3:2;
+  for(let first=0;first<bingPages;first++) add('bing',base,plan.type==='news'?'news':'web',`https://www.bing.com/search?q=${e0}&count=10&first=${first*10}&form=QBLH&setlang=en-IN&cc=in`,0);
+  add('bing-rss',base,plan.type==='news'?'news':'web',`https://www.bing.com/search?format=rss&q=${e0}&setlang=en-IN&cc=in`,0);
+  for(let i=0;i<qs.length;i++){
+    const q=qs[i],e=encodeURIComponent(q);
+    add('google',q,plan.type==='news'?'news':'web',`https://www.google.com/search?gbv=1&q=${e}&num=20&hl=en&gl=in&filter=0`,i);
+    if(i<2) add('duckduckgo',q,plan.type==='news'?'news':'web',`https://html.duckduckgo.com/html/?q=${e}&kl=in-en`,i);
+    if(i===0) add('duck-lite',q,plan.type==='news'?'news':'web',`https://lite.duckduckgo.com/lite/?q=${e}&kl=in-en`,i);
+    if(i<2) add('yahoo',q,plan.type==='news'?'news':'web',`https://search.yahoo.com/search?p=${e}&fr=yfp-t`,i);
+    if(i<2) add('mojeek',q,plan.type==='news'?'news':'web',`https://www.mojeek.com/search?q=${e}&lb=EN&lbb=100&rb=IN&rbb=10&fmt=html`,i);
+    if(i===0) add('brave',q,plan.type==='news'?'news':'web',`https://search.brave.com/search?q=${e}&source=web`,i);
   }
-  if(plan.flags.live || plan.type==='news') for(let i=0;i<Math.min(2,queries.length);i++){ const q=queries[i]; add('google-news',q,'news',`https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-IN&gl=IN&ceid=IN:en`,i); }
-  if(plan.type==='video' || plan.flags.explicitVideo) for(let i=0;i<Math.min(2,queries.length);i++){ const q=queries[i]; add('youtube',q,'video',`https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&hl=en`,i); }
-  if(plan.type==='doc' || plan.flags.explicitDoc) for(let i=0;i<Math.min(2,queries.length);i++){ const q=queries[i]; add('google-doc',q,'doc',`https://www.google.com/search?q=${encodeURIComponent(`${q} filetype:pdf`)}&num=20&hl=en&gl=in`,i); }
-  if(plan.type==='gov' || plan.flags.explicitGov) for(let i=0;i<Math.min(2,queries.length);i++){ const q=queries[i]; add('google-gov',q,'gov',`https://www.google.com/search?q=${encodeURIComponent(`${q} site:gov.in`)}&num=20&hl=en&gl=in`,i); }
+  if(plan.flags.live || plan.type==='news') {
+    for(let i=0;i<Math.min(2,qs.length);i++){ const q=qs[i]; add('google-news',q,'news',`https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-IN&gl=IN&ceid=IN:en`,i); }
+  }
+  if(plan.type==='video' || plan.flags.explicitVideo) {
+    for(let i=0;i<Math.min(2,qs.length);i++){ const q=qs[i]; add('youtube',q,'video',`https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&hl=en`,i); }
+  }
+  if(plan.type==='doc' || plan.flags.explicitDoc) for(let i=0;i<Math.min(2,qs.length);i++){const q=qs[i]; add('google-doc',q,'doc',`https://www.google.com/search?gbv=1&q=${encodeURIComponent(`${q} filetype:pdf`)}&num=20&hl=en&gl=in&filter=0`,i);}
+  if(plan.type==='gov' || plan.flags.explicitGov) for(let i=0;i<Math.min(2,qs.length);i++){const q=qs[i]; add('google-gov',q,'gov',`https://www.google.com/search?gbv=1&q=${encodeURIComponent(`${q} site:gov.in`)}&num=20&hl=en&gl=in&filter=0`,i);}
   return out;
 }
 
@@ -518,11 +625,16 @@ async function discoverOne(req,deadline){
     const body=await fetchSearch(req,deadline); let results=[];
     if(req.provider==='bing')results=parseBing(body,req);
     else if(req.provider==='google' || req.provider==='google-video' || req.provider==='google-doc' || req.provider==='google-gov')results=parseGoogle(body,req,req.provider);
-    else if(req.provider==='duckduckgo')results=parseDuck(body,req);
+    else if(req.provider==='duckduckgo' || req.provider==='duck-lite')results=parseDuck(body,req);
     else if(req.provider==='yahoo')results=parseYahoo(body,req);
     else if(req.provider==='mojeek')results=parseMojeek(body,req);
+    else if(req.provider==='brave')results=parseBrave(body,req);
+    else if(req.provider==='bing-rss')results=parseRssSearch(body,req,'bing-rss');
     else if(req.provider==='google-news')results=parseGoogleNews(body,req);
     else if(req.provider==='youtube')results=parseYoutube(body,req);
+    if(!results.length && !['google-news','bing-rss','youtube'].includes(req.provider)) {
+      results = extractAnchors(body, req.url, req.provider, req, 40);
+    }
     return {provider:req.provider,ok:true,results};
   }catch(error){ return {provider:req.provider,ok:false,results:[],error:error?.message||'DISCOVERY_FAILED'}; }
 }
@@ -713,7 +825,7 @@ function buildResponse(ctx){
     intent:{type:requestedType||plan.type,wantsNews:plan.flags.explicitNews||plan.type==='news'||plan.flags.live,wantsVideo:plan.flags.explicitVideo||plan.type==='video',wantsGov:plan.flags.explicitGov||plan.type==='gov',wantsDocs:plan.flags.explicitDoc||plan.type==='doc',wantsHistory:plan.flags.history,wantsAcademic:plan.flags.academic},
     generatedAt:nowIso(),started,latencyMs:Date.now()-started,keylessCoreSearch:true,groqUsed:Boolean(ctx.groqUsed),cached:cacheHit,
     providers:providerStats,
-    quality:{discoveredResults:results.length,validatedResults:verifiedCount,requestedResults:count,realContentOnly:false,contentGuarantee:'Search results are source metadata/snippets. No snippet is labeled as full page content.'},
+    quality:{discoveredResults:results.length,validatedResults:verifiedCount,requestedResults:count,realContentOnly:false,contentGuarantee:'Search results are the public search sources actually discovered and ranked; no fabricated source is added.'},
     searchPlan:{queryVariants:preciseQueries,engineRequests:Object.values(providerStats).reduce((s,p)=>s+Number(p.requests||0),0),verificationRequested:verifyRequested,verificationPerformed:Number(ctx.verificationPerformed || 0),verificationSucceeded:verifiedCount,commonCrawlEnabled:useCc,commonCrawlPerformed:results.filter(r=>r.commonCrawl).length,streamed:true,logStreamSupported:true,deep,aiRequested},
     liveLog:logger.logs,allFetchedSources:results.length,results,warnings:results.length<count?[`${results.length} ranked sources were discovered. Public engines may return fewer results than requested.`]:[]
   };
@@ -784,7 +896,7 @@ async function performSearch(input,started,logger){
     }
   }
 
-  let final=ranked.slice(0,OUTPUT_MAX_SOURCES);
+  let final=ranked.slice(0,MAX_DISCOVERY_RESULTS);
   if(useCc && left(deadline)>500){
     const ccDeadline=Date.now()+Math.min(500,left(deadline)-50);
     const rows=await Promise.all(final.slice(0,MAX_COMMON_CRAWL).map(async r=>({url:r.url,cc:await commonCrawlMeta(r.url,ccDeadline)})));
@@ -828,7 +940,7 @@ function streamSseSearch(input){
 export async function runSearch(input={}){
   const query=truncate(String(input.query??input.q??'').trim(),MAX_QUERY_LEN); if(!query)throw new Error('MISSING_QUERY'); return performSearch({...input,query},Date.now(),createLogger());
 }
-export const SEARCH_CONTRACT=Object.freeze({version:VERSION,maxResults:MAX_RESULTS,standalone:true,dependencies:[],searchSurfaces:['bing','google','duckduckgo','yahoo','mojeek','google-news','youtube'],ranking:'multi-engine-query-fusion',contentMode:'metadata-and-snippets-only',returnsAllDiscovered:true,optionalVerification:true,noTavily:true});
+export const SEARCH_CONTRACT=Object.freeze({version:VERSION,maxResults:MAX_RESULTS,standalone:true,dependencies:[],searchSurfaces:['bing','google','duckduckgo','yahoo','mojeek','google-news','youtube'],ranking:'multi-engine-query-fusion',contentMode:'search-discovery-only',returnsAllDiscovered:true,optionalVerification:true,noTavily:true});
 
 export default async function handler(req){
   if(req.method==='OPTIONS')return jsonResponse({ok:true,version:VERSION});
