@@ -18,17 +18,17 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-2.1.0';
+const VERSION = 'arix-crawler-2.3.0';
 const MAX_RESULTS = 40;
 const DEFAULT_RESULTS = 10;
-const MAX_QUERY_LEN = 700;
+const MAX_QUERY_LEN = 1600;
 const MAX_REQUEST_BODY = 100_000;
 
-const SEARCH_BUDGET_MS = 6_800;
+const SEARCH_BUDGET_MS = 8_800;
 const SEARCH_TIMEOUT_MS = 1_050;
-const VERIFY_TIMEOUT_MS = 700;
+const VERIFY_TIMEOUT_MS = 850;
 const VERIFY_HEADROOM_MS = 90;
-const DISCOVERY_CUTOFF_MS = 2_650;
+const DISCOVERY_CUTOFF_MS = 3_600;
 const SEARCH_CONCURRENCY = 24;
 const VERIFY_CONCURRENCY = 18;
 const MAX_ENGINE_REQUESTS = 24;
@@ -57,11 +57,21 @@ const BLOCKED_HOSTS = new Set([
   'outbrain.com', 'segment.io', 'hotjar.com', 'clarity.ms',
 ]);
 
+/* Strict search-result/source blacklist. These hosts are never allowed to become
+ * candidate source URLs, even after redirect/unwrapping/canonicalization. This is
+ * intentionally separate from SEARCH_HOSTS so the blacklist is enforced at every
+ * candidate -> verification -> final-result boundary. */
+const SEARCH_SOURCE_BLACKLIST = new Set([
+  'google.com', 'google.co.in', 'google.co.uk', 'google.de', 'google.fr', 'google.ca',
+  'bing.com', 'search.brave.com', 'yahoo.com', 'search.yahoo.com',
+  'mojeek.com', 'duckduckgo.com', 'html.duckduckgo.com', 'news.google.com',
+  'ecosia.org', 'yandex.com', 'yandex.ru', 'qwant.com', 'startpage.com',
+  'search.aol.com', 'ask.com', 'baidu.com', 'sogou.com', 'search.naver.com',
+]);
+
 const TRACKING_PATH = /(?:^|[\/_-])(?:analytics|gtag|ga4|collect|pixel|beacon|tracking|tracker|telemetry)(?:[\/_-]|$)/i;
 const SEARCH_HOSTS = new Set([
-  'bing.com', 'www.bing.com', 'google.com', 'www.google.com', 'google.co.in',
-  'duckduckgo.com', 'html.duckduckgo.com', 'search.yahoo.com', 'yahoo.com',
-  'mojeek.com', 'www.mojeek.com', 'news.google.com', 'youtube.com', 'www.youtube.com'
+  ...SEARCH_SOURCE_BLACKLIST, 'youtube.com', 'www.youtube.com'
 ]);
 
 const GOV_DOMAINS = [
@@ -87,23 +97,32 @@ const STOPWORDS = new Set([
 ]);
 
 const SYNONYMS = [
-  ['car','cars','automobile','automobiles','motorcar','motorcars','vehicle','vehicles'],
-  ['history','historical','timeline','timelines','origins','origin','evolution','development','heritage'],
+  ['car','cars','automobile','automobiles','motorcar','motorcars'],
+  ['history','historical'],
   ['india','indian'],
-  ['price','prices','cost','costs','rate','rates','pricing','priced'],
-  ['law','laws','legal','legislation','act','acts','regulation','regulations','rule','rules'],
-  ['policy','policies','framework','initiative','initiatives','programme','program','programs'],
-  ['company','companies','firm','firms','business','businesses','corporation','corporations'],
-  ['founder','founders','created','creator','cofounder','co-founder','originator'],
-  ['population','people','residents','inhabitants','demographics'],
-  ['economy','economic','economics','gdp','market','markets'],
-  ['education','school','schools','student','students','curriculum','syllabus'],
-  ['research','study','studies','paper','papers','report','reports','analysis'],
-  ['technology','technologies','tech','technical'],
-  ['electric','ev','electricity','battery','battery-powered'],
-  ['manufacturing','manufacture','production','factory','factories'],
-  ['guide','guides','tutorial','tutorials','manual','documentation','docs'],
-  ['ai','artificial-intelligence','artificial intelligence','machine-learning','machine learning'],
+  ['price','prices','cost','costs','pricing','priced'],
+  ['law','laws','legal','legislation'],
+  ['policy','policies'],
+  ['programme','program','programs'],
+  ['company','companies','corporation','corporations','firm','firms'],
+  ['population','populations'],
+  ['people','residents','inhabitants'],
+  ['economy','economic','economics'],
+  ['market','markets'],
+  ['education','educational'],
+  ['school','schools'],
+  ['student','students'],
+  ['research','researches'],
+  ['study','studies'],
+  ['paper','papers'],
+  ['report','reports'],
+  ['technology','technologies','tech'],
+  ['electric','electrical'],
+  ['manufacturing','manufacture'],
+  ['factory','factories'],
+  ['guide','guides','tutorial','tutorials','manual'],
+  ['documentation','docs'],
+  ['ai','artificial-intelligence'],
 ];
 const SYNONYM_MAP = new Map();
 for (const group of SYNONYMS) for (const term of group) SYNONYM_MAP.set(term, group[0]);
@@ -162,7 +181,13 @@ function blocked(url) {
   if (!safeUrl(url)) return true;
   const h = normalizeHost(url);
   if ([...BLOCKED_HOSTS].some(x => h === x || h.endsWith(`.${x}`))) return true;
-  try { return TRACKING_PATH.test(new URL(url).pathname); } catch { return true; }
+  if ([...SEARCH_SOURCE_BLACKLIST].some(x => h === x || h.endsWith(`.${x}`))) return true;
+  try {
+    const u = new URL(url);
+    const raw = `${u.href} ${decodeUri(u.href)}`;
+    if (/(?:^|[/:.?=&_-])(?:www\.)?(?:google\.com|bing\.com|search\.brave\.com|yahoo\.com|mojeek\.com)(?:[/:?#=&_-]|$)/i.test(raw)) return true;
+    return TRACKING_PATH.test(u.pathname);
+  } catch { return true; }
 }
 function isGov(url) { const h = normalizeHost(url); return GOV_DOMAINS.some(d => h === d || h.endsWith(`.${d}`)); }
 function isTrusted(url) {
@@ -273,6 +298,45 @@ function parseMaybeDateFromText(v) {
   return null;
 }
 
+const QUERY_FILLERS = new Set([
+  'available','allow','allows','allowed','also','answer','answers','around','based','can','could',
+  'details','different','does','explain','explained','focus','give','help','important','include',
+  'including','just','kind','kinds','known','look','looking','make','need','needs','provide','really',
+  'should','show','specific','tell','things','ways','well','would','which','what','when','where','who',
+  'why','how','latest','current','recent','today','tomorrow','yesterday','please','find','search','information',
+  'information-on','information-about','details-on','details-about','using','use','used','want','would-like'
+]);
+
+function extractQuotedPhrases(q) {
+  const out = [];
+  for (const m of String(q || '').matchAll(/["“”]([^"“”]{4,180})["“”]/g)) {
+    const x = normalizeText(m[1]);
+    if (x) out.push(x);
+  }
+  return unique(out);
+}
+
+function selectCoreTerms(q, allTerms, anchors) {
+  const quoted = extractQuotedPhrases(q);
+  const filtered = allTerms.filter(t => !QUERY_FILLERS.has(t));
+  if (filtered.length <= 10) return unique([...quoted.flatMap(rawTokens), ...filtered]).slice(0, 12);
+
+  const anchorSet = new Set((anchors || []).map(normalizeText));
+  const scored = filtered.map((term, idx) => {
+    let score = 0;
+    if (anchorSet.has(term) || anchorSet.has(stem(term))) score += 5;
+    if (/^20\d{2}$|^\d{4,}$/.test(term)) score += 4;
+    if (term.length >= 9) score += 2.5;
+    else if (term.length >= 6) score += 1.5;
+    if (idx < 5) score += 1.0;
+    if (SYNONYM_MAP.has(term)) score += 0.5;
+    return {term, score, idx};
+  }).sort((a,b) => b.score - a.score || a.idx - b.idx);
+
+  const chosen = scored.slice(0, 10).sort((a,b) => a.idx - b.idx).map(x => x.term);
+  return unique([...quoted.flatMap(rawTokens), ...chosen]).slice(0, 12);
+}
+
 function queryPlan(query, options = {}) {
   const q = truncate(String(query || '').trim(), MAX_QUERY_LEN);
   const requested = String(options.type || '').toLowerCase();
@@ -283,37 +347,60 @@ function queryPlan(query, options = {}) {
   }
   const content = contentTokens(q);
   const uniqueTerms = unique(content);
-  const live = /\b(latest|today|current|recent|breaking|this week|this month|yesterday|newly)\b/i.test(q);
+  const anchors = unique((q.match(/\b(?:[A-Z][A-Za-z0-9.-]{2,}|20\d{2}|[A-Z]{2,5})\b/g) || []).map(normalizeText));
+  const coreTerms = selectCoreTerms(q, uniqueTerms, anchors);
+  const quotedPhrases = extractQuotedPhrases(q);
+  const live = /\b(latest|today|current|recent|breaking|this week|this month|yesterday|newly|as of)\b/i.test(q);
   const history = /\b(history|historical|timeline|origins?|evolution|development|milestones)\b/i.test(q);
-  const official = /\b(official|government|govt|ministry|scheme|policy|law|act|rule|regulation|tax|gst|rbi|sebi|mca|notification|circular|guideline)\b/i.test(q);
-  const academic = /\b(research|study|paper|academic|journal|thesis|evidence|peer[- ]reviewed)\b/i.test(q);
-  const exactish = uniqueTerms.length <= 7 ? uniqueTerms.join(' ') : uniqueTerms.slice(0, 7).join(' ');
-  const anchors = unique((q.match(/\b(?:India|Indian|[A-Z][A-Za-z]{2,}|20\d{2})\b/g) || []).map(x => x.toLowerCase()));
+  const official = /\b(official|government|govt|ministry|scheme|policy|law|act|rule|regulation|tax|gst|rbi|sebi|mca|notification|circular|guideline|statute)\b/i.test(q);
+  const academic = /\b(research|study|paper|academic|journal|thesis|evidence|peer[- ]reviewed|literature)\b/i.test(q);
+  const exactish = coreTerms.length <= 7 ? coreTerms.join(' ') : coreTerms.slice(0, 7).join(' ');
+  const coreQuery = coreTerms.join(' ').trim();
   return {
-    query:q, type, requestedType:requested, mode, terms:uniqueTerms, exactish, anchors,
+    query:q, type, requestedType:requested, mode, terms:uniqueTerms, coreTerms, coreQuery, quotedPhrases,
+    exactish, anchors, longQuery:q.length > 520 || uniqueTerms.length > 12,
     flags:{live,history,official,academic,explicitNews:type==='news',explicitVideo:type==='video',explicitDoc:type==='doc',explicitGov:type==='gov'}
   };
 }
 
 function buildQueries(query, plan, deep = false) {
   const set = new Set();
-  const add = s => { const x = truncate(String(s || '').replace(/\s+/g,' ').trim(), 460); if (x.length >= 3) set.add(x); };
-  add(plan.query);
-  if (plan.terms.length >= 2 && plan.terms.length <= 8) add(`"${plan.terms.join(' ')}"`);
-  if (plan.terms.length >= 3) add(`${plan.terms.slice(0, Math.min(plan.terms.length, 6)).join(' ')} explained`);
-  if (plan.flags.live) add(`${plan.query} latest`);
-  if (plan.flags.history) add(`${plan.query} timeline history`);
-  if (plan.flags.official) add(`${plan.query} official source`);
-  if (plan.flags.academic) add(`${plan.query} research paper evidence`);
-  if (plan.flags.explicitNews) add(`${plan.query} latest news`);
-  if (plan.flags.explicitVideo) add(`${plan.query} video`);
-  if (plan.flags.explicitDoc) add(`${plan.query} filetype:pdf`);
-  if (plan.flags.explicitGov) add(`${plan.query} site:gov.in`);
-  if (plan.mode === 'deep' || deep) {
-    if (plan.terms.length >= 2) add(`intitle:${plan.terms.slice(0,3).join(' ')} ${plan.query}`);
-    if (plan.anchors.length) add(`${plan.query} ${plan.anchors.slice(0,2).join(' ')}`);
+  const add = s => {
+    const x = truncate(String(s || '').replace(/\s+/g,' ').trim(), 460);
+    if (x.length >= 3) set.add(x);
+  };
+  const original = plan.query;
+  const core = plan.coreQuery || plan.exactish || original;
+  const subject = plan.coreTerms.slice(0, Math.min(6, plan.coreTerms.length)).join(' ').trim();
+
+  /* For long questions, do NOT blindly send the entire natural-language prompt to
+   * every engine. Preserve the original only as one fallback arm; use its extracted
+   * subject/constraints for the high-precision arms. */
+  if (!plan.longQuery && original.length <= 520) add(original);
+  else if (subject) add(subject);
+
+  if (plan.quotedPhrases.length) for (const phrase of plan.quotedPhrases.slice(0,2)) add(`"${phrase}"`);
+  if (core && core !== original) add(core);
+  if (subject && subject !== core) add(subject);
+
+  if (plan.flags.live) add(`${core} latest`);
+  if (plan.flags.history) add(`${core} history timeline`);
+  if (plan.flags.official) add(`${core} official source`);
+  if (plan.flags.academic) add(`${core} research evidence`);
+  if (plan.flags.explicitNews) add(`${core} latest news`);
+  if (plan.flags.explicitVideo) add(`${core} video`);
+  if (plan.flags.explicitDoc) add(`${core} filetype:pdf`);
+  if (plan.flags.explicitGov) add(`${core} site:gov.in`);
+
+  if ((plan.mode === 'deep' || deep) && plan.coreTerms.length) {
+    add(`intitle:${plan.coreTerms.slice(0, Math.min(3, plan.coreTerms.length)).join(' ')} ${subject || core}`);
+    if (plan.anchors.length) add(`${subject || core} ${plan.anchors.slice(0,2).join(' ')}`);
   }
-  return [...set].slice(0, deep ? 8 : 6);
+
+  const preferred = unique([...set]);
+  /* Keep query count restrained: precision comes from orthogonal query arms, not a
+   * huge pile of near-duplicates. */
+  return preferred.slice(0, deep ? 8 : 6);
 }
 
 function typeFromUrl(url, fallback = 'web') {
@@ -692,53 +779,109 @@ function urlIntentScore(url,plan){
   if(/(?:\/tag\/|\/tags\/|\/category\/|\/categories\/|\/search[/?]|\/author\/|\/authors\/|\/topic\/|\/topics\/|\/(?:home|homepage)\/?$)/i.test(s))x-=6;
   return x;
 }
+function weightedCoverage(text, terms) {
+  const norm = normalizeText(text);
+  if (!norm || !terms.length) return {coverage:0, hits:0, matched:[]};
+  let total = 0, matchedWeight = 0, hits = 0;
+  const matched = [];
+  for (const term of terms) {
+    const c = canonicalToken(term);
+    const weight = 1 + Math.min(1.2, Math.max(0, String(c).length - 4) * 0.09);
+    total += weight;
+    const variants = unique([c, stem(c)]);
+    const hit = variants.some(v => v && (tokenSet(norm).has(v) || norm.includes(` ${v} `)));
+    if (hit) { matchedWeight += weight; hits++; matched.push(c); }
+  }
+  return {coverage:total ? matchedWeight/total : 0, hits, matched:unique(matched)};
+}
+
+function querySpecificity(plan) {
+  const n = plan.coreTerms?.length || plan.terms?.length || 0;
+  if (n >= 14) return 1.25;
+  if (n >= 10) return 1.15;
+  if (n >= 7) return 1.05;
+  return 0.95;
+}
+
+function genericPagePenalty(url, title) {
+  const s = String(url || '').toLowerCase();
+  const t = normalizeText(title);
+  let p = 0;
+  if (/(?:^|\/)(?:tag|tags|category|categories|topic|topics|author|authors|search|results|archive|archives)(?:\/|\?|$)/i.test(s)) p += 10;
+  if (/(?:^|\/)(?:home|homepage|index)(?:\.[a-z0-9]+)?$/i.test(s) || s.endsWith('/')) p += 3;
+  if (/^(?:home|homepage|welcome|search results|results|index|untitled)$/i.test(t)) p += 9;
+  if (/\b(?:login|sign in|subscribe|contact us|privacy policy|terms of service)\b/i.test(t)) p += 8;
+  return p;
+}
+
 function rankOne(item,plan){
   const title=String(item.title||''); const snippet=String(item.snippet||''); const url=String(item.url||'');
-  const terms=plan.terms; if(!terms.length)return 35;
-  const t=titleTerms(title,terms), s=titleTerms(snippet,terms), u=titleTerms(url.replace(/[-_/?.=&]+/g,' '),terms);
-  const n=terms.length;
-  const titleCoverage=t.hits/n, snippetCoverage=s.hits/n, urlCoverage=u.hits/n;
-  const phrase=phraseScore(plan.query,`${title} ${snippet}`);
+  const terms=(plan.coreTerms?.length ? plan.coreTerms : plan.terms) || [];
+  if(!terms.length)return 35;
+
+  const t=weightedCoverage(title,terms), s=weightedCoverage(snippet,terms), u=weightedCoverage(url.replace(/[-_/?.=&]+/g,' '),terms);
+  const probe=weightedCoverage(item.pageProbeText||'',terms);
+  const queryForPhrase=plan.quotedPhrases?.[0] || plan.coreQuery || plan.query;
+  const phrase=phraseScore(queryForPhrase,`${title} ${snippet} ${item.pageProbeText||''}`);
   const consensus=Math.min(1,((item.providers?.length||1)-1)/3);
-  const qRank=item.providerRank>0 ? Math.max(0,1-(item.providerRank-1)/30) : .35;
+  const qRank=item.providerRank>0 ? Math.max(0,1-(item.providerRank-1)/35) : .30;
   const dq=domainQuality(url);
-  const freshnessBonus=plan.flags.live ? ({last_24h:10,last_7d:7,last_30d:3}[freshness(item.publishedAt)]||0) : 0;
+  const freshnessBonus=plan.flags.live ? ({last_24h:8,last_7d:5,last_30d:2}[freshness(item.publishedAt)]||0) : 0;
+  const specificity=querySpecificity(plan);
+
   let score=0;
-  score += titleCoverage*45;
-  score += snippetCoverage*17;
-  score += urlCoverage*6;
-  score += phrase*18;
-  score += consensus*7;
-  score += qRank*7;
-  score += dq*7;
+  score += t.coverage*40*specificity;
+  score += s.coverage*20;
+  score += Math.min(.75,u.coverage)*5;
+  score += phrase*16;
+  score += probe.coverage*8;
+  score += consensus*5;
+  score += qRank*4;
+  score += dq*5;
   score += urlIntentScore(url,plan);
   score += freshnessBonus;
-  if(item.source==='multi-source')score+=4;
+  if(item.source==='multi-source')score+=3;
+  if(item.verified)score+=4;
   if(plan.flags.live && !item.publishedAt && /\b20\d{2}\b/.test(`${title} ${snippet}`))score+=1;
-  if(plan.type==='gov' && !isGov(url))score-=10;
-  if(plan.type==='doc' && !isDoc(url))score-=12;
-  if(plan.type==='video' && !isVideo(url))score-=15;
-  if(plan.type==='news' && item.type!=='news' && !/\/(news|article|story|press)/i.test(url))score-=10;
+
+  /* Soft negative evidence: generic pages are pushed down, but never hard-dropped. */
+  score -= genericPagePenalty(url,title);
+  if(t.coverage < .20 && s.coverage < .25) score -= plan.longQuery ? 9 : 6;
+  if(t.coverage < .12 && phrase < .35) score -= 5;
+
+  if(plan.type==='gov' && !isGov(url))score-=8;
+  if(plan.type==='doc' && !isDoc(url))score-=10;
+  if(plan.type==='video' && !isVideo(url))score-=12;
+  if(plan.type==='news' && item.type!=='news' && !/\/(?:news|article|story|press)/i.test(url))score-=7;
+
   return clamp(Math.round(score*100)/100,0,100);
 }
 function relevanceObject(item,plan){
-  const title=titleTerms(item.title,plan.terms), body=titleTerms(item.snippet,plan.terms), phrase=phraseScore(plan.query,`${item.title} ${item.snippet}`);
-  const n=Math.max(1,plan.terms.length);
+  const terms=(plan.coreTerms?.length ? plan.coreTerms : plan.terms) || [];
+  const title=weightedCoverage(item.title,terms), body=weightedCoverage(item.snippet,terms), phrase=phraseScore(plan.quotedPhrases?.[0] || plan.coreQuery || plan.query,`${item.title} ${item.snippet} ${item.pageProbeText||''}`);
+  const n=Math.max(1,terms.length);
   return {
-    score:rankOne(item,plan), titleCoverage:Number((title.hits/n).toFixed(3)), bodyCoverage:Number((body.hits/n).toFixed(3)),
-    conceptCoverage:Number(((title.hits+body.hits)/(n*2)).toFixed(3)), matchedConcepts:unique([...title.matched,...body.matched]),
-    exactPhrase:phrase>=.8, phraseScore:Number(phrase.toFixed(3)), providers:item.providers||[item.source]
+    score:rankOne(item,plan), titleCoverage:Number(title.coverage.toFixed(3)), bodyCoverage:Number(body.coverage.toFixed(3)),
+    conceptCoverage:Number(((title.coverage+body.coverage)/2).toFixed(3)), matchedConcepts:unique([...title.matched,...body.matched]),
+    matchedCount:title.hits+body.hits, conceptCount:n, exactPhrase:phrase>=.8, phraseScore:Number(phrase.toFixed(3)),
+    providers:item.providers||[item.source], focusTerms:terms
   };
 }
 
 function fusionRank(results,plan){
-  const ranked=results.map((r,index)=>{ const rel=relevanceObject(r,plan); return {...r,relevance:rel,relevanceScore:rel.score,relevanceBand:rel.score>=82?'excellent':rel.score>=65?'strong':rel.score>=48?'usable':rel.score>=25?'related':'weak',_inputOrder:index}; });
+  const ranked=results.map((r,index)=>{ const rel=relevanceObject(r,plan); return {...r,relevance:rel,relevanceScore:rel.score,relevanceBand:rel.score>=82?'excellent':rel.score>=65?'strong':rel.score>=48?'usable':rel.score>=25?'related':'weak',_inputOrder:index,_selectionScore:rel.score}; });
+  const domainCounts=new Map();
   ranked.sort((a,b)=>{
+    const ad=domainCounts.get(normalizeHost(a.url))||0, bd=domainCounts.get(normalizeHost(b.url))||0;
+    const aDiv=Math.min(6,ad)*1.8, bDiv=Math.min(6,bd)*1.8;
+    const aa=a._selectionScore-aDiv, bb=b._selectionScore-bDiv;
+    if(Math.abs(bb-aa)>.01)return bb-aa;
     const d=Number(b.relevanceScore)-Number(a.relevanceScore); if(Math.abs(d)>.01)return d;
     const dp=Number(domainQuality(b.url))-Number(domainQuality(a.url)); if(Math.abs(dp)>.001)return dp;
     const bp=(b.providers?.length||1)-(a.providers?.length||1); if(bp)return bp;
     return (a._inputOrder||0)-(b._inputOrder||0);
   });
+  for(const r of ranked) { const h=normalizeHost(r.url); domainCounts.set(h,(domainCounts.get(h)||0)+1); r.domainRepetition=Math.min(6,domainCounts.get(h)); }
   return ranked;
 }
 
@@ -759,9 +902,12 @@ async function verifyOne(candidate,deadline){
     const body=await readLimited(res,20_000,localDeadline).catch(()=> '');
     const title=titleFromHtml(body) || metaFromHtml(body,'og:title') || candidate.title;
     const canonical=metaFromHtml(body,'og:url');
+    const metaDescription=metaFromHtml(body,'description') || metaFromHtml(body,'og:description');
+    const headingSignals=[...String(body).matchAll(/<h[1-3]\b[^>]*>([\s\S]*?)<\/h[1-3]\s*>/gi)].slice(0,10).map(m=>cleanSnippet(m[1])).join(' ');
+    const pageProbeText=truncate(normalizeText([title,metaDescription,headingSignals,stripTags(body).slice(0,7000)].filter(Boolean).join(' ')),9000);
     const published=dateFromHtml(body) || candidate.publishedAt || null;
     const reachable=res.ok || (res.status>=300 && res.status<500);
-    return {...candidate,url:finalUrl,title:truncate(title,500),publishedAt:published,httpStatus:res.status,contentType:ct||null,verified:Boolean(reachable),verificationMethod:'light-http-check',contentAvailable:false,contentStatus:'metadata-only',contentMethod:'search-metadata'};
+    return {...candidate,url:finalUrl,title:truncate(title,500),publishedAt:published,httpStatus:res.status,contentType:ct||null,verified:Boolean(reachable),verificationMethod:'light-http-check',contentAvailable:false,contentStatus:'metadata-only',contentMethod:'search-metadata',pageProbeText,metaDescription:truncate(metaDescription,900),canonicalUrl:safeUrl(canonical)&&!blocked(canonical)?normalizedUrl(canonical):null};
   }catch(error){ return {...candidate,verified:false,verificationMethod:'light-http-check-failed',verificationError:error?.message||'VERIFY_FAILED'}; }
 }
 
@@ -872,7 +1018,7 @@ async function performSearch(input,started,logger){
 
   /* Verify more than the displayed count when possible, but never make verification the
    * bottleneck. Unverified sources are still retained and ranked. */
-  const verifyLimit=Math.min(ranked.length,deep?40:Math.max(12,count*2));
+  const verifyLimit=Math.min(ranked.length,deep?32:Math.max(12,Math.min(24,count*2)));
   let verificationPerformed = 0;
   if(verifyRequested && left(deadline)>550 && verifyLimit){
     logger.add('verification-start',`Running lightweight reachability checks on ${verifyLimit} top sources.`);
@@ -896,7 +1042,7 @@ async function performSearch(input,started,logger){
     }
   }
 
-  let final=ranked.slice(0,MAX_DISCOVERY_RESULTS);
+  let final=ranked.filter(r=>r?.url && !blocked(r.url) && !isLikelySearchUrl(r.url)).slice(0,MAX_DISCOVERY_RESULTS);
   if(useCc && left(deadline)>500){
     const ccDeadline=Date.now()+Math.min(500,left(deadline)-50);
     const rows=await Promise.all(final.slice(0,MAX_COMMON_CRAWL).map(async r=>({url:r.url,cc:await commonCrawlMeta(r.url,ccDeadline)})));
