@@ -18,20 +18,20 @@ export const runtime = 'edge';
 export const config = { runtime: 'edge' };
 export const maxDuration = 300;
 
-const VERSION = 'arix-crawler-2.4.0';
-const MAX_RESULTS = 40;
+const VERSION = 'arix-crawler-2.4.1';
+const MAX_RESULTS = 80;
 const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 1600;
 const MAX_REQUEST_BODY = 100_000;
 
-const SEARCH_BUDGET_MS = 9_200;
-const SEARCH_TIMEOUT_MS = 950;
-const VERIFY_TIMEOUT_MS = 720;
+const SEARCH_BUDGET_MS = 10_500;
+const SEARCH_TIMEOUT_MS = 850;
+const VERIFY_TIMEOUT_MS = 800;
 const VERIFY_HEADROOM_MS = 90;
-const DISCOVERY_CUTOFF_MS = 4_400;
-const SEARCH_CONCURRENCY = 32;
-const VERIFY_CONCURRENCY = 18;
-const MAX_ENGINE_REQUESTS = 36;
+const DISCOVERY_CUTOFF_MS = 5_000;
+const SEARCH_CONCURRENCY = 45;
+const VERIFY_CONCURRENCY = 30;
+const MAX_ENGINE_REQUESTS = 45;
 const MAX_DISCOVERY_RESULTS = 1000;
 const MAX_LIVE_LOG = 80;
 const OUTPUT_MAX_SOURCES = 1000;
@@ -44,13 +44,13 @@ const COMMON_CRAWL_TIMEOUT_MS = 650;
 const MAX_COMMON_CRAWL = 4;
 const COMMON_CRAWL_INDEXES = ['CC-MAIN-2026-34', 'CC-MAIN-2026-30'];
 
-const AI_PLANNER_TIMEOUT_MS = 1_350;
+const AI_PLANNER_TIMEOUT_MS = 2_800;
 const MAX_AI_TARGETS = 10;
 const MAX_AI_QUERIES = 18;
 const MIN_AI_QUERIES = 4;
 const MAX_QUERIES_PER_TARGET = 3;
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; ArixAI-LiveSearch/2.4.0; +https://lexis-ai-chatini.vercel.app/)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; ArixAI-LiveSearch/2.4.1; +https://lexis-ai-chatini.vercel.app/)';
 
 /* Only obvious tracking / measurement surfaces are blocked. Ordinary public sites,
  * PDFs, JS documentation, forums, media pages, etc. are not blanket-blocked. */
@@ -62,9 +62,7 @@ const BLOCKED_HOSTS = new Set([
 ]);
 
 /* Strict search-result/source blacklist. These hosts are never allowed to become
- * candidate source URLs, even after redirect/unwrapping/canonicalization. This is
- * intentionally separate from SEARCH_HOSTS so the blacklist is enforced at every
- * candidate -> verification -> final-result boundary. */
+ * candidate source URLs, even after redirect/unwrapping/canonicalization. */
 const SEARCH_SOURCE_BLACKLIST = new Set([
   'google.com', 'google.co.in', 'google.co.uk', 'google.de', 'google.fr', 'google.ca',
   'bing.com', 'search.brave.com', 'yahoo.com', 'search.yahoo.com',
@@ -193,6 +191,7 @@ function blocked(url) {
     return TRACKING_PATH.test(u.pathname);
   } catch { return true; }
 }
+
 function isGov(url) { const h = normalizeHost(url); return GOV_DOMAINS.some(d => h === d || h.endsWith(`.${d}`)); }
 function isTrusted(url) {
   const h = normalizeHost(url);
@@ -282,6 +281,7 @@ function stripTags(html) {
     .replace(/&#(\d+);?/g, (_, x) => { const n = parseInt(x,10); return Number.isFinite(n) ? String.fromCodePoint(Math.min(n,0x10ffff)) : ' '; })
     .replace(/\s+/g, ' ').trim();
 }
+
 function cleanSnippet(v) { return truncate(stripTags(v).replace(/\s+/g,' ').trim(), 3000); }
 function titleFromHtml(html) { return cleanSnippet((String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i)||[, ''])[1]); }
 function metaFromHtml(html, name) {
@@ -390,6 +390,7 @@ function parseJsonObject(text){
   if(start>=0&&end>start){try{return JSON.parse(body.slice(start,end+1))}catch{}}
   throw new Error('AI_PLANNER_INVALID_JSON');
 }
+
 function normalizePlannerPlan(raw, basePlan){
   const source=raw&&typeof raw==='object'?raw:{};
   const rawTargets=Array.isArray(source.targets)?source.targets:[];
@@ -598,6 +599,7 @@ function hasSearchNoiseTitle(v) {
   const t = normalizeText(v);
   return !t || /^(sponsored|ad|advertisement|ads|sign in|log in|privacy|terms|cookie|feedback|more results|related searches|people also ask|images|videos|maps|shopping|news)$/.test(t);
 }
+
 function resultContext(html, index, width = 2500) {
   const s = String(html || '');
   return s.slice(Math.max(0, index - Math.floor(width * 0.35)), Math.min(s.length, index + width));
@@ -635,6 +637,7 @@ function scoreSearchAnchor(url, title, context, provider) {
   if (h === 'youtube.com' || h === 'youtu.be') score += 2;
   return score;
 }
+
 function extractAnchors(html, base, provider, req, cap = 80) {
   const out = [];
   const s = String(html || '');
@@ -662,6 +665,7 @@ function extractAnchors(html, base, provider, req, cap = 80) {
   out.sort((a, b) => b.score - a.score);
   return out.filter(x => x.candidate).slice(0, cap).map(x => x.candidate);
 }
+
 function extractHeadingAnchors(html, base, provider, req, heading = 'h3', cap = 40) {
   const s = String(html || ''), out = [], seen = new Set();
   const re = new RegExp(`<${heading}\\b[^>]*>([\\s\\S]*?)<\\/${heading}\\s*>`, 'gi');
@@ -727,6 +731,7 @@ function parseRssSearch(text, req, provider = req.provider) {
   }
   return out;
 }
+
 function parseBing(html, req) {
   const s = String(html || ''), primary = [];
   for (const block of s.match(/<li[^>]+class=["'][^"']*b_algo[^"']*["'][\s\S]*?<\/li>/gi) || []) {
@@ -1134,6 +1139,7 @@ function fusionRank(results,plan){
   for(const r of ranked) { const h=normalizeHost(r.url); domainCounts.set(h,(domainCounts.get(h)||0)+1); r.domainRepetition=Math.min(6,domainCounts.get(h)); }
   return ranked;
 }
+
 function selectExactCount(ranked,count,plan){
   const pool=ranked.filter(r=>r?.url&&!blocked(r.url)&&!isLikelySearchUrl(r.url));
   if(pool.length<=count)return pool;
@@ -1248,19 +1254,20 @@ function targetCoverageSummary(results,plan){
 }
 
 function buildResponse(ctx){
-  const {query,count,mode,requestedType,plan,preciseQueries,providerStats,results,logger,started,verifyRequested,deep,aiRequested,useCc,cacheHit=false,discoveredBeforeSelection=results.length,selectedBeforeDecoration=results}=ctx;
+  const {query,count,userRequestedCount,mode,requestedType,plan,preciseQueries,providerStats,results,logger,started,verifyRequested,deep,aiRequested,useCc,cacheHit=false,discoveredBeforeSelection=results.length,selectedBeforeDecoration=results}=ctx;
   const verifiedCount=results.filter(r=>r.verified).length;
   const targetCoverage=targetCoverageSummary(selectedBeforeDecoration,plan);
   const warnings=[];
-  if(results.length<count)warnings.push(`${results.length} real sources were available after live discovery; ${count} were requested. No fabricated or simulated source was added.`);
+  const reqCount = userRequestedCount || count;
+  if(results.length<reqCount)warnings.push(`${results.length} real sources were available after live discovery; ${reqCount} were requested. No fabricated or simulated source was added.`);
   return {
-    ok:true,version:VERSION,query,requestedResults:count,returnedResults:results.length,sourceCountMode:'exact-request-count-when-real-sources-available',
+    ok:true,version:VERSION,query,requestedResults:reqCount,returnedResults:results.length,sourceCountMode:'exact-request-count-when-real-sources-available',
     resultSelectionPolicy:'target-aware-title-match-fusion-then-exact-count-selection',mode,
     intent:{type:requestedType||plan.type,wantsNews:plan.flags.explicitNews||plan.type==='news'||plan.flags.live,wantsVideo:plan.flags.explicitVideo||plan.type==='video',wantsGov:plan.flags.explicitGov||plan.type==='gov',wantsDocs:plan.flags.explicitDoc||plan.type==='doc',wantsHistory:plan.flags.history,wantsAcademic:plan.flags.academic},
     generatedAt:nowIso(),started,latencyMs:Date.now()-started,keylessCoreSearch:true,groqUsed:true,cached:false,
     groq:{required:true,model:'openai/gpt-oss-20b',function:'query_planning_only',queryPlanGenerated:true},
     providers:providerStats,
-    quality:{discoveredResults:discoveredBeforeSelection,validatedResults:verifiedCount,requestedResults:count,returnedResults:results.length,exactCountSatisfied:results.length===count,realContentOnly:false,contentGuarantee:'Search results are real public sources actually discovered and ranked; no fabricated source is added.',precisionStrategy:'AI target decomposition + orthogonal query jobs + title/snippet target matching + source quality + freshness + consensus + lightweight verification'},
+    quality:{discoveredResults:discoveredBeforeSelection,validatedResults:verifiedCount,requestedResults:reqCount,returnedResults:results.length,exactCountSatisfied:results.length===reqCount,realContentOnly:false,contentGuarantee:'Search results are real public sources actually discovered and ranked; no fabricated source is added.',precisionStrategy:'AI target decomposition + orthogonal query jobs + title/snippet target matching + source quality + freshness + consensus + lightweight verification'},
     searchPlan:{queryVariants:preciseQueries.map(q=>q.query),queryMissions:preciseQueries,engineRequests:Object.values(providerStats).reduce((s,p)=>s+Number(p.requests||0),0),verificationRequested:verifyRequested,verificationPerformed:Number(ctx.verificationPerformed||0),verificationSucceeded:verifiedCount,commonCrawlEnabled:useCc,commonCrawlPerformed:results.filter(r=>r.commonCrawl).length,streamed:true,logStreamSupported:true,deep,aiRequested,informationNeed:plan.aiInformationNeed,targetCount:plan.aiTargets?.length||0,targetCoverage},
     liveLog:logger.logs,allFetchedSources:discoveredBeforeSelection,discoveredSourceCount:discoveredBeforeSelection,selectedSources:results.length,results,warnings
   };
@@ -1269,7 +1276,9 @@ function buildResponse(ctx){
 async function performSearch(input,started,logger){
   const deadline=started+SEARCH_BUDGET_MS;
   const query=truncate(String(input.query??input.q??'').trim(),MAX_QUERY_LEN);
-  const count=safeInt(input.count??input.limit,DEFAULT_RESULTS,1,MAX_RESULTS);
+  const userRequestedCount = safeInt(input.count??input.limit,DEFAULT_RESULTS,1,MAX_RESULTS);
+  // Add a buffer so frontend AI filtering always has enough candidates to reach the user's requested count.
+  const count = Math.min(MAX_RESULTS, Math.floor(userRequestedCount * 1.5) + 5); 
   const mode=String(input.mode||'auto').toLowerCase();
   const requestedType=String(input.type||'').toLowerCase();
   const deep=String(input.deep??'false').toLowerCase()==='true' || mode==='deep';
@@ -1313,7 +1322,7 @@ async function performSearch(input,started,logger){
   logger.add('discovery-complete',`Discovery produced ${discoveredBeforeSelection} unique public sources before final precision selection.`,{providers:Object.fromEntries(Object.entries(providerStats).map(([k,v])=>[k,{ok:v.ok,failed:v.failed,results:v.results}]))});
 
   if(!discovered.length){
-    return buildResponse({query,count,mode,requestedType,plan,preciseQueries,providerStats,results:[],logger,started,verifyRequested,deep,aiRequested,useCc,verifyLimit:0,verificationPerformed:0,discoveredBeforeSelection,selectedBeforeDecoration:[]});
+    return buildResponse({query,count,userRequestedCount,mode,requestedType,plan,preciseQueries,providerStats,results:[],logger,started,verifyRequested,deep,aiRequested,useCc,verifyLimit:0,verificationPerformed:0,discoveredBeforeSelection,selectedBeforeDecoration:[]});
   }
 
   let ranked=fusionRank(discovered,plan);
@@ -1347,7 +1356,7 @@ async function performSearch(input,started,logger){
   }
 
   const decorated=final.map((r,i)=>decorateResult(r,i,plan));
-  return buildResponse({query,count,mode,requestedType,plan,preciseQueries,providerStats,results:decorated,logger,started,verifyRequested,deep,aiRequested,useCc,groqUsed:true,verifyLimit,verificationPerformed,discoveredBeforeSelection,selectedBeforeDecoration:final});
+  return buildResponse({query,count,userRequestedCount,mode,requestedType,plan,preciseQueries,providerStats,results:decorated,logger,started,verifyRequested,deep,aiRequested,useCc,groqUsed:true,verifyLimit,verificationPerformed,discoveredBeforeSelection,selectedBeforeDecoration:final});
 }
 
 async function readInput(req){
@@ -1362,9 +1371,38 @@ function corsHeaders(contentType='application/json; charset=utf-8'){
 function jsonResponse(body,status=200){return new Response(JSON.stringify(body,null,2),{status,headers:corsHeaders()});}
 
 function streamJsonSearch(input){
-  const encoder=new TextEncoder(); const started=Date.now(); const logger=createLogger(); const query=truncate(String(input.query??input.q??'').trim(),MAX_QUERY_LEN); const count=safeInt(input.count??input.limit,DEFAULT_RESULTS,1,MAX_RESULTS); const mode=String(input.mode||'auto').toLowerCase();
-  const stream=new ReadableStream({start(controller){let closed=false; const send=x=>{if(closed)return;try{controller.enqueue(encoder.encode(x))}catch{closed=true}}; logger.add('request-start',`Starting live search for ${query}.`,{count,mode}); send(`{"ok":true,"version":${encode(VERSION)},"query":${encode(query)},"requestedResults":${count},"mode":${encode(mode)},"streaming":true,"results":[\n`); const heartbeat=setInterval(()=>send(' \n'),1000);
-    Promise.resolve().then(()=>performSearch(input,started,logger)).then(result=>{clearInterval(heartbeat); const rows=Array.isArray(result.results)?result.results:[]; rows.forEach((r,i)=>send(`${i?',\n':''}${JSON.stringify(r)}\n`)); const meta={...result}; delete meta.results; send('],\n'); const entries=Object.entries(meta); entries.forEach(([k,v],i)=>send(`${JSON.stringify(k)}:${JSON.stringify(v)}${i===entries.length-1?'':',\n'}`)); send('}'); try{controller.close()}catch{} closed=true;}).catch(error=>{clearInterval(heartbeat); send(`],"returnedResults":0,"generatedAt":${encode(nowIso())},"latencyMs":${Date.now()-started},"keylessCoreSearch":true,"groqUsed":false,"resultsError":${encode(error?.message||'SEARCH_FAILED')},"liveLog":${JSON.stringify(logger.logs)},"warnings":${JSON.stringify(['The crawler failed safely after the stream had already started.'])}`);try{controller.close()}catch{}closed=true;});
+  const encoder=new TextEncoder(); const started=Date.now(); const logger=createLogger(); 
+  const query=truncate(String(input.query??input.q??'').trim(),MAX_QUERY_LEN); 
+  const userRequestedCount=safeInt(input.count??input.limit,DEFAULT_RESULTS,1,MAX_RESULTS); 
+  const mode=String(input.mode||'auto').toLowerCase();
+  
+  const stream=new ReadableStream({start(controller){
+    let closed=false; 
+    const send=x=>{if(closed)return;try{controller.enqueue(encoder.encode(x))}catch{closed=true}}; 
+    logger.add('request-start',`Starting live search for ${query}.`,{count:userRequestedCount,mode}); 
+    
+    // Explicitly seed stream header with accurate formatting.
+    send(`{"ok":true,"version":${encode(VERSION)},"query":${encode(query)},"requestedResults":${userRequestedCount},"mode":${encode(mode)},"streaming":true,"results":[\n`); 
+    
+    const heartbeat=setInterval(()=>send(' \n'),1000);
+    Promise.resolve().then(()=>performSearch(input,started,logger))
+      .then(result=>{
+        clearInterval(heartbeat); 
+        const rows=Array.isArray(result.results)?result.results:[]; 
+        rows.forEach((r,i)=>send(`${i?',\n':''}${JSON.stringify(r)}\n`)); 
+        const meta={...result}; delete meta.results; 
+        send('],\n'); 
+        const entries=Object.entries(meta); 
+        entries.forEach(([k,v],i)=>send(`${JSON.stringify(k)}:${JSON.stringify(v)}${i===entries.length-1?'':',\n'}`)); 
+        send('}'); 
+        try{controller.close()}catch{} closed=true;
+      })
+      .catch(error=>{
+        clearInterval(heartbeat); 
+        // Fixed: Ensure the JSON string ends with `}` to stop strict parser crashes (e.g. position 798 error).
+        send(`],"returnedResults":0,"generatedAt":${encode(nowIso())},"latencyMs":${Date.now()-started},"keylessCoreSearch":true,"groqUsed":false,"resultsError":${encode(error?.message||'SEARCH_FAILED')},"liveLog":${JSON.stringify(logger.logs)},"warnings":${JSON.stringify(['The crawler failed safely after the stream had already started.'])}}`); 
+        try{controller.close()}catch{}closed=true;
+      });
   }});
   return new Response(stream,{status:200,headers:{...corsHeaders(),'x-arix-search-stream':'1','x-arix-stream-heartbeat-ms':'1000'}});
 }
