@@ -44,7 +44,7 @@ const COMMON_CRAWL_TIMEOUT_MS = 650;
 const MAX_COMMON_CRAWL = 4;
 const COMMON_CRAWL_INDEXES = ['CC-MAIN-2026-34', 'CC-MAIN-2026-30'];
 
-const AI_PLANNER_TIMEOUT_MS = 2_800;
+const AI_PLANNER_TIMEOUT_MS = 3_800;
 const MAX_AI_TARGETS = 10;
 const MAX_AI_QUERIES = 18;
 const MIN_AI_QUERIES = 4;
@@ -486,13 +486,11 @@ Your plan must obey all of these rules:
         signal:controller.signal,
         headers:{authorization:`Bearer ${key}`,'content-type':'application/json'},
         body:JSON.stringify({
-          model:'openai/gpt-oss-20b',
+          model:'llama3-8b-8192',
           messages:[{role:'user',content:prompt}],
           temperature:0,
           top_p:1,
-          max_completion_tokens:1500,
-          reasoning_effort:complexity,
-          reasoning_format:'hidden',
+          max_tokens:1500,
           response_format:{type:'json_object'},
           stream:false
         })
@@ -508,8 +506,8 @@ Your plan must obey all of these rules:
       if(!text)throw new Error('AI_PLANNER_EMPTY');
       const raw=parseJsonObject(text);
       const plan=normalizePlannerPlan(raw,basePlan);
-      logger?.add('ai-query-plan-complete','GPT-OSS 20B generated compact non-duplicate search missions.',{targets:plan.targets.length,queries:plan.queries.length,reasoningEffort:complexity});
-      return { ...plan, model:'openai/gpt-oss-20b',keyIndex:a };
+      logger?.add('ai-query-plan-complete','Groq generated compact non-duplicate search missions.',{targets:plan.targets.length,queries:plan.queries.length,reasoningEffort:complexity});
+      return { ...plan, model:'llama3-8b-8192',keyIndex:a };
     }catch(error){
       lastError=error;
       if(error?.name==='AbortError') lastError=new Error('AI_PLANNER_TIMEOUT');
@@ -1265,7 +1263,7 @@ function buildResponse(ctx){
     resultSelectionPolicy:'target-aware-title-match-fusion-then-exact-count-selection',mode,
     intent:{type:requestedType||plan.type,wantsNews:plan.flags.explicitNews||plan.type==='news'||plan.flags.live,wantsVideo:plan.flags.explicitVideo||plan.type==='video',wantsGov:plan.flags.explicitGov||plan.type==='gov',wantsDocs:plan.flags.explicitDoc||plan.type==='doc',wantsHistory:plan.flags.history,wantsAcademic:plan.flags.academic},
     generatedAt:nowIso(),started,latencyMs:Date.now()-started,keylessCoreSearch:true,groqUsed:true,cached:false,
-    groq:{required:true,model:'openai/gpt-oss-20b',function:'query_planning_only',queryPlanGenerated:true},
+    groq:{required:true,model:'llama3-8b-8192',function:'query_planning_only',queryPlanGenerated:true},
     providers:providerStats,
     quality:{discoveredResults:discoveredBeforeSelection,validatedResults:verifiedCount,requestedResults:reqCount,returnedResults:results.length,exactCountSatisfied:results.length===reqCount,realContentOnly:false,contentGuarantee:'Search results are real public sources actually discovered and ranked; no fabricated source is added.',precisionStrategy:'AI target decomposition + orthogonal query jobs + title/snippet target matching + source quality + freshness + consensus + lightweight verification'},
     searchPlan:{queryVariants:preciseQueries.map(q=>q.query),queryMissions:preciseQueries,engineRequests:Object.values(providerStats).reduce((s,p)=>s+Number(p.requests||0),0),verificationRequested:verifyRequested,verificationPerformed:Number(ctx.verificationPerformed||0),verificationSucceeded:verifiedCount,commonCrawlEnabled:useCc,commonCrawlPerformed:results.filter(r=>r.commonCrawl).length,streamed:true,logStreamSupported:true,deep,aiRequested,informationNeed:plan.aiInformationNeed,targetCount:plan.aiTargets?.length||0,targetCoverage},
@@ -1418,7 +1416,7 @@ function streamSseSearch(input){
 export async function runSearch(input={}){
   const query=truncate(String(input.query??input.q??'').trim(),MAX_QUERY_LEN); if(!query)throw new Error('MISSING_QUERY'); return performSearch({...input,query},Date.now(),createLogger());
 }
-export const SEARCH_CONTRACT=Object.freeze({version:VERSION,maxResults:MAX_RESULTS,standalone:true,dependencies:[],searchSurfaces:['bing','google','duckduckgo','yahoo','mojeek','brave','google-news','youtube'],ranking:'ai-target-query-planning + target-aware multi-engine fusion',contentMode:'search-discovery-only',returnsAllDiscovered:false,exactRequestedCount:true,aiPlanner:'openai/gpt-oss-20b',groqPlannerCompulsory:true,groqPlannerOnlyFunction:true,optionalVerification:true,noTavily:true});
+export const SEARCH_CONTRACT=Object.freeze({version:VERSION,maxResults:MAX_RESULTS,standalone:true,dependencies:[],searchSurfaces:['bing','google','duckduckgo','yahoo','mojeek','brave','google-news','youtube'],ranking:'ai-target-query-planning + target-aware multi-engine fusion',contentMode:'search-discovery-only',returnsAllDiscovered:false,exactRequestedCount:true,aiPlanner:'llama3-8b-8192',groqPlannerCompulsory:true,groqPlannerOnlyFunction:true,optionalVerification:true,noTavily:true});
 
 export default async function handler(req){
   if(req.method==='OPTIONS')return jsonResponse({ok:true,version:VERSION});
