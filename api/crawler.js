@@ -24,12 +24,12 @@ const DEFAULT_RESULTS = 10;
 const MAX_QUERY_LEN = 1600;
 const MAX_REQUEST_BODY = 100_000;
 const SEARCH_BUDGET_MS = 8_800;
-const SEARCH_TIMEOUT_MS = 1_050;
-const VERIFY_TIMEOUT_MS = 850;
-const VERIFY_HEADROOM_MS = 90;
-const DISCOVERY_CUTOFF_MS = 3_600;
+const SEARCH_TIMEOUT_MS = 800;
+const VERIFY_TIMEOUT_MS = 600;
+const VERIFY_HEADROOM_MS = 80;
+const DISCOVERY_CUTOFF_MS = 2_400;
 const SEARCH_CONCURRENCY = 24;
-const VERIFY_CONCURRENCY = 18;
+const VERIFY_CONCURRENCY = 16;
 const MAX_ENGINE_REQUESTS = 24;
 const MAX_DISCOVERY_RESULTS = 1000;
 const MAX_LIVE_LOG = 80;
@@ -734,11 +734,8 @@ function scoreSearchAnchor(url, title, context, provider) {
   if (/\b(?:sponsored|advertisement|ads by)\b/i.test(c)) score -= 20;
 
   if (provider === 'bing' && /b_algo/i.test(context)) score += 12;
-  if (provider === 'google' && /MjjYud|g\.h3|<h3/i.test(context)) score += 8;
-  if (provider === 'duckduckgo' && /result__a|result__body|results_links/i.test(context)) score += 12;
-  if (provider === 'yahoo' && /search-result|algo-sr/i.test(context)) score += 8;
-  if (provider === 'mojeek' && /result|title/i.test(context)) score += 6;
-  if (provider === 'brave' && /snippet|result|fdb/i.test(context)) score += 7;
+ if (provider === 'google' && /MjjYud|g\.h3|<h3/i.test(context)) score += 8;
+ if (provider === 'brave' && /snippet|result|fdb/i.test(context)) score += 11;
 
   if (isGov(url)) score += 4;
   if (isTrusted(url)) score += 3;
@@ -917,57 +914,6 @@ function parseGoogle(html, req, source = 'google') {
     .slice(0, 40);
 }
 
-function parseDuck(html, req) {
-  const s = String(html || '');
-  const out = [];
-  for (const m of s.matchAll(/<a\b[^>]*class=["'][^"']*result__a[^"']*["'][^>]*href\s*=\s*(["'])([\s\S]*?)\1[^>]*>([\s\S]*?)<\/a\s*>/gi)) {
-    const c = makeCandidate(m[2], searchTitle(m[3]), nearbySnippet(s, m.index || 0), 'duckduckgo', req.type, {
-      base: 'https://html.duckduckgo.com/',
-      providerRank: out.length + 1,
-      queryVariant: req.queryVariant,
-      searchWrapperResolved: true
-    });
-    if (c) out.push(c);
-  }
-  if (out.length >= 3) return out.slice(0, 40);
-  return [...out, ...extractAnchors(s, 'https://html.duckduckgo.com/', 'duckduckgo', req, 40)]
-    .filter((v, i, a) => a.findIndex((x) => normalizedKey(x.url) === normalizedKey(v.url)) === i)
-    .slice(0, 40);
-}
-
-function parseYahoo(html, req) {
-  const s = String(html || '');
-  const primary = [];
-  for (const m of s.matchAll(/<h3\b[^>]*>[\s\S]*?<a\b[^>]*href\s*=\s*(["'])([\s\S]*?)\1[^>]*>([\s\S]*?)<\/a\s*>[\s\S]*?<\/h3\s*>/gi)) {
-    const c = makeCandidate(m[2], searchTitle(m[3]), nearbySnippet(s, m.index || 0), 'yahoo', req.type, {
-      base: 'https://search.yahoo.com/',
-      providerRank: primary.length + 1,
-      queryVariant: req.queryVariant,
-      searchWrapperResolved: true
-    });
-    if (c) primary.push(c);
-  }
-  return [...primary, ...extractAnchors(s, 'https://search.yahoo.com/', 'yahoo', req, 40)]
-    .filter((v, i, a) => a.findIndex((x) => normalizedKey(x.url) === normalizedKey(v.url)) === i)
-    .slice(0, 40);
-}
-
-function parseMojeek(html, req) {
-  const s = String(html || '');
-  const out = [];
-  for (const m of s.matchAll(/<a\b[^>]*href\s*=\s*(["'])([\s\S]*?)\1[^>]*class=["'][^"']*(?:title|ob|result)[^"']*["'][^>]*>([\s\S]*?)<\/a\s*>/gi)) {
-    const c = makeCandidate(m[2], searchTitle(m[3]), nearbySnippet(s, m.index || 0), 'mojeek', req.type, {
-      base: 'https://www.mojeek.com/',
-      providerRank: out.length + 1,
-      queryVariant: req.queryVariant,
-      searchWrapperResolved: true
-    });
-    if (c) out.push(c);
-  }
-  return [...out, ...extractAnchors(s, 'https://www.mojeek.com/', 'mojeek', req, 40)]
-    .filter((v, i, a) => a.findIndex((x) => normalizedKey(x.url) === normalizedKey(v.url)) === i)
-    .slice(0, 40);
-}
 
 function parseGoogleNews(xml, req) {
   return parseRssSearch(xml, req, 'google-news');
@@ -1065,16 +1011,15 @@ function providerRequests(queries, plan, deep) {
   );
 
   for (let i = 0; i < qs.length; i++) {
-    const q = qs[i];
-    const e = encodeURIComponent(q);
-    add('google', q, plan.type === 'news' ? 'news' : 'web', `https://www.google.com/search?gbv=1&q=${e}&num=20&hl=en&gl=in&filter=0`, i);
-    if (i < 2) add('duckduckgo', q, plan.type === 'news' ? 'news' : 'web', `https://html.duckduckgo.com/html/?q=${e}&kl=in-en`, i);
-    if (i === 0) add('duck-lite', q, plan.type === 'news' ? 'news' : 'web', `https://lite.duckduckgo.com/lite/?q=${e}&kl=in-en`, i);
-    if (i < 2) add('yahoo', q, plan.type === 'news' ? 'news' : 'web', `https://search.yahoo.com/search?p=${e}&fr=yfp-t`, i);
-    if (i < 2) add('mojeek', q, plan.type === 'news' ? 'news' : 'web', `https://www.mojeek.com/search?q=${e}&lb=EN&lbb=100&rb=IN&rbb=10&fmt=html`, i);
-    if (i === 0) add('brave', q, plan.type === 'news' ? 'news' : 'web', `https://search.brave.com/search?q=${e}&source=web`, i);
-  }
-
+ const q = qs[i];
+ const e = encodeURIComponent(q);
+ add('google', q, plan.type === 'news' ? 'news' : 'web',
+`https://www.google.com/search?gbv=1&q=${e}&num=20&hl=en&gl=in&filter=0`, i);
+ if (i < 2) {
+ add('brave', q, plan.type === 'news' ? 'news' : 'web',
+`https://search.brave.com/search?q=${e}&source=web`, i);
+ }
+ }
   if (plan.flags.live || plan.type === 'news') {
     for (let i = 0; i < Math.min(2, qs.length); i++) {
       const q = qs[i];
@@ -1169,27 +1114,23 @@ async function fetchSearch(req, deadline) {
 }
 
 async function discoverOne(req, deadline) {
-  try {
-    const body = await fetchSearch(req, deadline);
-    let results = [];
-    if (req.provider === 'bing') results = parseBing(body, req);
-    else if (req.provider === 'google' || req.provider === 'google-video' || req.provider === 'google-doc' || req.provider === 'google-gov') {
-      results = parseGoogle(body, req, req.provider);
-    } else if (req.provider === 'duckduckgo' || req.provider === 'duck-lite') results = parseDuck(body, req);
-    else if (req.provider === 'yahoo') results = parseYahoo(body, req);
-    else if (req.provider === 'mojeek') results = parseMojeek(body, req);
-    else if (req.provider === 'brave') results = parseBrave(body, req);
-    else if (req.provider === 'bing-rss') results = parseRssSearch(body, req, 'bing-rss');
-    else if (req.provider === 'google-news') results = parseGoogleNews(body, req);
-    else if (req.provider === 'youtube') results = parseYoutube(body, req);
-
-    if (!results.length && !['google-news', 'bing-rss', 'youtube'].includes(req.provider)) {
-      results = extractAnchors(body, req.url, req.provider, req, 40);
-    }
-    return { provider: req.provider, ok: true, results };
-  } catch (error) {
-    return { provider: req.provider, ok: false, results: [], error: error?.message || 'DISCOVERY_FAILED' };
-  }
+ try {
+ const body = await fetchSearch(req, deadline);
+ let results = [];
+ if (req.provider === 'bing') results = parseBing(body, req);
+ else if (req.provider === 'google' || req.provider === 'google-video' || req.provider === 'google-doc' || req.provider === 'google-gov') {
+ results = parseGoogle(body, req, req.provider);
+ } else if (req.provider === 'brave') results = parseBrave(body, req);
+ else if (req.provider === 'bing-rss') results = parseRssSearch(body, req, 'bing-rss');
+ else if (req.provider === 'google-news') results = parseGoogleNews(body, req);
+ else if (req.provider === 'youtube') results = parseYoutube(body, req);
+ if (!results.length && !['google-news', 'bing-rss', 'youtube'].includes(req.provider)) {
+ results = extractAnchors(body, req.url, req.provider, req, 40);
+ }
+ return { provider: req.provider, ok: true, results };
+ } catch (error) {
+ return { provider: req.provider, ok: false, results: [], error: error?.message || 'DISCOVERY_FAILED' };
+ }
 }
 
 function dedupe(list) {
@@ -1658,11 +1599,11 @@ function decorateResult(r, i, plan) {
     publisherResolved: Boolean(r.publisherResolved),
     publisherWrapperUrl: r.publisherWrapperUrl || null,
     searchWrapperResolved: Boolean(r.searchWrapperResolved),
-    extractedText: '',
-    pageContent: '',
-    contentAvailable: false,
-    contentStatus: 'metadata-only',
-    contentMethod: 'search-metadata',
+    extractedText: r.pageProbeText ? truncate(r.pageProbeText, 3500) : (r.snippet ? truncate(r.snippet, 1000) : ''),
+    pageContent: r.pageProbeText ? truncate(r.pageProbeText, 3500) : '',
+    contentAvailable: Boolean(r.pageProbeText),
+    contentStatus: r.pageProbeText ? 'verified-preview' : 'metadata-only',
+    contentMethod: r.pageProbeText ? 'probe-extract' : 'search-metadata',
     contentLength: 0,
     contentConfidence: 0,
     contentSourceUrl: r.url,
@@ -1839,13 +1780,13 @@ async function performSearch(input, started, logger) {
 
   /* Verify more than the displayed count when possible, but never make verification the
    * bottleneck. Unverified sources are still retained and ranked. */
-  const verifyLimit = Math.min(ranked.length, deep ? 32 : Math.max(12, Math.min(24, count * 2)));
-  let verificationPerformed = 0;
-  if (verifyRequested && left(deadline) > 550 && verifyLimit) {
-    logger.add('verification-start', `Running lightweight reachability checks on ${verifyLimit} top sources.`);
-    verificationPerformed = verifyLimit;
-    const verifyDeadline = Math.min(deadline - 60, Date.now() + Math.max(450, left(deadline) - 60));
-    const checked = await mapConcurrent(ranked.slice(0, verifyLimit), VERIFY_CONCURRENCY, (r) => verifyOne(r, verifyDeadline));
+  const verifyLimit = Math.min(ranked.length, deep ? 16 : Math.min(10, Math.max(5, count)));
+ let verificationPerformed = 0;
+ if (verifyRequested && left(deadline) > 400 && verifyLimit) {
+ logger.add('verification-start', `Running lightweight reachability checks on ${verifyLimit} top sources.`);
+ verificationPerformed = verifyLimit;
+ const verifyDeadline = Math.min(deadline - 60, Date.now() + Math.max(350, left(deadline) - 60));
+ const checked = await mapConcurrent(ranked.slice(0, verifyLimit), VERIFY_CONCURRENCY, (r) => verifyOne(r, verifyDeadline));
     const checkedMap = new Map(checked.filter(Boolean).map((r) => [normalizedKey(r.url), r]));
     ranked = ranked.map((r) => checkedMap.get(normalizedKey(r.url)) || r);
     ranked = fusionRank(ranked, plan);
@@ -1918,14 +1859,15 @@ async function readInput(req) {
 }
 
 function corsHeaders(contentType = 'application/json; charset=utf-8') {
-  return {
-    'content-type': contentType,
-    'cache-control': 'no-store, no-transform',
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET, POST, OPTIONS',
-    'access-control-allow-headers': 'content-type, authorization, x-arix-search-key',
-    'x-arix-crawler-version': VERSION
-  };
+ return {
+ 'content-type': contentType,
+ 'cache-control': 'no-store, no-cache, no-transform, must-revalidate',
+ 'x-accel-buffering': 'no',
+ 'access-control-allow-origin': '*',
+ 'access-control-allow-methods': 'GET, POST, OPTIONS',
+ 'access-control-allow-headers': 'content-type, authorization, x-arix-search-key',
+ 'x-arix-crawler-version': VERSION
+ };
 }
 
 function jsonResponse(body, status = 200) {
@@ -1953,10 +1895,8 @@ function streamJsonSearch(input) {
       };
 
       logger.add('request-start', `Starting live search for ${query}.`, { count, mode });
-      send(`{"ok":true,"version":${encode(VERSION)},"query":${encode(query)},"requestedResults":${count},"mode":${encode(mode)},"streaming":true,"results":[\n`);
-
-      const heartbeat = setInterval(() => send(' \n'), 1000);
-
+      send(`{"ok":true,"version":${encode(VERSION)},"query":${encode(query)},"requestedResults":${count},"mode":${encode(mode)},"streaming":true,"results":[\n` + ' '.repeat(2048) + '\n');
+      const heartbeat = setInterval(() => send(' \n'), 600);
       Promise.resolve()
         .then(() => performSearch(input, started, logger))
         .then((result) => {
@@ -2053,16 +1993,16 @@ export async function runSearch(input = {}) {
 }
 
 export const SEARCH_CONTRACT = Object.freeze({
-  version: VERSION,
-  maxResults: MAX_RESULTS,
-  standalone: true,
-  dependencies: [],
-  searchSurfaces: ['bing', 'google', 'duckduckgo', 'yahoo', 'mojeek', 'google-news', 'youtube'],
-  ranking: 'multi-engine-query-fusion',
-  contentMode: 'search-discovery-only',
-  returnsAllDiscovered: true,
-  optionalVerification: true,
-  noTavily: true
+ version: VERSION,
+ maxResults: MAX_RESULTS,
+ standalone: true,
+ dependencies: [],
+ searchSurfaces: ['bing', 'google', 'brave', 'google-news', 'youtube'],
+ ranking: 'multi-engine-query-fusion',
+ contentMode: 'search-discovery-only',
+ returnsAllDiscovered: true,
+ optionalVerification: true,
+ noTavily: true
 });
 
 export default async function handler(req) {
